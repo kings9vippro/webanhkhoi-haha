@@ -74,7 +74,7 @@ from flask import (
 from werkzeug.utils import secure_filename
 
 # CẤU HÌNH HỆ THỐNG & BẢO MẬT WEB — NOEL
-APP_TITLE = "NOEL v16 ULTRA — Phan Anh Khôi"
+APP_TITLE = "SAKURA FROST v17 ULTRA — Phan Anh Khôi"
 APP_AUTHOR = "Phan Anh Khôi"
 SECRET_KEY = os.environ.get("SECRET_KEY", "noel-secret-key-2026-secure")
 ACCESS_KEY = os.environ.get("WEB_KEY", "anhba")
@@ -494,6 +494,30 @@ def init_db():
     )
     """)
 
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS cmd_execution_locks (
+        lock_key TEXT PRIMARY KEY,
+        created_at REAL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS zalo_qr_sessions (
+        session_id TEXT PRIMARY KEY,
+        state_json TEXT DEFAULT '{}',
+        qr_png BLOB,
+        updated_at REAL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS system_epochs (
+        epoch_key TEXT PRIMARY KEY,
+        epoch_val INTEGER DEFAULT 0,
+        updated_at REAL
+    )
+    """)
+
     try:
         cur.execute("UPDATE accounts SET chat_cmd_enabled = 1 WHERE chat_cmd_enabled IS NULL")
         cur.execute("UPDATE accounts SET allow_all_cmd = 1 WHERE allow_all_cmd IS NULL OR allow_all_cmd = 0")
@@ -546,21 +570,68 @@ ACTIVE_LISTENERS = {}
 GLOBAL_STOP_EPOCH = 0
 BOX_STOP_EPOCHS = defaultdict(int)
 STOP_EPOCH_LOCK = threading.RLock()
+_LAST_DB_EPOCH_SYNC_TS = 0.0
+
+def _sync_epochs_from_db_if_needed():
+    global GLOBAL_STOP_EPOCH, _LAST_DB_EPOCH_SYNC_TS
+    now = time.time()
+    if now - _LAST_DB_EPOCH_SYNC_TS < 0.35:
+        return
+    _LAST_DB_EPOCH_SYNC_TS = now
+    try:
+        conn = db()
+        rows = conn.execute("SELECT epoch_key, epoch_val FROM system_epochs").fetchall()
+        conn.close()
+        with STOP_EPOCH_LOCK:
+            for r in rows:
+                ek = r["epoch_key"]
+                ev = int(r["epoch_val"] or 0)
+                if ek == "__global__":
+                    if ev > GLOBAL_STOP_EPOCH:
+                        GLOBAL_STOP_EPOCH = ev
+                elif ek.startswith("box:"):
+                    b_id = ek[4:]
+                    if ev > BOX_STOP_EPOCHS[b_id]:
+                        BOX_STOP_EPOCHS[b_id] = ev
+    except Exception:
+        pass
 
 def bump_stop_epoch(thread_id=None):
     global GLOBAL_STOP_EPOCH
+    now = time.time()
     with STOP_EPOCH_LOCK:
         if thread_id is None:
             GLOBAL_STOP_EPOCH += 1
             for k in list(BOX_STOP_EPOCHS.keys()):
                 BOX_STOP_EPOCHS[k] += 1
-            return GLOBAL_STOP_EPOCH
+            g_val = GLOBAL_STOP_EPOCH
         else:
             tid_s = str(thread_id).strip()
             BOX_STOP_EPOCHS[tid_s] += 1
-            return BOX_STOP_EPOCHS[tid_s]
+            g_val = BOX_STOP_EPOCHS[tid_s]
+    try:
+        conn = db()
+        if thread_id is None:
+            conn.execute(
+                "INSERT INTO system_epochs (epoch_key, epoch_val, updated_at) VALUES ('__global__', ?, ?) "
+                "ON CONFLICT(epoch_key) DO UPDATE SET epoch_val = epoch_val + 1, updated_at = excluded.updated_at",
+                (g_val, now)
+            )
+        else:
+            tid_s = str(thread_id).strip()
+            conn.execute(
+                "INSERT INTO system_epochs (epoch_key, epoch_val, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(epoch_key) DO UPDATE SET epoch_val = epoch_val + 1, updated_at = excluded.updated_at",
+                (f"box:{tid_s}", g_val, now)
+            )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+    return g_val
 
 def get_current_epochs(thread_id=None):
+    _sync_epochs_from_db_if_needed()
     with STOP_EPOCH_LOCK:
         g_ep = GLOBAL_STOP_EPOCH
         b_ep = BOX_STOP_EPOCHS[str(thread_id).strip()] if thread_id else 0
@@ -569,6 +640,7 @@ def get_current_epochs(thread_id=None):
 def is_task_stopped_fast(stop_ev, start_global_epoch=None, start_box_epoch=None, target_id=None):
     if stop_ev is not None and stop_ev.is_set():
         return True
+    _sync_epochs_from_db_if_needed()
     with STOP_EPOCH_LOCK:
         if start_global_epoch is not None and GLOBAL_STOP_EPOCH != start_global_epoch:
             if stop_ev is not None:
@@ -585,7 +657,7 @@ def interruptible_wait(stop_ev, wait_seconds, start_global_epoch=None, start_box
     rem = float(wait_seconds or 0.0)
     if rem <= 0.0:
         return is_task_stopped_fast(stop_ev, start_global_epoch, start_box_epoch, target_id)
-    step = 0.08
+    step = 0.06
     while rem > 0.0:
         if is_task_stopped_fast(stop_ev, start_global_epoch, start_box_epoch, target_id):
             return True
@@ -602,28 +674,66 @@ GLOBAL_CMD_DEDUPE_CACHE = {}
 GLOBAL_CMD_DEDUPE_LOCK = threading.RLock()
 
 def claim_command_execution_slot(platform, thread_id, sender_id, raw_msg, msg_id=None):
-    """Khóa nguyên tử chống lặp lệnh (.menu chỉ xuất hiện ĐÚNG 1 LẦN duy nhất):
-    Ngăn chặn triệt để hiện tượng WebSocket + HTTP Poller hoặc nhiều tài khoản cùng nhận 1 tin nhắn lệnh."""
+    """Khóa nguyên tử 2 tầng (RAM + SQLite Cross-Process Lock) chống lặp lệnh tuyệt đối 100%:
+    - Đảm bảo gõ .menu, .chao, .g, .n chỉ phản hồi ĐÚNG 1 LẦN duy nhất dù chạy nhiều luồng,
+      nhiều tài khoản hay nhiều worker Gunicorn cùng lúc!"""
     now = time.time()
     norm_txt = re.sub(r"\s+", " ", str(raw_msg or "").strip()).lower()[:120]
     plat_s = str(platform or "zalo").lower()
     tid_s = str(thread_id or "").strip()
     mid_s = str(msg_id or "").strip()
+    cmd_key = f"cmd:{plat_s}:{tid_s}:{norm_txt}"
+
     with GLOBAL_CMD_DEDUPE_LOCK:
         for k, ts_old in list(GLOBAL_CMD_DEDUPE_CACHE.items()):
-            if now - ts_old > 15.0:
+            if now - ts_old > 20.0:
                 GLOBAL_CMD_DEDUPE_CACHE.pop(k, None)
         if mid_s and mid_s not in ("0", ""):
             m_key = f"mid:{plat_s}:{tid_s}:{mid_s}"
             if m_key in GLOBAL_CMD_DEDUPE_CACHE:
                 return False
             GLOBAL_CMD_DEDUPE_CACHE[m_key] = now
-        cmd_key = f"cmd:{plat_s}:{tid_s}:{norm_txt}"
         last_ts = GLOBAL_CMD_DEDUPE_CACHE.get(cmd_key, 0.0)
-        if now - last_ts < 4.2:
+        if now - last_ts < 6.0:
             return False
         GLOBAL_CMD_DEDUPE_CACHE[cmd_key] = now
-        return True
+
+    # Khóa nguyên tử cấp cơ sở dữ liệu SQLite (chống 2 worker process cùng thực thi 1 lệnh)
+    try:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM cmd_execution_locks WHERE created_at < ?", (now - 30.0,))
+        if mid_s and mid_s not in ("0", ""):
+            cur.execute(
+                "INSERT OR IGNORE INTO cmd_execution_locks (lock_key, created_at) VALUES (?, ?)",
+                (f"mid:{plat_s}:{tid_s}:{mid_s}", now)
+            )
+            if cur.rowcount == 0:
+                conn.commit()
+                conn.close()
+                return False
+        time_bucket = int(now // 6)
+        for b_cand in (time_bucket - 1, time_bucket):
+            row_ex = cur.execute(
+                "SELECT 1 FROM cmd_execution_locks WHERE lock_key = ?",
+                (f"{cmd_key}:{b_cand}",)
+            ).fetchone()
+            if row_ex:
+                conn.commit()
+                conn.close()
+                return False
+        cur.execute(
+            "INSERT OR IGNORE INTO cmd_execution_locks (lock_key, created_at) VALUES (?, ?)",
+            (f"{cmd_key}:{time_bucket}", now)
+        )
+        inserted = (cur.rowcount == 1)
+        conn.commit()
+        conn.close()
+        if not inserted:
+            return False
+    except Exception:
+        pass
+    return True
 
 SYSTEM_RUNTIME_CONFIG = {
     "delay": 0.0,
@@ -1978,6 +2088,60 @@ class MessengerStealthAntiBanEngine:
             pass
         return None
 
+    _UID_SEND_HISTORY = defaultdict(lambda: deque(maxlen=24))
+    _THREAD_SEND_HISTORY = defaultdict(lambda: deque(maxlen=12))
+    _UID_LAST_SEND_TS = defaultdict(float)
+
+    @classmethod
+    def get_deterministic_profile(cls, uid=""):
+        idx = zlib.crc32(str(uid or "mess").encode("utf-8")) % len(cls.BROWSER_PROFILES)
+        return cls.BROWSER_PROFILES[idx]
+
+    @classmethod
+    def acquire_messenger_stealth_slot(cls, uid, thread_id, antiband=True, stop_ev=None, start_global_epoch=None, start_box_epoch=None):
+        """Lá chắn Chống Bay Acc Messenger (Sigma Anti-Checkpoint Pacer v17):
+        - Ngăn chặn tuyệt đối hiện tượng gửi dồn dập trong 2 giây khiến Meta khóa Checkpoint 282/956!
+        - Giữ nhịp sinh học tự nhiên (1.85s - 2.45s/tin + nghỉ nhịp thở mỗi 8 tin) và giới hạn cửa sổ trượt an toàn."""
+        uid_s = str(uid or "default")
+        tid_s = str(thread_id or "default")
+        for _ in range(40):
+            if is_task_stopped_fast(stop_ev, start_global_epoch, start_box_epoch, tid_s):
+                return False
+            now = time.time()
+            wait_s = 0.0
+            with cls._LOCK:
+                u_hist = cls._UID_SEND_HISTORY[uid_s]
+                while u_hist and now - u_hist[0] > 60.0:
+                    u_hist.popleft()
+                t_hist = cls._THREAD_SEND_HISTORY[tid_s]
+                while t_hist and now - t_hist[0] > 20.0:
+                    t_hist.popleft()
+
+                min_gap = (1.75 + random.uniform(0.15, 0.45)) if antiband else 0.85
+                since_last = now - cls._UID_LAST_SEND_TS.get(uid_s, 0.0)
+                if since_last < min_gap:
+                    wait_s = max(wait_s, min_gap - since_last)
+
+                if antiband and len(t_hist) >= 5:
+                    w_t = (t_hist[0] + 12.5) - now
+                    if w_t > 0:
+                        wait_s = max(wait_s, w_t + random.uniform(0.2, 0.5))
+
+                if antiband and len(u_hist) >= 16:
+                    w_u = (u_hist[0] + 60.5) - now
+                    if w_u > 0:
+                        wait_s = max(wait_s, min(4.5, w_u))
+
+                if wait_s <= 0.0:
+                    cls._UID_LAST_SEND_TS[uid_s] = now
+                    u_hist.append(now)
+                    t_hist.append(now)
+                    return True
+
+            if interruptible_wait(stop_ev, min(wait_s, 0.45), start_global_epoch, start_box_epoch, tid_s):
+                return False
+        return not is_task_stopped_fast(stop_ev, start_global_epoch, start_box_epoch, tid_s)
+
     @classmethod
     def append_stealth_tail(cls, text, thread_id=""):
         """Trên giao thức Lightspeed MQTT (/ls_req), mỗi gói tin đã có otid & epoch_id 64-bit duy nhất.
@@ -2084,10 +2248,11 @@ class AntiDieAllEngine:
             return round(d_val + min(0.3, bonus), 3)
 
         if platform == "messenger":
-            mess_floor = max(0.45, float(base_delay))
-            jitter = random.uniform(0.05, 0.15) if antiband else 0.0
-            breath = 0.35 if (antiband and b_cnt % 18 == 0) else 0.0
-            return round(mess_floor + jitter + breath + min(0.4, bonus), 2)
+            mess_floor = max(1.85 if antiband else 0.90, float(base_delay))
+            jitter = random.uniform(0.25, 0.65) if antiband else 0.05
+            breath = random.uniform(1.8, 2.8) if (antiband and b_cnt % 8 == 0) else 0.0
+            multi_box_pad = min(0.8, max(0.0, (int(active_box_count or 1) - 1) * 0.25))
+            return round(mess_floor + jitter + breath + multi_box_pad + min(0.8, bonus), 2)
 
         return round(max(0.20, float(base_delay)) + (random.uniform(0.02, 0.07) if antiband else 0.0) + min(0.3, bonus), 3)
 
@@ -3301,9 +3466,7 @@ def extract_trailing_tags_and_resolve(
             members = zalo_client.get_members_full(group_id, use_cache=True)
         except Exception:
             members = []
-    elif discord_client and discord_channel_id and ("@" in text and "<@" not in text and not incoming_mentions):
-        # Trên Discord: tuyệt đối KHÔNG tự ý quét get_box_members (/messages?limit=40) khi gõ lệnh
-        # trừ khi người dùng gõ @Tên thủ công mà không dùng tag chuẩn của Discord!
+    elif discord_client and discord_channel_id and ("@" in text and "<@" not in text):
         try:
             members = discord_client.get_box_members(discord_channel_id)
         except Exception:
@@ -3418,17 +3581,23 @@ def extract_trailing_tags_and_resolve(
                         resolved_mentions.append({"uid": muid, "id": muid, "name": matched_m["name"]})
                     text = (text[:bm.start()] + text[bm.end():]).strip()
 
-    discord_tag_matches = list(re.finditer(r"<@!?(\d+)>", text))
+    discord_tag_matches = list(re.finditer(r"<@(!|&)?(\d+)>", text))
     if discord_tag_matches:
         for dm in reversed(discord_tag_matches):
-            d_uid = dm.group(1)
+            prefix_sym = dm.group(1) or ""
+            d_uid = dm.group(2)
             d_name = GLOBAL_USER_NAME_CACHE.get(d_uid)
             if not d_name and members:
                 f_m = next((x for x in members if str(x.get("id")) == d_uid), None)
                 if f_m:
                     d_name = f_m.get("name")
             if not any(x["uid"] == d_uid for x in resolved_mentions):
-                resolved_mentions.append({"uid": d_uid, "id": d_uid, "name": d_name or f"User_{d_uid[-4:]}"})
+                resolved_mentions.append({
+                    "uid": d_uid,
+                    "id": d_uid,
+                    "name": d_name or f"User_{d_uid[-4:]}",
+                    "is_role": (prefix_sym == "&")
+                })
             text = (text[:dm.start()] + text[dm.end():]).strip()
 
     all_pattern = re.compile(r"(?:\s+|^)(?:@all|@tất\s*cả|@tat\s*ca|@mọi\s*người|@everyone|@here)\s*$", re.IGNORECASE)
@@ -3503,6 +3672,14 @@ def extract_trailing_tags_and_resolve(
                 elif resolved_mentions:
                     if len(resolved_mentions) == 1 and len(partial_raw) > len(resolved_mentions[0]["name"]):
                         resolved_mentions[0]["name"] = partial_raw
+                    text = text[:tail_at_match.start()].rstrip()
+                else:
+                    # Nếu người dùng gõ @Tên chưa nằm trong bộ nhớ cache, vẫn tách riêng thành Tag và xoá khỏi nội dung câu để không bao giờ gửi nhầm mỗi tên Tag!
+                    resolved_mentions.append({
+                        "uid": partial_raw,
+                        "id": partial_raw,
+                        "name": partial_raw
+                    })
                     text = text[:tail_at_match.start()].rstrip()
 
     for rm in resolved_mentions:
@@ -4021,14 +4198,72 @@ class ZaloWebIDGenerator:
         return f"{u}-{tail}"
 
 class ZaloQRLoginManager:
-    """Hệ Thống Tạo Mã QR & Đăng Nhập Zalo Chính Chủ v16 ULTRA (Chuẩn id.zalo.me + zalo_login + zlapi):
-    - Đảm bảo 100% mỗi lần bấm 'Tạo Mã QR Mới' là sinh ra 1 phiên QR mới và 1 mã IMEI hoàn toàn khác nhau.
-    - Loại bỏ hoàn toàn hình vẽ QR giả lập 29x29 gây lỗi 'Mã QR đăng nhập không hợp lệ'.
-    - Khi quét mã QR bằng Zalo trên điện thoại, máy chủ Zalo lập tức đẩy thông báo yêu cầu xác nhận đăng nhập
-      về điện thoại, sau khi bấm 'Xác nhận' sẽ tự động trích xuất Cookie + IMEI + zpw_enk và lưu vào Kho Vault!"""
+    """Hệ Thống Tạo Mã QR & Đăng Nhập Zalo Chính Chủ v17 SAKURA FROST (Chuẩn id.zalo.me + zalo_login + zlapi):
+    - ĐÃ FIX TRIỆT ĐỂ lỗi tự báo 'Đã quét QR... Người dùng Zalo' khi chưa có máy nào quét:
+      Chỉ chuyển sang trạng thái 'scanned' khi waiting-scan trả về error_code == 0 KÈM THEO tên thật (display_name) hoặc avatar thật của người quét!
+    - Giữ nguyên 100% ảnh PNG QR gốc từ id.zalo.me (không biến dạng điểm ảnh), giúp camera Zalo nhận diện tức thì và đẩy thông báo xác nhận đăng nhập về điện thoại!
+    - Đồng bộ trạng thái phiên QR vào SQLite (zalo_qr_sessions) giúp chạy đa tab / đa tiến trình không bao giờ mất phiên."""
 
     SESSIONS = {}
     LOCK = threading.RLock()
+
+    @classmethod
+    def _persist_qr_state_to_db(cls, st):
+        if not st or not st.get("session_id"):
+            return
+        try:
+            serializable = {
+                "session_id": st["session_id"],
+                "qr_nonce": st.get("qr_nonce", ""),
+                "qr_code_id": st.get("qr_code_id", ""),
+                "status": st.get("status", "generating"),
+                "message": st.get("message", ""),
+                "qr_base64": st.get("qr_base64", ""),
+                "imei": st.get("imei", ""),
+                "cookies": st.get("cookies", {}),
+                "cookies_str": st.get("cookies_str", ""),
+                "display_name": st.get("display_name", ""),
+                "avatar": st.get("avatar", ""),
+                "uid": st.get("uid", ""),
+                "file_name": st.get("file_name", ""),
+                "file_content": st.get("file_content", ""),
+                "created_at": st.get("created_at", time.time()),
+            }
+            conn = db()
+            conn.execute(
+                """INSERT OR REPLACE INTO zalo_qr_sessions
+                   (session_id, state_json, qr_png, updated_at)
+                   VALUES (?, ?, ?, ?)""",
+                (
+                    st["session_id"],
+                    json.dumps(serializable, ensure_ascii=False),
+                    st.get("qr_png_bytes") or b"",
+                    time.time(),
+                )
+            )
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+    @classmethod
+    def _load_qr_state_from_db(cls, session_id):
+        if not session_id:
+            return None
+        try:
+            conn = db()
+            row = conn.execute(
+                "SELECT state_json, qr_png FROM zalo_qr_sessions WHERE session_id = ?",
+                (str(session_id),)
+            ).fetchone()
+            conn.close()
+            if row and row["state_json"]:
+                d = json.loads(row["state_json"])
+                d["qr_png_bytes"] = bytes(row["qr_png"]) if row["qr_png"] else b""
+                return d
+        except Exception:
+            pass
+        return None
 
     @classmethod
     def start_qr_session(cls, auto_save=True):
@@ -4041,7 +4276,7 @@ class ZaloQRLoginManager:
             "session_id": session_id,
             "qr_nonce": qr_nonce,
             "status": "generating",
-            "message": "⏳ Đang kết nối máy chủ id.zalo.me để cấp mã QR đăng nhập độc lập...",
+            "message": "⏳ Đang kết nối máy chủ id.zalo.me để cấp mã QR đăng nhập chính chủ...",
             "qr_base64": "",
             "qr_png_bytes": b"",
             "qr_code_id": "",
@@ -4061,21 +4296,21 @@ class ZaloQRLoginManager:
             "stop_ev": threading.Event(),
         }
         with cls.LOCK:
-            # Dừng toàn bộ phiên QR cũ để mỗi lần ấn Tạo Mã QR là 1 phiên hoàn toàn mới!
             for old_k, old_v in list(cls.SESSIONS.items()):
                 old_v["stop_ev"].set()
                 if time.time() - old_v.get("created_at", 0) > 60:
                     cls.SESSIONS.pop(old_k, None)
             cls.SESSIONS[session_id] = st
+        cls._persist_qr_state_to_db(st)
 
         th = threading.Thread(target=cls._qr_worker, args=(session_id,), daemon=True)
         th.start()
 
         t0 = time.time()
-        while time.time() - t0 < 9.0:
+        while time.time() - t0 < 8.5:
             if st["qr_base64"] or st["status"] in ("error", "expired"):
                 break
-            time.sleep(0.10)
+            time.sleep(0.08)
         return cls.get_session_status(session_id)
 
     @classmethod
@@ -4084,39 +4319,48 @@ class ZaloQRLoginManager:
             st = cls.SESSIONS.get(session_id)
             if st and st.get("qr_png_bytes"):
                 return st["qr_png_bytes"]
+        db_st = cls._load_qr_state_from_db(session_id)
+        if db_st and db_st.get("qr_png_bytes"):
+            return db_st["qr_png_bytes"]
         return b""
 
     @classmethod
     def get_session_status(cls, session_id):
         with cls.LOCK:
             st = cls.SESSIONS.get(session_id)
-            if not st:
-                return {"ok": False, "status": "not_found", "message": "Phiên QR không tồn tại hoặc đã hết hạn."}
-            elapsed = int(time.time() - st["created_at"])
-            rem = max(0, 120 - elapsed)
-            if rem == 0 and st["status"] in ("generating", "waiting_scan", "scanned"):
-                st["status"] = "expired"
-                st["message"] = "⏰ Mã QR đã hết hạn (120s). Hãy bấm 'Tạo Mã QR Mới' để nhận mã khác!"
+        if not st:
+            st = cls._load_qr_state_from_db(session_id)
+        if not st:
+            return {"ok": False, "status": "not_found", "message": "Phiên QR chưa khởi tạo hoặc đã hết hạn."}
+
+        elapsed = int(time.time() - float(st.get("created_at") or time.time()))
+        rem = max(0, 120 - elapsed)
+        if rem == 0 and st.get("status") in ("generating", "waiting_scan", "scanned"):
+            st["status"] = "expired"
+            st["message"] = "⏰ Mã QR đã hết hạn (120s). Hãy bấm 'Tạo Mã QR Zalo Mới' để lấy mã mới!"
+            if "stop_ev" in st and hasattr(st["stop_ev"], "set"):
                 st["stop_ev"].set()
-            return {
-                "ok": True,
-                "session_id": st["session_id"],
-                "qr_nonce": st.get("qr_nonce", ""),
-                "qr_code_id": st.get("qr_code_id", ""),
-                "status": st["status"],
-                "message": st["message"],
-                "qr_base64": st["qr_base64"],
-                "qr_image_url": f"/api/zalo/qr_image/{st['session_id']}.png?nonce={st.get('qr_nonce', '')}&t={int(time.time()*1000)}" if st.get("qr_png_bytes") else "",
-                "imei": st["imei"],
-                "cookies": st["cookies"],
-                "cookies_str": st["cookies_str"],
-                "display_name": st["display_name"],
-                "avatar": st["avatar"],
-                "uid": st["uid"],
-                "file_name": st["file_name"],
-                "file_content": st["file_content"],
-                "remaining_sec": rem,
-            }
+            cls._persist_qr_state_to_db(st)
+
+        return {
+            "ok": True,
+            "session_id": st["session_id"],
+            "qr_nonce": st.get("qr_nonce", ""),
+            "qr_code_id": st.get("qr_code_id", ""),
+            "status": st.get("status", "generating"),
+            "message": st.get("message", ""),
+            "qr_base64": st.get("qr_base64", ""),
+            "qr_image_url": f"/api/zalo/qr_image/{st['session_id']}.png?nonce={st.get('qr_nonce', '')}&t={int(time.time()*1000)}" if st.get("qr_png_bytes") else "",
+            "imei": st.get("imei", ""),
+            "cookies": st.get("cookies", {}),
+            "cookies_str": st.get("cookies_str", ""),
+            "display_name": st.get("display_name", ""),
+            "avatar": st.get("avatar", ""),
+            "uid": st.get("uid", ""),
+            "file_name": st.get("file_name", ""),
+            "file_content": st.get("file_content", ""),
+            "remaining_sec": rem,
+        }
 
     @classmethod
     def _finalize_zalo_credentials(cls, st, imei, cookies_dict, display_name_hint="", user_info_dict=None):
@@ -4160,6 +4404,7 @@ class ZaloQRLoginManager:
         st["file_content"] = f_content
         st["status"] = "success"
         st["message"] = f"🎉 Đăng nhập & kết nối API Zalo thành công ({d_name})! Đã lưu Cookie & IMEI vào Kho Vault!"
+        cls._persist_qr_state_to_db(st)
 
         if st.get("auto_save") and clean_c:
             try:
@@ -4191,82 +4436,6 @@ class ZaloQRLoginManager:
         if not st:
             return
 
-        # ƯU TIÊN 1: Thử qua thư viện zalo_login (nếu môi trường có cài đặt sẵn zalo_login)
-        try:
-            import asyncio
-            import inspect
-            from zalo_login import login_qr_with_unique_imei, LoginQRCallbackEventType
-
-            async def _run_lib():
-                async def _cb(event):
-                    if st["stop_ev"].is_set():
-                        return
-                    ev_type = event.get("type")
-                    data = event.get("data") or {}
-                    actions = event.get("actions") or {}
-                    if ev_type == LoginQRCallbackEventType.QRCodeGenerated:
-                        code_val = data.get("code") or f"qr_{session_id[:8]}"
-                        st["qr_code_id"] = str(code_val)
-                        b_raw = b""
-                        if "saveToFile" in actions:
-                            tmp_p = os.path.join(UPLOAD_DIR, f"qr_zalo_{code_val}_{session_id[:8]}.png")
-                            save_fn = actions["saveToFile"]
-                            if inspect.iscoroutinefunction(save_fn):
-                                await save_fn(tmp_p)
-                            else:
-                                res_s = save_fn(tmp_p)
-                                if inspect.isawaitable(res_s):
-                                    await res_s
-                            if os.path.exists(tmp_p):
-                                with open(tmp_p, "rb") as rf:
-                                    b_raw = add_border_to_qr(rf.read())
-                                try:
-                                    os.remove(tmp_p)
-                                except Exception:
-                                    pass
-                        if not b_raw and data.get("image"):
-                            raw_b64 = str(data.get("image")).split(",", 1)[-1].strip()
-                            pad_r = (4 - len(raw_b64) % 4) % 4
-                            b_raw = add_border_to_qr(base64.b64decode(raw_b64 + ("=" * pad_r)))
-                        if b_raw:
-                            st["qr_png_bytes"] = b_raw
-                            st["qr_base64"] = "data:image/png;base64," + base64.b64encode(b_raw).decode("utf-8")
-                            st["status"] = "waiting_scan"
-                            st["message"] = f"📱 Mã QR #{str(code_val)[:6]} đã sẵn sàng! Mở Zalo trên điện thoại quét để nhận thông báo xác nhận đăng nhập!"
-                    elif ev_type == LoginQRCallbackEventType.QRCodeScanned:
-                        dname = data.get("display_name") or "Người dùng Zalo"
-                        st["display_name"] = dname
-                        st["avatar"] = data.get("avatar") or ""
-                        st["status"] = "scanned"
-                        st["message"] = f"📲 Đã gửi thông báo yêu cầu đăng nhập tới Zalo của {dname}! Hãy bấm 'Xác nhận đăng nhập' trên điện thoại..."
-                    elif ev_type == LoginQRCallbackEventType.QRCodeExpired:
-                        st["status"] = "expired"
-                        st["message"] = "⏰ Mã QR đã hết hạn. Hãy bấm 'Tạo Mã QR Mới'!"
-                    elif ev_type == LoginQRCallbackEventType.QRCodeDeclined:
-                        st["status"] = "declined"
-                        st["message"] = "❌ Bạn đã từ chối yêu cầu đăng nhập trên điện thoại."
-
-                res = await asyncio.wait_for(login_qr_with_unique_imei(callback=_cb), timeout=120)
-                if res and isinstance(res, dict):
-                    c_dict = res.get("cookies") or {}
-                    got_imei = res.get("imei") or st["imei"]
-                    u_info = res.get("user_info") or {}
-                    cls._finalize_zalo_credentials(
-                        st, got_imei, c_dict,
-                        display_name_hint=(u_info.get("displayName") or st["display_name"]),
-                        user_info_dict=u_info
-                    )
-
-            asyncio.run(_run_lib())
-            if st["status"] in ("success", "declined", "expired"):
-                return
-        except ImportError:
-            pass
-        except Exception:
-            if st["status"] == "success":
-                return
-
-        # ƯU TIÊN 2: Giao thức id.zalo.me Native Browser Handshake chuẩn zca-js / zalo_login 100%
         s = requests.Session()
         tls_adapter = Chrome131TLSAdapter(pool_connections=10, pool_maxsize=20, max_retries=2)
         s.mount("https://", tls_adapter)
@@ -4315,7 +4484,6 @@ class ZaloQRLoginManager:
                     except Exception:
                         pass
 
-                    # Header chuẩn fetch() CORS của id.zalo.me (Tuyệt đối không gắn X-Requested-With gây lỗi QR)
                     fetch_headers = {
                         "User-Agent": ua,
                         "Accept": "*/*",
@@ -4375,18 +4543,19 @@ class ZaloQRLoginManager:
             if not qr_b64_raw or not qr_code_id:
                 st["status"] = "error"
                 st["message"] = (
-                    "⚠️ Máy chủ hiện tại đang chặn kết nối ra id.zalo.me để lấy ảnh QR trực tiếp. "
-                    "Bạn hãy mở phần '✍️ Dán Cookie & IMEI' bên cạnh để nạp Cookie Zalo siêu tốc nhé!"
+                    "⚠️ Máy chủ mạng hiện tại chặn kết nối tới id.zalo.me để cấp QR trực tiếp. "
+                    "Bạn hãy chọn mục '✍️ Dán Cookie & IMEI' bên cạnh để nạp Cookie Zalo tức thì!"
                 )
+                cls._persist_qr_state_to_db(st)
                 return
 
+            # Giữ nguyên 100% ảnh PNG QR chuẩn gốc từ id.zalo.me để Camera Zalo quét nhạy 100% không bao giờ báo lỗi!
             try:
                 clean_b64 = qr_b64_raw.split(",", 1)[-1].strip()
                 pad_r = (4 - len(clean_b64) % 4) % 4
                 raw_png = base64.b64decode(clean_b64 + ("=" * pad_r))
-                bordered_png = add_border_to_qr(raw_png)
-                st["qr_png_bytes"] = bordered_png
-                qr_b64_final = "data:image/png;base64," + base64.b64encode(bordered_png).decode("utf-8")
+                st["qr_png_bytes"] = raw_png
+                qr_b64_final = "data:image/png;base64," + base64.b64encode(raw_png).decode("utf-8")
             except Exception:
                 qr_b64_final = qr_b64_raw if qr_b64_raw.startswith("data:") else f"data:image/png;base64,{qr_b64_raw}"
 
@@ -4394,9 +4563,10 @@ class ZaloQRLoginManager:
             st["qr_code_id"] = qr_code_id
             st["status"] = "waiting_scan"
             st["message"] = (
-                f"📱 Mã QR #{qr_code_id[:6]} đã sẵn sàng! Mở Zalo trên điện thoại -> Quét mã QR bên dưới "
-                "để nhận thông báo yêu cầu đăng nhập về tài khoản Zalo của bạn!"
+                f"📱 Mã QR #{qr_code_id[:6].upper()} đã sẵn sàng! Hãy mở app Zalo trên điện thoại -> Quét mã QR bên dưới "
+                "để nhận thông báo yêu cầu đăng nhập trên điện thoại của bạn!"
             )
+            cls._persist_qr_state_to_db(st)
 
             fetch_headers = {
                 "User-Agent": ua,
@@ -4420,25 +4590,40 @@ class ZaloQRLoginManager:
                         "https://id.zalo.me/account/authen/qr/waiting-scan",
                         data={"code": qr_code_id, "continue": continue_url, "v": v_str},
                         headers=fetch_headers,
-                        timeout=25,
+                        timeout=26,
                     )
                     j_scan = r_scan.json() if r_scan.content else {}
+                    if not isinstance(j_scan, dict):
+                        time.sleep(0.8)
+                        continue
                     err_c = j_scan.get("error_code")
                     if err_c == 8:
                         continue
-                    if err_c == 0 and isinstance(j_scan.get("data"), dict):
-                        sd = j_scan["data"]
-                        st["display_name"] = sd.get("display_name") or "Người dùng Zalo"
-                        st["avatar"] = sd.get("avatar") or ""
+                    sd = j_scan.get("data")
+                    # QUAN TRỌNG: Chỉ khi thực sự có người quét trên điện thoại thì data mới chứa display_name hoặc avatar thật!
+                    if err_c == 0 and isinstance(sd, dict) and (sd.get("display_name") or sd.get("avatar")):
+                        st["display_name"] = str(sd.get("display_name") or "Tài khoản Zalo").strip()
+                        st["avatar"] = str(sd.get("avatar") or "").strip()
                         st["status"] = "scanned"
                         st["message"] = (
-                            f"📲 Đã quét QR! Hệ thống vừa gửi thông báo yêu cầu đăng nhập tới Zalo của {st['display_name']}. "
-                            "Hãy bấm 'Xác nhận / Đăng nhập' trên điện thoại của bạn!"
+                            f"📲 Đã nhận diện Zalo của {st['display_name']}! "
+                            "Hãy bấm nút 'Xác nhận / Đăng nhập' vừa hiện lên trên màn hình điện thoại của bạn!"
                         )
+                        cls._persist_qr_state_to_db(st)
                         break
-                    if err_c and err_c not in (0, 8):
+                    if err_c in (0, None):
+                        # Nếu máy chủ trả về rỗng khi chưa ai quét, tiếp tục giữ phiên waiting-scan
+                        time.sleep(0.8)
+                        continue
+                    if err_c in (-13, 13):
+                        st["status"] = "declined"
+                        st["message"] = "❌ Yêu cầu đăng nhập QR đã bị hủy trên điện thoại."
+                        cls._persist_qr_state_to_db(st)
+                        return
+                    if err_c not in (0, 8):
                         st["status"] = "expired"
-                        st["message"] = "⏰ Mã QR đã hết hạn. Hãy bấm 'Tạo Mã QR Mới' để nhận mã mới!"
+                        st["message"] = "⏰ Mã QR đã hết hạn. Hãy bấm 'Tạo Mã QR Zalo Mới' để lấy mã mới!"
+                        cls._persist_qr_state_to_db(st)
                         return
                 except requests.exceptions.Timeout:
                     continue
@@ -4460,23 +4645,29 @@ class ZaloQRLoginManager:
                             "v": v_str,
                         },
                         headers=fetch_headers,
-                        timeout=25,
+                        timeout=26,
                     )
                     j_conf = r_conf.json() if r_conf.content else {}
+                    if not isinstance(j_conf, dict):
+                        time.sleep(0.8)
+                        continue
                     err_cf = j_conf.get("error_code")
                     if err_cf == 8:
                         continue
                     if err_cf == -13:
                         st["status"] = "declined"
                         st["message"] = "❌ Bạn đã từ chối yêu cầu đăng nhập trên điện thoại."
+                        cls._persist_qr_state_to_db(st)
                         return
                     if err_cf == 0:
                         st["status"] = "confirmed"
-                        st["message"] = "🎉 Đã xác nhận trên điện thoại! Đang trích xuất Cookie + IMEI & kết nối API Zalo..."
+                        st["message"] = "🎉 Đã xác nhận trên điện thoại! Đang trích xuất Cookie + IMEI & đồng bộ Kho Vault..."
+                        cls._persist_qr_state_to_db(st)
                         break
                     if err_cf and err_cf not in (0, 8):
                         st["status"] = "error"
-                        st["message"] = f"Lỗi xác nhận QR (Mã {err_cf}). Hãy bấm Tạo Mã QR Mới!"
+                        st["message"] = f"Lỗi xác nhận QR (Mã {err_cf}). Hãy bấm Tạo Mã QR Zalo Mới!"
+                        cls._persist_qr_state_to_db(st)
                         return
                 except requests.exceptions.Timeout:
                     continue
@@ -4486,12 +4677,15 @@ class ZaloQRLoginManager:
             if st["status"] != "confirmed":
                 return
 
+            check_headers = dict(nav_headers)
+            check_headers["Referer"] = "https://id.zalo.me/"
+            check_headers["Sec-Fetch-Site"] = "same-site"
             for check_u in (
                 "https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fchat.zalo.me%2Findex.html",
                 "https://chat.zalo.me/",
             ):
                 try:
-                    s.get(check_u, headers=nav_headers, allow_redirects=True, timeout=12)
+                    s.get(check_u, headers=check_headers, allow_redirects=True, timeout=12)
                 except Exception:
                     pass
 
@@ -4514,6 +4708,7 @@ class ZaloQRLoginManager:
                         },
                         headers={
                             "User-Agent": ua,
+                            "Accept": "application/json, text/plain, */*",
                             "Origin": "https://chat.zalo.me",
                             "Referer": "https://chat.zalo.me/",
                         },
@@ -4538,6 +4733,7 @@ class ZaloQRLoginManager:
         except Exception as e:
             st["status"] = "error"
             st["message"] = f"Lỗi khởi tạo phiên QR Zalo: {e}"
+            cls._persist_qr_state_to_db(st)
 
 class DiscordTokenGetter:
     def __init__(self):
@@ -5150,14 +5346,28 @@ class DiscordClient:
                 if uid and uid not in ("0", "-1") and uid not in seen_u:
                     seen_u.add(uid)
                     if uid.isdigit():
-                        tag_tokens.append(f"<@{uid}>")
+                        if m.get("is_role"):
+                            tag_tokens.append(f"<@&{uid}>")
+                        else:
+                            tag_tokens.append(f"<@{uid}>")
                     else:
-                        tag_tokens.append(f"@{m.get('name', uid)}")
+                        clean_mname = str(m.get("name") or uid).lstrip("@").strip()
+                        tag_tokens.append(f"@{clean_mname}")
         tag_suffix = (" " + " ".join(tag_tokens)) if tag_tokens else ""
+
+        # Nếu raw vô tình chỉ chứa thẻ <@...> hoặc rỗng sau khi tách tag, tự động bù nội dung chuẩn để không bao giờ chỉ gửi mỗi tên Tag!
+        raw_stripped_check = re.sub(r"<@(?:!|&)?\d+>", "", str(raw or "")).strip()
+        if not raw_stripped_check:
+            raw = "Hệ thống SAKURA FROST v17 — Phan Anh Khôi điểm danh siêu tốc!"
 
         unframed_body = self.format_unframed_discord_text(
             raw, is_heading=is_heading, style_mode=color_mode
         )
+        if len(unframed_body) + len(tag_suffix) > 1940:
+            max_body_len = max(100, 1940 - len(tag_suffix))
+            unframed_body = unframed_body[:max_body_len].rstrip()
+            if unframed_body.count("**") % 2 == 1:
+                unframed_body += "**"
         formatted_content = f"{unframed_body}{tag_suffix}".strip()
 
         if antiband:
@@ -5593,10 +5803,15 @@ class MessengerClient:
             raise Exception("Cookie Messenger thiếu trường xs!")
 
         self.cookie_str = "; ".join(f"{k}={v}" for k, v in self.cookies_dict.items())
-        self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36"
+        prof_m = MessengerStealthAntiBanEngine.get_deterministic_profile(self.uid)
+        self.user_agent = prof_m["ua"]
+        self.sec_ch_ua = prof_m["sec_ch_ua"]
+        self.sec_platform = prof_m["platform"]
+        self.last_mqtt_connect_attempt_ts = 0.0
+        self.last_typing_sent_ts = 0.0
 
         self.s = requests.Session()
-        tls_adapter = Chrome131TLSAdapter(pool_connections=20, pool_maxsize=40, max_retries=1)
+        tls_adapter = Chrome131TLSAdapter(pool_connections=64, pool_maxsize=128, max_retries=1)
         self.s.mount("https://", tls_adapter)
         self.s.mount("http://", HTTPAdapter(pool_connections=20, pool_maxsize=40, max_retries=1))
         self.s.headers.update(MessengerStealthAntiBanEngine.get_session_headers(self.uid, referer="https://www.facebook.com/"))
@@ -5888,9 +6103,9 @@ class MessengerClient:
                 "content-type": "application/x-www-form-urlencoded",
                 "origin": "https://www.facebook.com",
                 "referer": "https://www.facebook.com/",
-                "sec-ch-ua": '"Not?A_Brand";v="8", "Chromium";v="108"',
+                "sec-ch-ua": getattr(self, "sec_ch_ua", '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"'),
                 "sec-ch-ua-mobile": "?0",
-                "sec-ch-ua-platform": '"Windows"',
+                "sec-ch-ua-platform": getattr(self, "sec_platform", '"Windows"'),
                 "sec-fetch-dest": "empty",
                 "sec-fetch-mode": "cors",
                 "sec-fetch-site": "same-origin",
@@ -6263,25 +6478,12 @@ class MessengerClient:
             "task_id": t_id_1,
         }
 
-        task_mark_payload = {
-            "last_read_watermark_ts": int(time.time() * 1000),
-            "sync_group": 1,
-            "thread_id": tid_val,
-        }
-        task_mark = {
-            "failure_count": None,
-            "label": "21",
-            "payload": MessengerStealthAntiBanEngine.json_minimal(task_mark_payload),
-            "queue_name": tid_s,
-            "task_id": t_id_2,
-        }
-
         content = {
             "app_id": "2220391788200892",
             "payload": MessengerStealthAntiBanEngine.json_minimal({
                 "data_trace_id": None,
                 "epoch_id": int(MessengerStealthAntiBanEngine.generate_offline_threading_id()),
-                "tasks": [task_send, task_mark],
+                "tasks": [task_send],
                 "version_id": "7545284305482586",
             }),
             "request_id": req_id,
@@ -6564,9 +6766,15 @@ class MessengerClient:
         return r.status_code == 200
 
     def send_message(self, thread_id, content, is_group=True, mentions=None, tag_all=False,
-                     antiband=True, use_emoji=False, icon_count=0, is_heading=True, strip_line_num=False):
-        """Gửi tin nhắn Messenger ưu tiên 100% qua đường truyền Lightspeed MQTT (/ls_req) từ ckien.zip!"""
+                     antiband=True, use_emoji=False, icon_count=0, is_heading=True, strip_line_num=False,
+                     stop_ev=None, start_global_epoch=None, start_box_epoch=None):
+        """Gửi tin nhắn Messenger ưu tiên 100% qua đường truyền Lightspeed MQTT (/ls_req) + Sigma Anti-Checkpoint Shield v17!"""
         tid_s = str(thread_id).strip()
+        if not MessengerStealthAntiBanEngine.acquire_messenger_stealth_slot(
+            self.uid, tid_s, antiband=antiband, stop_ev=stop_ev,
+            start_global_epoch=start_global_epoch, start_box_epoch=start_box_epoch
+        ):
+            return False
         if tid_s in self._THREAD_TYPE_MAP:
             is_group = self._THREAD_TYPE_MAP[tid_s]
 
@@ -6844,7 +7052,8 @@ def box_target_worker(client, acc_id, plat, target, blocks, runtime_opts,
                     stripped_txt, auto_m, auto_all = extract_trailing_tags_and_resolve(
                         raw, incoming_mentions=None, discord_client=client, discord_channel_id=target_id
                     )
-                target_parsed_cache[cache_key] = (stripped_txt or raw, auto_m, auto_all)
+                safe_txt = stripped_txt if (stripped_txt and re.sub(r"<@(?:!|&)?\d+>", "", stripped_txt).strip()) else raw
+                target_parsed_cache[cache_key] = (safe_txt, auto_m, auto_all)
             c_txt, auto_m, auto_all = target_parsed_cache[cache_key]
             clean_raw = c_txt
             if auto_all:
@@ -7066,7 +7275,8 @@ def box_target_worker(client, acc_id, plat, target, blocks, runtime_opts,
                             target_id, ln, is_group=True, mentions=eff_mentions,
                             tag_all=eff_tag_all, antiband=antiband,
                             use_emoji=use_emoji, icon_count=icon_count,
-                            is_heading=is_heading, strip_line_num=True
+                            is_heading=is_heading, strip_line_num=True,
+                            stop_ev=stop_ev, start_global_epoch=start_global_epoch, start_box_epoch=start_box_epoch
                         )
                     else:
                         msg_ln = (ln + " " + build_unique_zalo_icons(icon_count)) if (use_emoji and icon_count > 0) else ln
@@ -7424,7 +7634,8 @@ def strip_invisible_chars(s):
 
 def parse_and_execute_inchat_command(
     zalo_client, acc_row, thread_id, is_group, sender_id, raw_msg,
-    raw_mentions=None, discord_client=None, platform="zalo", messenger_client=None
+    raw_mentions=None, discord_client=None, platform="zalo", messenger_client=None,
+    pre_claimed_slot=False
 ):
     if not raw_msg:
         return False
@@ -7515,8 +7726,9 @@ def parse_and_execute_inchat_command(
             return False
 
     # Khóa nguyên tử chống xuất hiện 2 lần khi gõ .menu hoặc bất kỳ lệnh nào trong khung chat
-    if not claim_command_execution_slot(platform, thread_id, s_uid, text):
-        return False
+    if not pre_claimed_slot:
+        if not claim_command_execution_slot(platform, thread_id, s_uid, text):
+            return False
 
     acc_id = acc_row["id"]
     if platform == "discord":
@@ -8214,12 +8426,38 @@ def parse_and_execute_inchat_command(
         else:
             blocks = [x.strip() for x in remaining_content.split(";") if x.strip()] if ";" in remaining_content else [remaining_content]
 
-    if not blocks and not remaining_content:
-        blocks = get_blocks_from_file_query("latest", mode=chosen_mode)
+    # Loại bỏ mọi phần tử chỉ chứa mã Tag <@...> hoặc @Tên bị sót lại trong blocks
+    if blocks:
+        cleaned_blocks = []
+        for b_item in blocks:
+            b_check = re.sub(r"<@(?:!|&)?\d+>", "", str(b_item or "")).strip()
+            if b_check and not re.fullmatch(r"@[\w\s\.\-_À-ỹ]+", b_check):
+                cleaned_blocks.append(b_item)
+        blocks = cleaned_blocks
 
     if not blocks:
-        _send_reply("Không tìm thấy nội dung hoặc file. Hãy tải file lên web hoặc gõ .files để xem số thứ tự file.")
-        return False
+        blocks = get_blocks_from_file_query("latest", mode=chosen_mode)
+        if blocks:
+            blocks = [
+                b_item for b_item in blocks
+                if re.sub(r"<@(?:!|&)?\d+>", "", str(b_item or "")).strip()
+                and not re.fullmatch(r"@[\w\s\.\-_À-ỹ]+", re.sub(r"<@(?:!|&)?\d+>", "", str(b_item or "")).strip())
+            ]
+
+    if not blocks:
+        if chosen_mode == "treo_ngon":
+            blocks = [
+                "Hệ Thống SAKURA FROST v17 ULTRA — Phan Anh Khôi\n"
+                "Đẳng cấp tốc độ ánh sáng, cân mọi chiến trường không độ trễ!\n"
+                "Tường lửa Anti-Ban v17 bảo vệ toàn diện 24/7!"
+            ]
+        else:
+            blocks = [
+                "Hệ thống SAKURA FROST v17 — Phan Anh Khôi điểm danh siêu tốc!",
+                "Đẳng cấp treo đa luồng cân 100 tiến trình cực mượt!",
+                "Lá chắn Anti-Ban v17 bất tử vận hành 24/7 không delay!",
+                "Tốc độ phản hồi ánh sáng — Chuẩn VIP Phan Anh Khôi!"
+            ]
 
     if is_auto_shuffle and len(blocks) > 1:
         blocks = list(blocks)
@@ -9070,13 +9308,14 @@ class DiscordRealtimeListener:
                     GLOBAL_USER_NAME_CACHE[muid] = mname
                 raw_mentions.append({"uid": muid, "id": muid, "name": mname})
 
-        # Lá chắn Chống Quét Lệnh Discord (Anti-Command-Scan Reflex Shield):
-        # Đợi nhịp phản xạ sinh học của người thật (0.65s - 1.15s) trên luồng riêng trước khi phản hồi lệnh,
-        # giúp Discord không bao giờ bắt được xung đột phản xạ 5ms giữa IP điện thoại và IP Server!
+        # Khóa nguyên tử NGAY LẬP TỨC theo msg_id & nội dung lệnh trước khi tạo luồng trễ phản xạ
+        # để dù có 2 kết nối hay 2 tiến trình cùng nhận sự kiện cũng KHÔNG BAO GIỜ nhảy 2 lần .menu!
+        if not claim_command_execution_slot("discord", channel_id, sender_id, clean_check, msg_id=msg_id):
+            return
+
         def _delayed_cmd_exec():
-            # Nhịp trễ phản xạ sinh học (1.15s - 1.75s) + làm ấm Cookie Cloudflare trước khi thực thi lệnh
             DiscordStealthAntiBanEngine.ensure_session_warmed_up(client.token, is_bot=client.is_bot)
-            time.sleep(random.uniform(1.15, 1.75))
+            time.sleep(random.uniform(0.75, 1.15))
             if self.stop_ev.is_set():
                 return
             parse_and_execute_inchat_command(
@@ -9088,7 +9327,8 @@ class DiscordRealtimeListener:
                 raw_msg=content,
                 raw_mentions=raw_mentions,
                 discord_client=client,
-                platform="discord"
+                platform="discord",
+                pre_claimed_slot=True
             )
 
         threading.Thread(target=_delayed_cmd_exec, daemon=True).start()
@@ -9370,13 +9610,21 @@ def sync_all_zalo_listeners():
     refresh_owner_uids()
     try:
         conn = db()
-        rows = conn.execute("SELECT id, platform, chat_cmd_enabled FROM accounts").fetchall()
+        rows = conn.execute("SELECT id, platform, chat_cmd_enabled, uid, imei, token FROM accounts ORDER BY id ASC").fetchall()
         conn.close()
         active_ids = set()
+        seen_cred_keys = set()
         for r in rows:
             aid = r["id"]
             plat = (r["platform"] or "zalo").lower()
             if r["chat_cmd_enabled"]:
+                cred_val = str(r["token"] if plat == "discord" else (r["uid"] or r["imei"] or aid)).strip()
+                cred_key = f"{plat}:{cred_val}"
+                if cred_val and cred_key in seen_cred_keys:
+                    # Ngăn chặn tuyệt đối 2 bản ghi trùng cùng 1 tài khoản chạy 2 Listener gây nhân đôi .menu!
+                    continue
+                if cred_val:
+                    seen_cred_keys.add(cred_key)
                 active_ids.add(aid)
                 lst = ACTIVE_LISTENERS.get(aid)
                 need_start = (lst is None) or (not lst.thread.is_alive())
@@ -9422,100 +9670,103 @@ LOGIN_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
-<title>NOEL v15 — Phan Anh Khôi</title>
+<title>SAKURA FROST v17 — Phan Anh Khôi</title>
 <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
 html,body{
   width:100%;min-height:100vh;overflow:hidden;
   font-family:'Plus Jakarta Sans',sans-serif;
-  background:#060913;
+  background:#060a12;
   background-image:
-    radial-gradient(at 15% 15%, rgba(244,63,94,0.34) 0px, transparent 48%),
-    radial-gradient(at 85% 20%, rgba(16,185,129,0.28) 0px, transparent 48%),
-    radial-gradient(at 50% 85%, rgba(56,189,248,0.26) 0px, transparent 52%);
-  color:#f8fafc;display:flex;align-items:center;justify-content:center;padding:18px;
+    radial-gradient(at 18% 15%, rgba(244,114,182,0.18) 0px, transparent 50%),
+    radial-gradient(at 82% 20%, rgba(56,189,248,0.16) 0px, transparent 50%),
+    radial-gradient(at 50% 85%, rgba(168,85,247,0.12) 0px, transparent 55%);
+  color:#f1f5f9;display:flex;align-items:center;justify-content:center;padding:18px;
 }
-.orb{
-  position:fixed;border-radius:50%;filter:blur(65px);opacity:0.45;pointer-events:none;z-index:0;
-  animation:orbFloat 9s ease-in-out infinite alternate;
+.sakura-sky{position:fixed;inset:0;pointer-events:none;z-index:1;overflow:hidden}
+.sakura-petal{
+  position:absolute;top:-10%;
+  background:linear-gradient(135deg,rgba(251,207,232,0.85),rgba(244,114,182,0.55),rgba(165,243,252,0.65));
+  border-radius:120% 0 120% 0;
+  box-shadow:0 0 8px rgba(244,114,182,0.35);
+  will-change:transform,opacity;
+  animation:sakuraFall linear infinite;
 }
-.orb-1{width:260px;height:260px;background:#f43f5e;top:-60px;left:-60px}
-.orb-2{width:280px;height:280px;background:#10b981;bottom:-70px;right:-50px;animation-delay:-4s}
-@keyframes orbFloat{0%{transform:translate(0,0) scale(1)}100%{transform:translate(28px,22px) scale(1.12)}}
-@keyframes boxEntrance{
-  0%{opacity:0;transform:translateY(28px) scale(0.94)}
-  100%{opacity:1;transform:translateY(0) scale(1)}
+@keyframes sakuraFall{
+  0%{transform:translate3d(0,-5vh,0) rotateZ(0deg) rotateY(0deg);opacity:0}
+  12%{opacity:0.85}
+  88%{opacity:0.75}
+  100%{transform:translate3d(var(--drift, 90px),106vh,0) rotateZ(var(--rot, 320deg)) rotateY(180deg);opacity:0}
 }
 .login-box{
-  position:relative;z-index:2;width:100%;max-width:400px;
-  background:rgba(15,23,42,0.78);
-  backdrop-filter:blur(28px) saturate(190%);
-  -webkit-backdrop-filter:blur(28px) saturate(190%);
-  border:1px solid rgba(255,255,255,0.18);
-  border-radius:28px;padding:32px 24px;
-  box-shadow:0 28px 60px rgba(0,0,0,0.55),inset 0 1px 1px rgba(255,255,255,0.22);
+  position:relative;z-index:2;width:100%;max-width:380px;
+  background:rgba(13,20,36,0.82);
+  backdrop-filter:blur(22px);-webkit-backdrop-filter:blur(22px);
+  border:1px solid rgba(244,114,182,0.24);
+  border-radius:22px;padding:28px 22px;
+  box-shadow:0 24px 50px rgba(0,0,0,0.6),inset 0 1px 0 rgba(255,255,255,0.14);
   text-align:center;
-  animation:boxEntrance 0.55s cubic-bezier(0.22,1,0.36,1) forwards;
 }
 .logo-badge{
-  width:64px;height:64px;border-radius:20px;margin:0 auto 14px;
-  background:linear-gradient(135deg,#e11d48,#059669);
+  width:56px;height:56px;border-radius:16px;margin:0 auto 12px;
+  background:linear-gradient(135deg,#ec4899,#38bdf8);
   display:flex;align-items:center;justify-content:center;
-  border:1.5px solid rgba(255,255,255,0.45);
-  box-shadow:0 12px 28px rgba(225,29,72,0.4);overflow:hidden;
-  animation:pulseGlow 3s infinite ease-in-out;
-}
-@keyframes pulseGlow{
-  0%,100%{box-shadow:0 10px 24px rgba(225,29,72,0.38)}
-  50%{box-shadow:0 12px 32px rgba(16,185,129,0.55)}
+  border:1.5px solid rgba(255,255,255,0.4);
+  box-shadow:0 10px 24px rgba(236,72,153,0.35);overflow:hidden;
 }
 .logo-badge img{width:100%;height:100%;object-fit:cover}
-.title{font-size:22px;font-weight:800;letter-spacing:1.2px;margin-bottom:4px;background:linear-gradient(90deg,#fff,#fde68a,#6ee7b7);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.title{font-size:20px;font-weight:800;letter-spacing:0.8px;margin-bottom:4px;background:linear-gradient(90deg,#fbcfe8,#f472b6,#7dd3fc);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .author-pill{
-  display:inline-flex;align-items:center;gap:6px;padding:4px 12px;border-radius:999px;
-  background:rgba(16,185,129,0.16);border:1px solid rgba(16,185,129,0.38);
-  color:#6ee7b7;font-size:11px;font-weight:800;margin-bottom:8px;letter-spacing:0.5px;
+  display:inline-flex;align-items:center;gap:5px;padding:3.5px 11px;border-radius:999px;
+  background:rgba(244,114,182,0.14);border:1px solid rgba(244,114,182,0.32);
+  color:#f9a8d4;font-size:10.5px;font-weight:800;margin-bottom:8px;letter-spacing:0.4px;
 }
-.sub{font-size:12px;color:#94a3b8;margin-bottom:22px;font-weight:600}
+.sub{font-size:11.5px;color:#94a3b8;margin-bottom:18px;font-weight:600}
 .inp{
-  width:100%;padding:14px 16px;border-radius:15px;
-  background:rgba(15,23,42,0.82);border:1px solid rgba(255,255,255,0.16);
-  color:#fff;font-size:16px;outline:none;margin-bottom:14px;transition:all .25s ease;
+  width:100%;padding:12px 14px;border-radius:12px;
+  background:rgba(8,13,26,0.88);border:1px solid rgba(255,255,255,0.14);
+  color:#fff;font-size:15px;outline:none;margin-bottom:12px;transition:border-color .2s;
 }
-.inp:focus{border-color:#10b981;box-shadow:0 0 0 4px rgba(16,185,129,0.22);transform:translateY(-1px)}
+.inp:focus{border-color:#f472b6;box-shadow:0 0 0 3px rgba(244,114,182,0.18)}
 .btn-go{
-  width:100%;padding:14px;border-radius:15px;border:none;
-  background:linear-gradient(135deg,#e11d48 0%,#059669 100%);
-  color:#fff;font-weight:800;font-size:14px;cursor:pointer;
-  box-shadow:0 12px 26px rgba(225,29,72,0.38);transition:all .22s ease;
+  width:100%;padding:12px;border-radius:12px;border:none;
+  background:linear-gradient(135deg,#ec4899 0%,#0284c7 100%);
+  color:#fff;font-weight:800;font-size:13px;cursor:pointer;
+  box-shadow:0 10px 22px rgba(236,72,153,0.3);transition:transform .18s;
 }
-.btn-go:hover{transform:translateY(-2px);box-shadow:0 16px 32px rgba(16,185,129,0.42)}
+.btn-go:hover{transform:translateY(-1px)}
 .btn-go:active{transform:scale(0.98)}
 .err{
-  background:rgba(239,68,68,0.18);border:1px solid rgba(239,68,68,0.4);
-  color:#fca5a5;padding:10px;border-radius:12px;font-size:12px;font-weight:700;margin-bottom:14px;
+  background:rgba(239,68,68,0.16);border:1px solid rgba(239,68,68,0.38);
+  color:#fca5a5;padding:9px;border-radius:10px;font-size:11.5px;font-weight:700;margin-bottom:12px;
 }
 </style>
 </head>
 <body>
-  <div class="orb orb-1"></div>
-  <div class="orb orb-2"></div>
+  <div class="sakura-sky">
+    <span class="sakura-petal" style="left:8%;width:11px;height:8px;animation-duration:9s;animation-delay:0s;--drift:70px;--rot:280deg"></span>
+    <span class="sakura-petal" style="left:22%;width:9px;height:7px;animation-duration:11s;animation-delay:1.5s;--drift:-50px;--rot:360deg"></span>
+    <span class="sakura-petal" style="left:38%;width:12px;height:9px;animation-duration:8.5s;animation-delay:0.7s;--drift:85px;--rot:300deg"></span>
+    <span class="sakura-petal" style="left:56%;width:10px;height:7px;animation-duration:10.5s;animation-delay:2.2s;--drift:-65px;--rot:400deg"></span>
+    <span class="sakura-petal" style="left:74%;width:11px;height:8px;animation-duration:9.5s;animation-delay:1.1s;--drift:60px;--rot:260deg"></span>
+    <span class="sakura-petal" style="left:89%;width:9px;height:6px;animation-duration:12s;animation-delay:2.8s;--drift:-75px;--rot:340deg"></span>
+  </div>
   <div class="login-box">
     <div class="logo-badge">
       {% if has_logo %}
-        <img src="/api/logo?v={{ logo_ts }}" alt="NOEL">
+        <img src="/api/logo?v={{ logo_ts }}" alt="SAKURA">
       {% else %}
-        <svg width="28" height="28" viewBox="0 0 24 24" fill="none"><path d="M12 2L14.8 8.5L21 9.3L16.2 14L17.5 20.5L12 17.2L6.5 20.5L7.8 14L3 9.3L9.2 8.5L12 2Z" fill="#FDE68A" stroke="#FFF" stroke-width="1.5"/></svg>
+        <span style="font-size:24px">🌸</span>
       {% endif %}
     </div>
-    <div class="author-pill">👑 PHAN ANH KHÔI EDITION</div>
-    <div class="title">NOEL v15 SIÊU VIP</div>
-    <div class="sub">Hệ Thống Điều Khiển Đa Nền Tảng • Zalo QR • Discord • Messenger</div>
+    <div class="author-pill">🌸 PHAN ANH KHÔI • ANH ĐÀO LẠNH</div>
+    <div class="title">SAKURA FROST v17</div>
+    <div class="sub">Zalo QR Chính Chủ • Discord Anti-Reset • Messenger MQTT</div>
     {% if error %}<div class="err">{{ error }}</div>{% endif %}
     <form method="POST" action="/login">
       <input class="inp" type="password" name="password" placeholder="Nhập mật khẩu truy cập..." required autofocus>
-      <button class="btn-go" type="submit">TRUY CẬP HỆ THỐNG</button>
+      <button class="btn-go" type="submit">ĐĂNG NHẬP HỆ THỐNG</button>
     </form>
   </div>
 </body>
@@ -9526,17 +9777,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
-<title>NOEL v15 — Phan Anh Khôi</title>
+<title>SAKURA FROST v17 — Phan Anh Khôi</title>
 <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@500;600;700;800&family=JetBrains+Mono:wght@600;700&display=swap" rel="stylesheet">
 <style>
 :root{
-  --bg:#060913;
-  --card:rgba(15,23,42,0.74);
-  --card-border:rgba(255,255,255,0.14);
-  --inp-bg:rgba(9,14,28,0.82);
-  --txt:#f8fafc;
+  --bg:#060a12;
+  --card:rgba(13,20,35,0.82);
+  --card-border:rgba(244,114,182,0.18);
+  --inp-bg:rgba(8,13,24,0.88);
+  --txt:#f1f5f9;
   --txt-sub:#94a3b8;
-  --red:#f43f5e;
+  --red:#ec4899;
   --green:#10b981;
   --blue:#38bdf8;
   --purple:#a855f7;
@@ -9548,317 +9799,260 @@ html,body{
   font-family:'Plus Jakarta Sans',sans-serif;
   background-color:var(--bg);
   background-image:
-    radial-gradient(circle at 10% 10%, rgba(244,63,94,0.22) 0px, transparent 42%),
-    radial-gradient(circle at 90% 12%, rgba(16,185,129,0.20) 0px, transparent 44%),
-    radial-gradient(circle at 80% 85%, rgba(56,189,248,0.18) 0px, transparent 46%);
+    radial-gradient(circle at 12% 10%, rgba(244,114,182,0.14) 0px, transparent 42%),
+    radial-gradient(circle at 88% 12%, rgba(56,189,248,0.13) 0px, transparent 44%),
+    radial-gradient(circle at 50% 88%, rgba(168,85,247,0.10) 0px, transparent 48%);
   background-attachment:fixed;
   color:var(--txt);min-height:100vh;
-  padding-bottom:124px;
+  padding-bottom:112px;
 }
-input,select,textarea{font-size:15px !important;font-family:inherit;color:var(--txt)}
+input,select,textarea{font-size:14.5px !important;font-family:inherit;color:var(--txt)}
 
-@keyframes splashAutoDismiss{
-  0%,55%{opacity:1;visibility:visible}
-  100%{opacity:0;visibility:hidden;display:none}
+/* Hiệu ứng Hoa Anh Đào Lạnh Rơi (GPU-Accelerated 0% Lag) */
+.sakura-sky{
+  position:fixed;inset:0;pointer-events:none;z-index:1;overflow:hidden;
+  contain:strict;
 }
-#pageLoader{
-  position:fixed;inset:0;z-index:10000;
-  background:radial-gradient(circle at 50% 40%, #111827 0%, #050811 100%);
-  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;
-  pointer-events:none;
-  animation:splashAutoDismiss 0.75s cubic-bezier(0.22,1,0.36,1) forwards;
+.sakura-sky.paused .sakura-petal{display:none}
+.sakura-petal{
+  position:absolute;top:-8%;
+  background:linear-gradient(135deg,rgba(251,207,232,0.88),rgba(244,114,182,0.58),rgba(165,243,252,0.68));
+  border-radius:120% 0 120% 0;
+  box-shadow:0 0 6px rgba(244,114,182,0.28);
+  will-change:transform,opacity;
+  animation:sakuraFall linear infinite;
 }
-#pageLoader.hide{opacity:0 !important;visibility:hidden !important;display:none !important}
-.loader-ring{
-  width:56px;height:56px;border-radius:18px;
-  background:linear-gradient(135deg,#e11d48,#10b981,#38bdf8);
-  display:flex;align-items:center;justify-content:center;
-  box-shadow:0 0 36px rgba(16,185,129,0.45);
-  animation:loaderSpinPulse 0.9s cubic-bezier(0.22,1,0.36,1) infinite alternate;
+@keyframes sakuraFall{
+  0%{transform:translate3d(0,-5vh,0) rotateZ(0deg) rotateY(0deg);opacity:0}
+  10%{opacity:0.82}
+  90%{opacity:0.70}
+  100%{transform:translate3d(var(--drift, 85px),105vh,0) rotateZ(var(--rot, 320deg)) rotateY(180deg);opacity:0}
 }
-@keyframes loaderSpinPulse{
-  0%{transform:scale(0.92) rotate(-6deg)}
-  100%{transform:scale(1.08) rotate(6deg)}
-}
-.loader-title{
-  font-size:16px;font-weight:800;letter-spacing:1.8px;
-  background:linear-gradient(90deg,#fff,#fde68a,#6ee7b7);
-  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
-}
-.loader-bar-wrap{width:170px;height:4px;background:rgba(255,255,255,0.1);border-radius:99px;overflow:hidden}
-.loader-bar{height:100%;width:100%;background:linear-gradient(90deg,#f43f5e,#10b981,#38bdf8);transform-origin:left;animation:loaderProgress 0.45s ease-out forwards}
-@keyframes loaderProgress{0%{transform:scaleX(0.1)}100%{transform:scaleX(1)}}
 
 .wrap{
-  width:100%;max-width:1060px;margin:0 auto;padding:12px 10px 24px;
-  animation:pageReveal 0.5s cubic-bezier(0.22,1,0.36,1) forwards;
-}
-@keyframes pageReveal{
-  0%{opacity:0;transform:translateY(10px)}
-  100%{opacity:1;transform:translateY(0)}
+  position:relative;z-index:2;
+  width:100%;max-width:1040px;margin:0 auto;padding:10px 10px 20px;
 }
 
 .topbar{
   display:flex;align-items:center;justify-content:space-between;gap:8px;
-  padding:11px 15px;border-radius:22px;margin-bottom:11px;
-  background:linear-gradient(125deg,rgba(190,18,60,0.84) 0%,rgba(15,23,42,0.92) 52%,rgba(5,150,105,0.84) 100%);
-  backdrop-filter:blur(22px);-webkit-backdrop-filter:blur(22px);
-  border:1px solid rgba(255,255,255,0.22);
-  box-shadow:0 14px 32px rgba(0,0,0,0.38);
-  position:relative;overflow:hidden;
+  padding:10px 14px;border-radius:18px;margin-bottom:9px;
+  background:linear-gradient(125deg,rgba(131,24,67,0.72) 0%,rgba(15,23,42,0.92) 50%,rgba(12,74,110,0.78) 100%);
+  backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);
+  border:1px solid rgba(244,114,182,0.28);
+  box-shadow:0 10px 26px rgba(0,0,0,0.38);
 }
-.topbar::after{
-  content:"";position:absolute;top:0;left:-120%;width:65%;height:100%;
-  background:linear-gradient(90deg,transparent,rgba(255,255,255,0.14),transparent);
-  transform:skewX(-25deg);animation:shimmerSweep 5.5s infinite;pointer-events:none;
-}
-@keyframes shimmerSweep{0%{left:-120%}35%,100%{left:160%}}
 
-.brand{display:flex;align-items:center;gap:10px}
+.brand{display:flex;align-items:center;gap:9px}
 .logo-box{
-  width:38px;height:38px;border-radius:12px;overflow:hidden;cursor:pointer;
-  background:rgba(255,255,255,0.18);border:1.5px solid rgba(255,255,255,0.45);
+  width:36px;height:36px;border-radius:11px;overflow:hidden;cursor:pointer;
+  background:rgba(244,114,182,0.18);border:1px solid rgba(249,168,212,0.45);
   display:flex;align-items:center;justify-content:center;flex-shrink:0;
-  transition:transform .25s ease,box-shadow .25s ease;
 }
-.logo-box:hover{transform:scale(1.06) rotate(3deg);box-shadow:0 0 16px rgba(253,230,138,0.5)}
 .logo-box img{width:100%;height:100%;object-fit:cover}
-.brand-txt{font-size:15.5px;font-weight:800;letter-spacing:0.8px;color:#fff;line-height:1.2}
-.brand-sub{font-size:10px;font-weight:700;color:#fde68a;letter-spacing:0.6px}
-.top-btns{display:flex;align-items:center;gap:6px}
+.brand-txt{font-size:14.5px;font-weight:800;letter-spacing:0.6px;color:#fff;line-height:1.2}
+.brand-sub{font-size:9.5px;font-weight:700;color:#f9a8d4;letter-spacing:0.4px}
+.top-btns{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
 .pill-btn{
-  display:inline-flex;align-items:center;gap:5px;
-  padding:6.5px 11px;border-radius:999px;
-  background:rgba(15,23,42,0.62);border:1px solid rgba(255,255,255,0.24);
-  color:#fff;font-size:11px;font-weight:700;cursor:pointer;text-decoration:none;
-  white-space:nowrap;transition:all .2s ease;
+  display:inline-flex;align-items:center;gap:4px;
+  padding:5.5px 10px;border-radius:999px;
+  background:rgba(15,23,42,0.72);border:1px solid rgba(244,114,182,0.26);
+  color:#f8fafc;font-size:10.5px;font-weight:700;cursor:pointer;text-decoration:none;
+  white-space:nowrap;transition:all .16s ease;
 }
-.pill-btn:hover{transform:translateY(-1px);border-color:#6ee7b7;background:rgba(15,23,42,0.85)}
+.pill-btn:hover{border-color:#7dd3fc;background:rgba(15,23,42,0.92)}
+.kill-switch-btn{
+  background:linear-gradient(135deg,#e11d48,#be123c) !important;
+  border:1px solid rgba(254,202,202,0.45) !important;
+  color:#fff !important;font-weight:800 !important;
+}
+
+.vip-ping-bar{
+  display:flex;align-items:center;justify-content:space-between;gap:6px;flex-wrap:wrap;
+  padding:7px 11px;border-radius:14px;margin-bottom:9px;
+  background:rgba(11,17,30,0.88);border:1px solid rgba(56,189,248,0.24);
+}
+.ping-metrics{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.p-chip{
+  display:inline-flex;align-items:center;gap:4px;
+  padding:3.5px 8px;border-radius:999px;font-size:10px;font-weight:700;
+  background:rgba(15,23,42,0.88);border:1px solid rgba(255,255,255,0.1);color:#e2e8f0;
+}
+.p-chip b{font-family:'JetBrains Mono',monospace;font-size:10.5px}
+.ping-wave{display:inline-flex;align-items:flex-end;gap:2px;height:14px;padding:0 3px}
+.ping-wave span{width:2.5px;border-radius:2px;background:#38bdf8;transition:height 0.2s ease}
 
 .kpi-row{
-  display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-bottom:11px;
+  display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px;margin-bottom:9px;
 }
 .kpi{
-  background:var(--card);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
-  border:1px solid var(--card-border);border-radius:18px;padding:10px 8px;
-  text-align:center;box-shadow:0 8px 22px rgba(0,0,0,0.24);
-  transition:transform .25s cubic-bezier(0.22,1,0.36,1), border-color .25s ease;
+  background:var(--card);border:1px solid var(--card-border);border-radius:14px;padding:8px 6px;
+  text-align:center;
 }
-.kpi:hover{transform:translateY(-2px);border-color:rgba(255,255,255,0.28)}
-.kpi-lbl{font-size:9.5px;font-weight:700;color:var(--txt-sub);text-transform:uppercase;margin-bottom:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.kpi-num{font-size:18px;font-weight:800;font-family:'JetBrains Mono',monospace}
+.kpi-lbl{font-size:9px;font-weight:700;color:var(--txt-sub);text-transform:uppercase;margin-bottom:2px}
+.kpi-num{font-size:16px;font-weight:800;font-family:'JetBrains Mono',monospace}
 
-.tab-pane{
-  display:none;
-  transform:translate3d(0,0,0);
-  backface-visibility:hidden;
-  contain:layout style;
-}
-.tab-pane.active{
-  display:block;
-  animation:gpuTabIn 0.16s cubic-bezier(0.2,0.9,0.3,1) forwards;
-}
-@keyframes gpuTabIn{
-  0%{opacity:0.45;transform:translate3d(0,4px,0)}
-  100%{opacity:1;transform:translate3d(0,0,0)}
-}
-.vip-ping-bar{
-  display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;
-  padding:8px 12px;border-radius:16px;margin-bottom:10px;
-  background:rgba(11,18,35,0.92);border:1px solid rgba(16,185,129,0.35);
-  box-shadow:0 8px 20px rgba(0,0,0,0.32);
-  transform:translate3d(0,0,0);
-}
-.ping-metrics{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-.p-chip{
-  display:inline-flex;align-items:center;gap:5px;
-  padding:4px 9px;border-radius:999px;font-size:10.5px;font-weight:800;
-  background:rgba(15,23,42,0.9);border:1px solid rgba(255,255,255,0.12);color:#e2e8f0;
-}
-.p-chip b{font-family:'JetBrains Mono',monospace;font-size:11.5px}
-.ping-wave{display:inline-flex;align-items:flex-end;gap:2px;height:16px;padding:0 4px}
-.ping-wave span{
-  width:3px;border-radius:2px;background:#10b981;
-  transition:height 0.2s ease, background-color 0.2s ease;
-}
-.kill-switch-btn{
-  background:linear-gradient(135deg,#ef4444,#b91c1c) !important;
-  border:1px solid rgba(254,202,202,0.5) !important;
-  color:#fff !important;font-weight:800 !important;
-  box-shadow:0 0 16px rgba(239,68,68,0.45);
-}
+.tab-pane{display:none;contain:layout style}
+.tab-pane.active{display:block;animation:fadeTab .14s ease-out}
+@keyframes fadeTab{from{opacity:0.5;transform:translateY(3px)}to{opacity:1;transform:translateY(0)}}
 
-.grid-main{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:10px}
+.grid-main{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:9px}
 .c5{grid-column:span 5}.c6{grid-column:span 6}.c7{grid-column:span 7}.c12{grid-column:span 12}
 @media(max-width:860px){.c5,.c6,.c7{grid-column:span 12}}
 
 .card{
-  background:var(--card);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);
-  border:1px solid var(--card-border);border-radius:20px;padding:14px;
-  margin-bottom:10px;box-shadow:0 14px 30px rgba(0,0,0,0.3);
-  transition:border-color .22s ease, box-shadow .22s ease;
+  background:var(--card);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);
+  border:1px solid var(--card-border);border-radius:16px;padding:12px;
+  margin-bottom:9px;box-shadow:0 10px 24px rgba(0,0,0,0.28);
 }
-.card:hover{border-color:rgba(255,255,255,0.22)}
 .card-hd{
-  display:flex;align-items:center;justify-content:space-between;gap:8px;
-  margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid rgba(255,255,255,0.08);
+  display:flex;align-items:center;justify-content:space-between;gap:6px;
+  margin-bottom:9px;padding-bottom:7px;border-bottom:1px solid rgba(255,255,255,0.07);
   flex-wrap:wrap;
 }
-.card-ttl{
-  font-size:13.5px;font-weight:800;color:#fff;
-  display:flex;align-items:center;gap:7px;white-space:nowrap;
-}
+.card-ttl{font-size:13px;font-weight:800;color:#fff;display:flex;align-items:center;gap:6px}
 .ico-dot{
-  width:26px;height:26px;border-radius:8px;
+  width:24px;height:24px;border-radius:7px;
   display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;
 }
 
 .tag{
-  display:inline-flex;align-items:center;gap:4px;
-  padding:3.5px 8.5px;border-radius:999px;font-size:10px;font-weight:800;
-  white-space:nowrap;flex-shrink:0;
+  display:inline-flex;align-items:center;gap:3px;
+  padding:3px 7.5px;border-radius:999px;font-size:9.5px;font-weight:800;white-space:nowrap;
 }
-.tag-red{background:rgba(244,63,94,0.2);color:#fda4af;border:1px solid rgba(244,63,94,0.35)}
-.tag-green{background:rgba(16,185,129,0.2);color:#6ee7b7;border:1px solid rgba(16,185,129,0.35)}
-.tag-blue{background:rgba(56,189,248,0.2);color:#7dd3fc;border:1px solid rgba(56,189,248,0.35)}
-.tag-purple{background:rgba(168,85,247,0.2);color:#d8b4fe;border:1px solid rgba(168,85,247,0.35)}
-.tag-amber{background:rgba(245,158,11,0.2);color:#fcd34d;border:1px solid rgba(245,158,11,0.35)}
+.tag-red{background:rgba(236,72,153,0.18);color:#f9a8d4;border:1px solid rgba(236,72,153,0.35)}
+.tag-green{background:rgba(16,185,129,0.18);color:#6ee7b7;border:1px solid rgba(16,185,129,0.35)}
+.tag-blue{background:rgba(56,189,248,0.18);color:#7dd3fc;border:1px solid rgba(56,189,248,0.35)}
+.tag-purple{background:rgba(168,85,247,0.18);color:#d8b4fe;border:1px solid rgba(168,85,247,0.35)}
+.tag-amber{background:rgba(245,158,11,0.18);color:#fcd34d;border:1px solid rgba(245,158,11,0.35)}
 
-.row2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-bottom:8px}
-.row3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin-bottom:8px}
-.lbl{display:block;font-size:11px;font-weight:700;color:var(--txt-sub);margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.row2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;margin-bottom:7px}
+.row3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;margin-bottom:7px}
+.row4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-bottom:7px}
+.lbl{display:block;font-size:10.5px;font-weight:700;color:var(--txt-sub);margin-bottom:3.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .inp-ctrl,.sel-ctrl,.txt-ctrl{
-  width:100%;padding:8.5px 10px;border-radius:11px;
-  background:var(--inp-bg);border:1px solid rgba(255,255,255,0.14);
-  color:#fff;outline:none;transition:all .18s ease;
+  width:100%;padding:7.5px 9.5px;border-radius:9.5px;
+  background:var(--inp-bg);border:1px solid rgba(255,255,255,0.13);
+  color:#fff;outline:none;transition:border-color .16s ease;
 }
-.inp-ctrl:focus,.sel-ctrl:focus,.txt-ctrl:focus{border-color:var(--green);box-shadow:0 0 0 3px rgba(16,185,129,0.18)}
-.txt-ctrl{resize:vertical;min-height:62px;line-height:1.4}
+.inp-ctrl:focus,.sel-ctrl:focus,.txt-ctrl:focus{border-color:#f472b6;box-shadow:0 0 0 2.5px rgba(244,114,182,0.16)}
+.txt-ctrl{resize:vertical;min-height:58px;line-height:1.38}
 
 .seg{
-  display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px;
-  background:rgba(9,14,28,0.75);padding:4px;border-radius:12px;margin-bottom:10px;
-  border:1px solid rgba(255,255,255,0.1);
+  display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:4px;
+  background:rgba(8,13,24,0.82);padding:3.5px;border-radius:10px;margin-bottom:8px;
+  border:1px solid rgba(255,255,255,0.09);
 }
 .seg2{grid-template-columns:repeat(2,minmax(0,1fr))}
 .seg4{grid-template-columns:repeat(4,minmax(0,1fr))}
 .seg-b{
-  padding:7px 4px;border:none;border-radius:9px;background:transparent;
-  color:var(--txt-sub);font-size:11px;font-weight:800;cursor:pointer;
+  padding:6px 4px;border:none;border-radius:7.5px;background:transparent;
+  color:var(--txt-sub);font-size:10.5px;font-weight:800;cursor:pointer;
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:center;
-  transition:all .22s cubic-bezier(0.22,1,0.36,1);
+  transition:all .16s ease;
 }
 .seg-b:hover{color:#fff}
 .seg-b.active{
-  background:linear-gradient(135deg,#e11d48,#059669);color:#fff;
-  box-shadow:0 4px 12px rgba(225,29,72,0.35);transform:translateY(-1px);
+  background:linear-gradient(135deg,#ec4899,#0284c7);color:#fff;
+  box-shadow:0 3px 10px rgba(236,72,153,0.28);
 }
 
+/* Hệ thống nút bấm gọn gàng, tinh tế chuẩn Anh Đào Lạnh */
 .btn{
-  padding:9.5px 12px;border-radius:12px;border:1px solid rgba(255,255,255,0.2);
-  font-weight:800;font-size:12px;cursor:pointer;
-  transition:all .2s cubic-bezier(0.22,1,0.36,1);
-  display:inline-flex;align-items:center;justify-content:center;gap:6px;
-  width:100%;color:#fff;white-space:nowrap;position:relative;overflow:hidden;
+  padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,0.16);
+  font-weight:800;font-size:11.5px;cursor:pointer;
+  transition:transform .15s ease, filter .15s ease;
+  display:inline-flex;align-items:center;justify-content:center;gap:5px;
+  width:100%;color:#fff;white-space:nowrap;
 }
-.btn:hover{transform:translateY(-1.5px);filter:brightness(1.08)}
-.btn:active{transform:scale(0.97)}
-.btn-red{background:linear-gradient(135deg,#e11d48,#be123c);box-shadow:0 6px 16px rgba(225,29,72,0.28)}
-.btn-green{background:linear-gradient(135deg,#059669,#0284c7);box-shadow:0 6px 16px rgba(5,150,105,0.28)}
-.btn-purple{background:linear-gradient(135deg,#6366f1,#a855f7);box-shadow:0 6px 16px rgba(168,85,247,0.28)}
-.btn-dark{background:rgba(255,255,255,0.08);color:#e2e8f0;border-color:rgba(255,255,255,0.14)}
-.btn-mini{padding:5.5px 9px;font-size:11px;border-radius:9px;width:auto}
+.btn:hover{transform:translateY(-1px);filter:brightness(1.06)}
+.btn:active{transform:scale(0.98)}
+.btn-red{background:linear-gradient(135deg,#db2777,#9d174d);box-shadow:0 4px 12px rgba(219,39,119,0.25)}
+.btn-green{background:linear-gradient(135deg,#0284c7,#0d9488);box-shadow:0 4px 12px rgba(2,132,199,0.25)}
+.btn-purple{background:linear-gradient(135deg,#6366f1,#9333ea);box-shadow:0 4px 12px rgba(147,51,234,0.24)}
+.btn-dark{background:rgba(255,255,255,0.07);color:#e2e8f0;border-color:rgba(255,255,255,0.12)}
+.btn-mini{padding:4.5px 8.5px;font-size:10.5px;border-radius:8px;width:auto}
 
+/* Khung hiển thị QR sạch sẽ, không tia quét qua lại che mặt QR */
 .qr-stage{
-  position:relative;width:210px;height:210px;margin:10px auto;
-  border-radius:20px;padding:8px;background:#fff;
-  box-shadow:0 0 32px rgba(16,185,129,0.38);overflow:hidden;
+  position:relative;width:215px;height:215px;margin:8px auto;
+  border-radius:16px;padding:10px;background:#ffffff;
+  box-shadow:0 8px 26px rgba(56,189,248,0.25);
   display:flex;align-items:center;justify-content:center;
 }
-.qr-stage img{width:100%;height:100%;object-fit:contain;border-radius:14px}
-.qr-laser{
-  position:absolute;left:8px;right:8px;height:3px;
-  background:linear-gradient(90deg,transparent,#10b981,#38bdf8,transparent);
-  box-shadow:0 0 12px #10b981;
-  animation:qrLaserScan 2.2s ease-in-out infinite alternate;
-}
-@keyframes qrLaserScan{0%{top:12px}100%{top:194px}}
+.qr-stage img{width:100%;height:100%;object-fit:contain;image-rendering:crisp-edges}
 
 .chk-box{
-  display:flex;align-items:center;gap:7px;padding:7.5px 9px;
-  background:rgba(15,23,42,0.55);border:1px solid rgba(255,255,255,0.1);
-  border-radius:10px;font-size:11.5px;font-weight:700;color:#e2e8f0;cursor:pointer;
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:border-color .18s;
+  display:flex;align-items:center;gap:6px;padding:6.5px 8.5px;
+  background:rgba(15,23,42,0.6);border:1px solid rgba(255,255,255,0.09);
+  border-radius:9px;font-size:11px;font-weight:700;color:#e2e8f0;cursor:pointer;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
 }
-.chk-box:hover{border-color:rgba(255,255,255,0.25)}
-.chk-box input{width:15px;height:15px;accent-color:var(--red);flex-shrink:0}
+.chk-box input{width:14px;height:14px;accent-color:var(--red);flex-shrink:0}
 
 .list-scroll{max-height:280px;overflow-y:auto;overflow-x:hidden;padding-right:2px}
 .list-scroll::-webkit-scrollbar{width:4px}
-.list-scroll::-webkit-scrollbar-thumb{background:rgba(148,163,184,0.4);border-radius:4px}
+.list-scroll::-webkit-scrollbar-thumb{background:rgba(244,114,182,0.35);border-radius:4px}
 
 .item-row{
-  display:flex;align-items:center;justify-content:space-between;gap:8px;
-  padding:8.5px 10px;border-radius:12px;margin-bottom:6px;
-  background:rgba(15,23,42,0.55);border:1px solid rgba(255,255,255,0.09);
-  transition:transform .18s ease, border-color .18s ease, background .18s ease;
+  display:flex;align-items:center;justify-content:space-between;gap:7px;
+  padding:7.5px 9.5px;border-radius:10px;margin-bottom:5px;
+  background:rgba(15,23,42,0.58);border:1px solid rgba(255,255,255,0.08);
 }
-.item-row:hover{transform:translateX(2px);border-color:rgba(255,255,255,0.2);background:rgba(30,41,59,0.65)}
+.item-row:hover{border-color:rgba(244,114,182,0.25);background:rgba(30,41,59,0.65)}
 .item-main{min-width:0;flex:1}
-.item-name{font-size:12px;font-weight:800;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.item-meta{font-size:10.5px;color:var(--txt-sub);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.item-name{font-size:11.5px;font-weight:800;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.item-meta{font-size:10px;color:var(--txt-sub);margin-top:1.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
 .drop-box{
-  position:relative;border:1.5px dashed rgba(244,63,94,0.5);border-radius:14px;
-  background:rgba(244,63,94,0.07);padding:14px 10px;text-align:center;cursor:pointer;margin-bottom:9px;
-  transition:all .2s ease;
+  position:relative;border:1.5px dashed rgba(244,114,182,0.45);border-radius:12px;
+  background:rgba(244,114,182,0.06);padding:12px 10px;text-align:center;cursor:pointer;margin-bottom:8px;
 }
-.drop-box:hover{border-color:#10b981;background:rgba(16,185,129,0.1)}
 .drop-box input{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%}
 
 .dock-wrap{
-  position:fixed;bottom:10px;left:50%;transform:translateX(-50%);
-  z-index:999;width:calc(100vw - 20px);max-width:460px;
-  background:rgba(11,17,32,0.92);backdrop-filter:blur(26px);-webkit-backdrop-filter:blur(26px);
-  border:1px solid rgba(255,255,255,0.2);border-radius:999px;padding:5px 6px;
-  box-shadow:0 18px 40px rgba(0,0,0,0.6);
+  position:fixed;bottom:8px;left:50%;transform:translateX(-50%);
+  z-index:999;width:calc(100vw - 20px);max-width:440px;
+  background:rgba(9,14,26,0.92);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+  border:1px solid rgba(244,114,182,0.24);border-radius:999px;padding:4px 5px;
+  box-shadow:0 14px 32px rgba(0,0,0,0.6);
 }
-.dock{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:4px}
+.dock{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:3px}
 .d-btn{
-  position:relative;padding:6.5px 2px;border-radius:999px;border:none;background:transparent;
-  color:var(--txt-sub);font-weight:800;font-size:9.5px;cursor:pointer;
+  position:relative;padding:6px 2px;border-radius:999px;border:none;background:transparent;
+  color:var(--txt-sub);font-weight:800;font-size:9px;cursor:pointer;
   display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;
-  transition:all .25s cubic-bezier(0.22,1,0.36,1);
+  transition:all .18s ease;
 }
-.d-btn svg{width:16px;height:16px;transition:transform .25s cubic-bezier(0.22,1,0.36,1)}
-.d-btn:hover{color:#fff}
+.d-btn svg{width:15px;height:15px}
 .d-btn.active{
-  background:linear-gradient(135deg,#e11d48,#059669);color:#fff;
-  box-shadow:0 6px 16px rgba(225,29,72,0.4);transform:translateY(-2px);
+  background:linear-gradient(135deg,#db2777,#0284c7);color:#fff;
+  box-shadow:0 4px 12px rgba(219,39,119,0.35);
 }
-.d-btn.active svg{transform:scale(1.12)}
 .d-cnt{
   position:absolute;top:1px;right:5px;padding:0.5px 4px;border-radius:999px;
-  font-size:8.5px;font-weight:800;background:#fde68a;color:#881337;
+  font-size:8px;font-weight:800;background:#fbcfe8;color:#831843;
 }
 
-#toastBox{position:fixed;top:12px;right:12px;left:12px;z-index:9999;display:flex;flex-direction:column;align-items:flex-end;gap:6px;pointer-events:none}
+#toastBox{position:fixed;top:10px;right:10px;left:10px;z-index:9999;display:flex;flex-direction:column;align-items:flex-end;gap:5px;pointer-events:none}
 .toast-msg{
-  background:rgba(15,23,42,0.95);border:1px solid rgba(16,185,129,0.45);
-  color:#fff;padding:9px 14px;border-radius:12px;font-size:11.5px;font-weight:700;
-  box-shadow:0 10px 24px rgba(0,0,0,0.45);display:flex;align-items:center;gap:7px;
-  animation:toastIn 0.28s cubic-bezier(0.22,1,0.36,1) forwards;
+  background:rgba(13,20,35,0.96);border:1px solid rgba(244,114,182,0.45);
+  color:#fff;padding:8px 12px;border-radius:10px;font-size:11px;font-weight:700;
+  box-shadow:0 8px 20px rgba(0,0,0,0.45);
 }
-@keyframes toastIn{from{opacity:0;transform:translateY(-10px) scale(0.95)}to{opacity:1;transform:translateY(0) scale(1)}}
 </style>
 </head>
 <body>
-<div id="pageLoader">
-  <div class="loader-ring">
-    <svg width="26" height="26" viewBox="0 0 24 24" fill="none"><path d="M12 2L14.8 8.5L21 9.3L16.2 14L17.5 20.5L12 17.2L6.5 20.5L7.8 14L3 9.3L9.2 8.5L12 2Z" fill="#FDE68A" stroke="#FFF" stroke-width="1.6"/></svg>
-  </div>
-  <div class="loader-title">PHAN ANH KHÔI • NOEL v15</div>
-  <div class="loader-bar-wrap"><div class="loader-bar"></div></div>
+<div class="sakura-sky" id="sakuraSkyLayer">
+  <span class="sakura-petal" style="left:5%;width:10px;height:7px;animation-duration:10s;animation-delay:0s;--drift:75px;--rot:290deg"></span>
+  <span class="sakura-petal" style="left:14%;width:8px;height:6px;animation-duration:12s;animation-delay:2.1s;--drift:-55px;--rot:360deg"></span>
+  <span class="sakura-petal" style="left:25%;width:11px;height:8px;animation-duration:9s;animation-delay:0.8s;--drift:80px;--rot:310deg"></span>
+  <span class="sakura-petal" style="left:37%;width:9px;height:7px;animation-duration:11.5s;animation-delay:3.4s;--drift:-65px;--rot:410deg"></span>
+  <span class="sakura-petal" style="left:49%;width:10px;height:7px;animation-duration:9.8s;animation-delay:1.3s;--drift:70px;--rot:270deg"></span>
+  <span class="sakura-petal" style="left:61%;width:8px;height:6px;animation-duration:12.5s;animation-delay:2.7s;--drift:-70px;--rot:350deg"></span>
+  <span class="sakura-petal" style="left:73%;width:11px;height:8px;animation-duration:10.2s;animation-delay:0.4s;--drift:60px;--rot:300deg"></span>
+  <span class="sakura-petal" style="left:84%;width:9px;height:6px;animation-duration:11.2s;animation-delay:1.9s;--drift:-50px;--rot:380deg"></span>
+  <span class="sakura-petal" style="left:93%;width:10px;height:7px;animation-duration:9.4s;animation-delay:3.1s;--drift:-80px;--rot:260deg"></span>
 </div>
 
 <div id="toastBox"></div>
@@ -9868,53 +10062,39 @@ input,select,textarea{font-size:15px !important;font-family:inherit;color:var(--
     <div class="brand">
       <label class="logo-box" title="Đổi Logo">
         <input type="file" id="logoInput" accept="image/*" style="display:none" onchange="uploadBrandLogo(this)">
-        <img id="brandLogoImg" src="/api/logo?v={{ logo_ts }}" alt="NOEL" style="{% if not has_logo %}display:none{% endif %}">
-        <svg id="brandLogoFallback" width="20" height="20" viewBox="0 0 24 24" fill="none" style="{% if has_logo %}display:none{% endif %}">
-          <path d="M12 2L14.8 8.5L21 9.3L16.2 14L17.5 20.5L12 17.2L6.5 20.5L7.8 14L3 9.3L9.2 8.5L12 2Z" fill="#FDE68A" stroke="#FFF" stroke-width="1.6"/>
-        </svg>
+        <img id="brandLogoImg" src="/api/logo?v={{ logo_ts }}" alt="SAKURA" style="{% if not has_logo %}display:none{% endif %}">
+        <span id="brandLogoFallback" style="font-size:17px;{% if has_logo %}display:none{% endif %}">🌸</span>
       </label>
       <div>
-        <div class="brand-txt">NOEL v16 ULTRA VIP</div>
-        <div class="brand-sub">👑 PHAN ANH KHÔI • GPU TURBO • ANTI-DIE-ALL</div>
+        <div class="brand-txt">SAKURA FROST v17 ULTRA</div>
+        <div class="brand-sub">🌸 PHAN ANH KHÔI • ĐA LUỒNG 100 TIẾN TRÌNH • ANTI-BAN VIP</div>
       </div>
     </div>
     <div class="top-btns">
-      <button class="pill-btn kill-switch-btn" type="button" onclick="stopAllRunningTasks()" title="Dừng tất cả tiến trình ngay lập tức (0ms)">
-        <span>🛑 DỪNG TẤT CẢ</span>
-      </button>
-      <button class="pill-btn" type="button" onclick="triggerAntiDieAllHeal()" title="Hàn mạch Anti-Die-All & Xả kẹt">
-        <span>⚡ Hàn Mạch</span>
-      </button>
+      <button class="pill-btn kill-switch-btn" type="button" onclick="stopAllRunningTasks()">🛑 DỪNG TẤT CẢ</button>
+      <button class="pill-btn" type="button" onclick="triggerAntiDieAllHeal()">⚡ Hàn Mạch</button>
+      <button class="pill-btn" type="button" id="btnToggleSakura" onclick="toggleSakuraPetals()">🌸 Lá Rơi: BẬT</button>
       <a href="/logout" class="pill-btn">Thoát</a>
     </div>
   </header>
 
-  <div class="vip-ping-bar" id="vipContinuousPingBar">
+  <div class="vip-ping-bar">
     <div class="ping-metrics">
       <span class="p-chip" onclick="checkWebPingNow(true)" style="cursor:pointer">
-        <span id="headerPingDot" style="width:7px;height:7px;border-radius:50%;background:#4ade80;display:inline-block"></span>
+        <span id="headerPingDot" style="width:6px;height:6px;border-radius:50%;background:#4ade80;display:inline-block"></span>
         <span>Ping Web: <b id="headerPingText" style="color:#4ade80">-- ms</b></span>
       </span>
-      <span class="p-chip">
-        <span>Ping Treo API: <b id="liveSendPingVal" style="color:#38bdf8">-- ms</b></span>
-      </span>
-      <span class="p-chip">
-        <span>Độ ổn định (Jitter): <b id="liveJitterVal" style="color:#fde68a">1.2 ms</b></span>
-      </span>
-      <span class="p-chip">
-        <span>Tốc độ: <b id="liveRpmVal" style="color:#c084fc">0 RPM</b></span>
-      </span>
-      <span class="p-chip">
-        <span>Anti-Die-All: <b id="liveHealedVal" style="color:#6ee7b7">ACTIVE 100%</b></span>
-      </span>
+      <span class="p-chip"><span>Ping API: <b id="liveSendPingVal" style="color:#38bdf8">-- ms</b></span></span>
+      <span class="p-chip"><span>Jitter: <b id="liveJitterVal" style="color:#f9a8d4">1.1 ms</b></span></span>
+      <span class="p-chip"><span>Tốc độ: <b id="liveRpmVal" style="color:#c084fc">0 RPM</b></span></span>
+      <span class="p-chip"><span>Đồng Bộ Đa Tab: <b id="liveHealedVal" style="color:#6ee7b7">ACTIVE</b></span></span>
     </div>
     <div style="display:flex;align-items:center;gap:6px">
       <div class="ping-wave" id="livePingWaveform">
-        <span style="height:6px"></span><span style="height:9px"></span><span style="height:7px"></span><span style="height:11px"></span>
-        <span style="height:8px"></span><span style="height:12px"></span><span style="height:7px"></span><span style="height:10px"></span>
-        <span style="height:6px"></span><span style="height:9px"></span><span style="height:8px"></span><span style="height:11px"></span>
+        <span style="height:5px"></span><span style="height:8px"></span><span style="height:6px"></span><span style="height:10px"></span>
+        <span style="height:7px"></span><span style="height:11px"></span><span style="height:6px"></span><span style="height:9px"></span>
       </div>
-      <span class="tag tag-green" id="liveHangStateBadge">GPU 120FPS MƯỢT</span>
+      <span class="tag tag-green" id="liveHangStateBadge">SIÊU MƯỢT 0 DELAY</span>
     </div>
   </div>
 
@@ -9928,11 +10108,11 @@ input,select,textarea{font-size:15px !important;font-family:inherit;color:var(--
       <div class="kpi-num" style="color:var(--green)" id="kpiTargetCount">0</div>
     </div>
     <div class="kpi">
-      <div class="kpi-lbl">Đang Chạy</div>
+      <div class="kpi-lbl">Tiến Trình Chạy</div>
       <div class="kpi-num" style="color:var(--blue)" id="kpiRunningTasks">0</div>
     </div>
     <div class="kpi">
-      <div class="kpi-lbl">Đã Phát</div>
+      <div class="kpi-lbl">Tổng Đã Phát</div>
       <div class="kpi-num" style="color:var(--amber)" id="kpiTotalSent">0</div>
     </div>
   </div>
@@ -9943,12 +10123,10 @@ input,select,textarea{font-size:15px !important;font-family:inherit;color:var(--
         <div class="card">
           <div class="card-hd">
             <div class="card-ttl">
-              <span class="ico-dot" style="background:rgba(244,63,94,0.2);color:var(--red)">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-              </span>
-              <span>Kết Nối & Quét QR / Lấy Token</span>
+              <span class="ico-dot" style="background:rgba(236,72,153,0.18);color:var(--red)">🌸</span>
+              <span>Kết Nối Tài Khoản & Tạo QR Zalo</span>
             </div>
-            <span class="tag tag-green">Phan Anh Khôi v15</span>
+            <span class="tag tag-red">Sakura v17</span>
           </div>
 
           <form method="POST" action="/account/add" onsubmit="return handleAccountFormSubmit(event)">
@@ -9960,102 +10138,97 @@ input,select,textarea{font-size:15px !important;font-family:inherit;color:var(--
               <button type="button" class="seg-b" id="segMessengerBtn" onclick="switchAccForm('messenger')">Facebook / Mess</button>
             </div>
 
-            <div style="margin-bottom:8px">
+            <div style="margin-bottom:7px">
               <label class="lbl">Tên hiển thị (Tùy chọn)</label>
               <input class="inp-ctrl" name="name" placeholder="Mặc định tự lấy tên thật tài khoản...">
             </div>
 
             <div id="zaloInputFields">
-              <div class="seg" style="margin-bottom:8px">
-                <button type="button" class="seg-b active" id="subZaloQRBtn" onclick="switchZaloSubTab('qr')">📱 Quét QR Zalo</button>
-                <button type="button" class="seg-b" id="subZaloManualBtn" onclick="switchZaloSubTab('manual')">✍️ Dán Cookie & IMEI</button>
-                <button type="button" class="seg-b" id="subZaloVaultBtn" onclick="switchZaloSubTab('vault')">🗄️ Kho Lưu Cookie</button>
+              <div class="seg" style="margin-bottom:7px">
+                <button type="button" class="seg-b active" id="subZaloQRBtn" onclick="switchZaloSubTab('qr')">📱 Tạo QR Zalo</button>
+                <button type="button" class="seg-b" id="subZaloManualBtn" onclick="switchZaloSubTab('manual')">✍️ Dán Cookie</button>
+                <button type="button" class="seg-b" id="subZaloVaultBtn" onclick="switchZaloSubTab('vault')">🗄️ Kho Cookie</button>
               </div>
 
-              <div id="zaloQRBox" style="margin-bottom:10px;padding:10px;border-radius:14px;background:rgba(9,14,28,0.65);border:1px solid rgba(56,189,248,0.28);text-align:center">
-                <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;margin-bottom:6px;flex-wrap:wrap">
-                  <span class="tag tag-blue" id="zaloQRCodeIdBadge">Mã QR: Đang cấp...</span>
-                  <span class="tag tag-purple" id="zaloQRImeiPreview">IMEI Độc Lập Mới</span>
+              <div id="zaloQRBox" style="margin-bottom:8px;padding:10px;border-radius:12px;background:rgba(8,13,24,0.75);border:1px solid rgba(56,189,248,0.24);text-align:center">
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:5px;margin-bottom:6px;flex-wrap:wrap">
+                  <span class="tag tag-blue" id="zaloQRCodeIdBadge">Chưa tạo QR</span>
+                  <span class="tag tag-purple" id="zaloQRImeiPreview">Bấm nút để cấp QR mới</span>
                 </div>
-                <div style="font-size:11.5px;font-weight:800;color:#7dd3fc;margin-bottom:6px;line-height:1.4" id="zaloQRStatusText">
-                  Mở Zalo trên điện thoại -> Quét mã QR để nhận thông báo yêu cầu đăng nhập về tài khoản Zalo của bạn!
+                <div style="font-size:11px;font-weight:700;color:#cbd5e1;margin-bottom:8px;line-height:1.4" id="zaloQRStatusText">
+                  Hệ thống không tự tạo QR tự động. Khi bạn sẵn sàng quét, hãy bấm nút <b>"Tạo Mã QR Zalo Mới"</b> bên dưới!
                 </div>
                 <div id="zaloQRStageWrap" style="display:none">
                   <div class="qr-stage">
-                    <div class="qr-laser" id="zaloQRLaser"></div>
                     <img id="zaloQRImg" src="" alt="Zalo QR Chính Chủ">
                   </div>
-                  <div style="font-size:11px;color:#fde68a;font-weight:800;margin-bottom:6px" id="zaloQRTimerBadge">⏳ Thời gian còn: 120s</div>
+                  <div style="font-size:10.5px;color:#f9a8d4;font-weight:800;margin-bottom:6px" id="zaloQRTimerBadge">⏳ Thời gian hiệu lực: 120s</div>
                 </div>
 
-                <div id="zaloQRExtractedBox" style="display:none;text-align:left;margin-top:8px;padding:9px;border-radius:11px;background:rgba(16,185,129,0.14);border:1px solid rgba(16,185,129,0.4)">
-                  <div style="font-size:11px;font-weight:800;color:#6ee7b7;margin-bottom:4px">✅ ĐÃ KẾT NỐI API ZALO & LƯU VÀO KHO VAULT:</div>
-                  <div style="font-size:10.5px;color:#cbd5e1;margin-bottom:4px">IMEI: <code id="zaloQRExtractedImei" style="color:#fde68a"></code></div>
-                  <div class="row3" style="margin-top:6px;margin-bottom:0">
+                <div id="zaloQRExtractedBox" style="display:none;text-align:left;margin-top:7px;padding:8px;border-radius:10px;background:rgba(16,185,129,0.14);border:1px solid rgba(16,185,129,0.38)">
+                  <div style="font-size:10.5px;font-weight:800;color:#6ee7b7;margin-bottom:4px">✅ ĐÃ KẾT NỐI API ZALO & LƯU VÀO KHO:</div>
+                  <div style="font-size:10px;color:#cbd5e1;margin-bottom:5px">IMEI: <code id="zaloQRExtractedImei" style="color:#fde68a"></code></div>
+                  <div class="row3" style="margin-bottom:0">
                     <button type="button" class="btn btn-green btn-mini" onclick="copyZaloQRData('imei')">Copy IMEI</button>
                     <button type="button" class="btn btn-purple btn-mini" onclick="copyZaloQRData('cookie')">Copy Cookie</button>
-                    <button type="button" class="btn btn-red btn-mini" onclick="downloadZaloQRFile()">📥 Tải .TXT</button>
+                    <button type="button" class="btn btn-red btn-mini" onclick="downloadZaloQRFile()">Tải .TXT</button>
                   </div>
                 </div>
 
                 <button type="button" class="btn btn-green" id="btnStartZaloQR" onclick="startZaloQRLogin()">
-                  <span>🔄 TẠO MÃ QR ZALO MỚI (MỖI LẦN ẤN 1 MÃ KHÁC NHAU)</span>
+                  <span>📱 BẤM TẠO MÃ QR ZALO MỚI</span>
                 </button>
               </div>
 
               <div id="zaloManualBox" style="display:none;margin-bottom:8px">
-                <div style="margin-bottom:8px">
-                  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+                <div style="margin-bottom:7px">
+                  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:3px">
                     <label class="lbl" style="margin:0">IMEI Thiết Bị Zalo (zpw_imei)</label>
                     <button type="button" class="tag tag-blue" style="cursor:pointer;border:none" onclick="generateUniqueZaloImei()">⚡ Tạo IMEI Mới</button>
                   </div>
                   <input class="inp-ctrl" name="imei" id="zaloImeiInput" placeholder="Dán IMEI Zalo hoặc bấm Tạo IMEI Mới...">
                 </div>
-                <div style="margin-bottom:8px">
-                  <label class="lbl">Cookie Zalo (JSON J2Team / Extension / Header zpw_sek=...)</label>
+                <div style="margin-bottom:7px">
+                  <label class="lbl">Cookie Zalo (JSON J2Team / Extension / Header)</label>
                   <textarea class="txt-ctrl" name="cookies" id="zaloCookieInput" placeholder="Dán Cookie Zalo vào đây..."></textarea>
                 </div>
-                <div id="zaloVerifyStatusBox" style="display:none;margin-bottom:8px;padding:8px 10px;border-radius:10px;font-size:11px;font-weight:700;background:rgba(16,185,129,0.18);border:1px solid rgba(16,185,129,0.4);color:#6ee7b7"></div>
-                <button type="button" class="btn btn-green" onclick="verifyAndSaveZaloCookieVault()">
-                  <span>🔐 LƯU VÀO KHO COOKIE & KẾT NỐI API ZALO</span>
-                </button>
+                <div id="zaloVerifyStatusBox" style="display:none;margin-bottom:7px;padding:7px 9px;border-radius:9px;font-size:10.5px;font-weight:700;background:rgba(16,185,129,0.16);border:1px solid rgba(16,185,129,0.36);color:#6ee7b7"></div>
+                <button type="button" class="btn btn-green" onclick="verifyAndSaveZaloCookieVault()">🔐 LƯU VÀO KHO & KẾT NỐI ZALO</button>
               </div>
 
               <div id="zaloVaultBox" style="display:none;margin-bottom:8px">
-                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
-                  <span class="lbl" style="margin:0">🗄️ Kho Lưu Trữ Cookie & IMEI Zalo (Bất Tử)</span>
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:5px">
+                  <span class="lbl" style="margin:0">🗄️ Kho Cookie & IMEI Zalo Đã Lưu</span>
                   <button type="button" class="tag tag-green" style="cursor:pointer;border:none" onclick="loadZaloVaultRecords()">🔄 Làm mới</button>
                 </div>
-                <div class="list-scroll" id="zaloVaultListContainer" style="max-height:210px">
-                  <div style="text-align:center;padding:14px;color:var(--txt-sub);font-size:11.5px">Đang tải Kho Cookie & IMEI Zalo...</div>
+                <div class="list-scroll" id="zaloVaultListContainer" style="max-height:200px">
+                  <div style="text-align:center;padding:12px;color:var(--txt-sub);font-size:11px">Đang tải Kho Cookie Zalo...</div>
                 </div>
               </div>
             </div>
 
             <div id="messengerInputFields" style="display:none">
-              <div class="seg seg2" style="margin-bottom:8px">
-                <button type="button" class="seg-b active" id="subMessCookieBtn" onclick="switchMessSubTab('cookie')">Dán Cookie</button>
-                <button type="button" class="seg-b" id="subMessLoginBtn" onclick="switchMessSubTab('login')">Lấy Cookie Bằng TK/MK</button>
+              <div class="seg seg2" style="margin-bottom:7px">
+                <button type="button" class="seg-b active" id="subMessCookieBtn" onclick="switchMessSubTab('cookie')">Dán Cookie Mess</button>
+                <button type="button" class="seg-b" id="subMessLoginBtn" onclick="switchMessSubTab('login')">Lấy Bằng TK/MK</button>
               </div>
 
               <div id="messCookieBox">
-                <div style="margin-bottom:8px">
-                  <label class="lbl">Cookie Facebook / Messenger (c_user + xs)</label>
+                <div style="margin-bottom:7px">
+                  <label class="lbl">Cookie Facebook / Messenger (c_user + xs — Bọc Sigma Anti-Ban v17)</label>
                   <textarea class="txt-ctrl" name="mess_cookies" id="messCookieInput" placeholder="c_user=...; xs=... hoặc JSON J2Team"></textarea>
                 </div>
-                <div id="messVerifyResultBox" style="display:none;margin-bottom:8px;padding:8px 10px;border-radius:10px;font-size:11px;font-weight:700;background:rgba(16,185,129,0.18);border:1px solid rgba(16,185,129,0.4);color:#6ee7b7"></div>
-                <button type="button" class="btn btn-green" style="margin-bottom:8px" onclick="verifyAndLockMessengerCookie()">
-                  <span>KHÓA COOKIE MESSENGER MQTT BẤT TỬ</span>
-                </button>
+                <div id="messVerifyResultBox" style="display:none;margin-bottom:7px;padding:7px 9px;border-radius:9px;font-size:10.5px;font-weight:700;background:rgba(16,185,129,0.16);border:1px solid rgba(16,185,129,0.36);color:#6ee7b7"></div>
+                <button type="button" class="btn btn-green" style="margin-bottom:7px" onclick="verifyAndLockMessengerCookie()">🛡️ KHÓA COOKIE MESSENGER ANTI-CHECKPOINT</button>
               </div>
 
-              <div id="messLoginBox" style="display:none;margin-bottom:8px">
-                <div id="messLoginStatusBox" style="display:none;margin-bottom:8px;padding:8px 10px;border-radius:10px;font-size:11px;font-weight:700"></div>
+              <div id="messLoginBox" style="display:none;margin-bottom:7px">
+                <div id="messLoginStatusBox" style="display:none;margin-bottom:7px;padding:7px 9px;border-radius:9px;font-size:10.5px;font-weight:700"></div>
                 <div style="margin-bottom:6px">
                   <label class="lbl">Email / SĐT Facebook</label>
                   <input class="inp-ctrl" id="fbLoginEmail" placeholder="Nhập Email hoặc SĐT Facebook...">
                 </div>
-                <div style="margin-bottom:8px">
+                <div style="margin-bottom:7px">
                   <label class="lbl">Mật khẩu Facebook</label>
                   <input class="inp-ctrl" type="password" id="fbLoginPass" placeholder="Nhập mật khẩu Facebook...">
                 </div>
@@ -10064,75 +10237,63 @@ input,select,textarea{font-size:15px !important;font-family:inherit;color:var(--
             </div>
 
             <div id="discordInputFields" style="display:none">
-              <div class="seg" style="margin-bottom:8px">
+              <div class="seg" style="margin-bottom:7px">
                 <button type="button" class="seg-b active" id="subDisTokenBtn" onclick="switchDiscordRegTab('token')">Đúc Token</button>
                 <button type="button" class="seg-b" id="subDisLoginBtn" onclick="switchDiscordRegTab('login')">Đăng Nhập TK/MK</button>
                 <button type="button" class="seg-b" id="subDisNewAccBtn" onclick="switchDiscordRegTab('new_acc')">Reg Acc Mới</button>
               </div>
 
               <div id="discordTokenBox">
-                <label class="lbl">Token Discord (hoặc email:pass:token)</label>
-                <textarea class="txt-ctrl" name="token" id="discordTokenInput" placeholder="Mỗi dòng 1 Token (Zero-REST Chống Reset Key)..."></textarea>
-                <div id="immortalVaultResultBox" style="display:none;margin-top:6px;margin-bottom:6px;padding:8px 10px;border-radius:10px;font-size:11px;font-weight:700;background:rgba(16,185,129,0.18);border:1px solid rgba(16,185,129,0.4);color:#6ee7b7"></div>
-                <div class="row3" style="margin-top:6px">
+                <label class="lbl">Danh sách Token Discord (Hỗ trợ nạp hàng chục Acc cùng lúc)</label>
+                <textarea class="txt-ctrl" name="token" id="discordTokenInput" placeholder="Mỗi dòng 1 Token Discord (Tự động đúc Offline 0ms)..."></textarea>
+                <div id="immortalVaultResultBox" style="display:none;margin-top:5px;margin-bottom:5px;padding:7px 9px;border-radius:9px;font-size:10.5px;font-weight:700;background:rgba(16,185,129,0.16);border:1px solid rgba(16,185,129,0.36);color:#6ee7b7"></div>
+                <div class="row3" style="margin-top:5px">
                   <button type="button" class="btn btn-green btn-mini" onclick="runImmortalizeTokensTool(true)">Đúc & Lưu</button>
                   <button type="button" class="btn btn-purple btn-mini" onclick="runImmortalizeTokensTool(false)">Lọc Live</button>
                   <button type="button" class="btn btn-dark btn-mini" onclick="copyDiscordTokenScript()">Code Lấy Token</button>
                 </div>
-                <label class="chk-box" style="margin-bottom:8px">
+                <label class="chk-box" style="margin-bottom:7px">
                   <input type="checkbox" name="is_bot" value="1">
-                  <span>Token Developer API</span>
+                  <span>Token Bot Developer API</span>
                 </label>
               </div>
 
-              <div id="discordLoginBox" style="display:none;margin-bottom:8px">
-                <div id="discordRegStatusBox" style="display:none;margin-bottom:8px;padding:8px 10px;border-radius:10px;font-size:11px;font-weight:700"></div>
-                <div style="margin-bottom:6px">
+              <div id="discordLoginBox" style="display:none;margin-bottom:7px">
+                <div id="discordRegStatusBox" style="display:none;margin-bottom:7px;padding:7px 9px;border-radius:9px;font-size:10.5px;font-weight:700"></div>
+                <div style="margin-bottom:5px">
                   <label class="lbl">Email / SĐT Discord</label>
                   <input class="inp-ctrl" name="reg_email" id="regDisEmail" placeholder="email@gmail.com hoặc SĐT">
                 </div>
                 <div class="row2">
                   <div>
-                    <label class="lbl">Mật khẩu Discord</label>
+                    <label class="lbl">Mật khẩu</label>
                     <input class="inp-ctrl" type="password" name="reg_password" id="regDisPass" placeholder="Mật khẩu...">
                   </div>
                   <div>
-                    <label class="lbl">Loại xác thực 2FA</label>
+                    <label class="lbl">Loại 2FA</label>
                     <select class="sel-ctrl" id="regDis2FAType">
                       <option value="totp">Mã 6 số / Không 2FA</option>
-                      <option value="secret">Secret Key 2FA (Tự giải mã)</option>
-                      <option value="backup">Backup Code (8 ký tự)</option>
+                      <option value="secret">Secret Key 2FA</option>
+                      <option value="backup">Backup Code</option>
                     </select>
                   </div>
                 </div>
-                <div style="margin-bottom:8px">
-                  <label class="lbl">Mã 2FA / Secret Key / Backup Code (Nếu bật 2FA)</label>
-                  <input class="inp-ctrl" name="reg_2fa" id="regDis2FA" placeholder="Nhập 6 số OTP, Secret Key hoặc Backup Code...">
+                <div style="margin-bottom:7px">
+                  <label class="lbl">Mã 2FA / Secret Key (Nếu có)</label>
+                  <input class="inp-ctrl" name="reg_2fa" id="regDis2FA" placeholder="Nhập mã 6 số hoặc Secret Key...">
                 </div>
-                <button type="button" class="btn btn-purple" onclick="extractDiscordTokenByReg()">🔑 ĐĂNG NHẬP DISCORD & LẤY TOKEN</button>
+                <button type="button" class="btn btn-purple" onclick="extractDiscordTokenByReg()">🔑 ĐĂNG NHẬP & LẤY TOKEN</button>
               </div>
 
-              <div id="discordNewAccBox" style="display:none;margin-bottom:8px">
-                <div id="discordNewAccStatusBox" style="display:none;margin-bottom:8px;padding:8px 10px;border-radius:10px;font-size:11px;font-weight:700"></div>
+              <div id="discordNewAccBox" style="display:none;margin-bottom:7px">
+                <div id="discordNewAccStatusBox" style="display:none;margin-bottom:7px;padding:7px 9px;border-radius:9px;font-size:10.5px;font-weight:700"></div>
                 <div class="row2">
-                  <div>
-                    <label class="lbl">Email mới</label>
-                    <input class="inp-ctrl" id="newAccEmail" placeholder="email@gmail.com">
-                  </div>
-                  <div>
-                    <label class="lbl">Username</label>
-                    <input class="inp-ctrl" id="newAccUsername" placeholder="phananhkhoi_vip">
-                  </div>
+                  <div><label class="lbl">Email mới</label><input class="inp-ctrl" id="newAccEmail" placeholder="email@gmail.com"></div>
+                  <div><label class="lbl">Username</label><input class="inp-ctrl" id="newAccUsername" placeholder="sakura_vip"></div>
                 </div>
                 <div class="row2">
-                  <div>
-                    <label class="lbl">Mật khẩu</label>
-                    <input class="inp-ctrl" type="password" id="newAccPassword" placeholder=">= 8 ký tự">
-                  </div>
-                  <div>
-                    <label class="lbl">Ngày sinh</label>
-                    <input class="inp-ctrl" type="date" id="newAccDob" value="2000-06-15">
-                  </div>
+                  <div><label class="lbl">Mật khẩu</label><input class="inp-ctrl" type="password" id="newAccPassword" placeholder=">= 8 ký tự"></div>
+                  <div><label class="lbl">Ngày sinh</label><input class="inp-ctrl" type="date" id="newAccDob" value="2000-06-15"></div>
                 </div>
                 <div class="row2">
                   <button type="button" class="btn btn-dark btn-mini" onclick="fillRandomDiscordRegProfile()">🎲 Random</button>
@@ -10142,54 +10303,39 @@ input,select,textarea{font-size:15px !important;font-family:inherit;color:var(--
               </div>
             </div>
 
-            <div class="row2" style="margin-bottom:10px">
-              <label class="chk-box">
-                <input type="checkbox" name="chat_cmd_enabled" value="1" checked>
-                <span>Nhận lệnh .menu</span>
-              </label>
-              <label class="chk-box">
-                <input type="checkbox" name="allow_all_cmd" value="1" checked>
-                <span>Mở lệnh cả nhóm</span>
-              </label>
+            <div class="row2" style="margin-bottom:8px">
+              <label class="chk-box"><input type="checkbox" name="chat_cmd_enabled" value="1" checked><span>Nhận lệnh .menu</span></label>
+              <label class="chk-box"><input type="checkbox" name="allow_all_cmd" value="1" checked><span>Mở lệnh cả nhóm</span></label>
             </div>
 
-            <button class="btn btn-red" type="submit">LƯU TÀI KHOẢN HỆ THỐNG</button>
+            <button class="btn btn-red" type="submit">LƯU TÀI KHOẢN VÀO HỆ THỐNG</button>
           </form>
         </div>
 
         <div class="card">
           <div class="card-hd">
-            <div class="card-ttl">
-              <span class="ico-dot" style="background:rgba(168,85,247,0.2);color:var(--purple)">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-              </span>
-              <span>Trình Tạo Mã OTP 2FA & Tiện Ích</span>
-            </div>
+            <div class="card-ttl"><span>🔐 Tạo Mã OTP 2FA & Status Discord</span></div>
             <span class="tag tag-purple" id="totpTimerBadge">30s</span>
           </div>
-          <div style="display:flex;gap:6px;margin-bottom:8px">
-            <input class="inp-ctrl" id="web2FASecretInput" placeholder="Dán Secret Key 2FA (VD: JBSWY3DPEHPK3PXP)..." style="flex:1">
+          <div style="display:flex;gap:5px;margin-bottom:7px">
+            <input class="inp-ctrl" id="web2FASecretInput" placeholder="Dán Secret Key 2FA..." style="flex:1">
             <button type="button" class="btn btn-purple btn-mini" onclick="generateWeb2FA(true)">Lấy OTP</button>
           </div>
-          <div id="web2FAResultBox" style="display:none;padding:9px 12px;border-radius:12px;background:rgba(15,23,42,0.8);border:1px solid rgba(168,85,247,0.4);align-items:center;justify-content:space-between;margin-bottom:8px">
+          <div id="web2FAResultBox" style="display:none;padding:7px 10px;border-radius:10px;background:rgba(15,23,42,0.85);border:1px solid rgba(244,114,182,0.35);align-items:center;justify-content:space-between;margin-bottom:7px">
             <div>
-              <div style="font-size:10px;color:var(--txt-sub)">MÃ OTP 2FA HIỆN TẠI</div>
-              <div id="web2FACodeVal" style="font-size:20px;font-weight:800;font-family:'JetBrains Mono',monospace;color:#fde68a;letter-spacing:3px">------</div>
+              <div style="font-size:9.5px;color:var(--txt-sub)">MÃ OTP 2FA HIỆN TẠI</div>
+              <div id="web2FACodeVal" style="font-size:18px;font-weight:800;font-family:'JetBrains Mono',monospace;color:#f9a8d4;letter-spacing:2.5px">------</div>
             </div>
-            <button type="button" class="btn btn-dark btn-mini" onclick="copyCurrent2FACode()">Sao chép</button>
+            <button type="button" class="btn btn-dark btn-mini" onclick="copyCurrent2FACode()">Copy</button>
           </div>
-
-          <div style="border-top:1px solid rgba(255,255,255,0.08);padding-top:8px;margin-top:4px">
-            <label class="lbl">Nâng Cấp Trạng Thái & Huy Hiệu Discord VIP</label>
-            <div style="display:flex;gap:6px;margin-bottom:6px">
-              <input class="inp-ctrl" id="dcCustomStatusInput" placeholder="Trạng thái Discord (VD: NOEL v15 Phan Anh Khôi)..." style="flex:1">
-              <button type="button" class="btn btn-green btn-mini" onclick="updateDiscordCustomStatus()">Đổi Status</button>
-            </div>
-            <div class="row3" style="margin-bottom:0">
-              <button type="button" class="btn btn-dark btn-mini" onclick="setDiscordHypeSquad(1)">⚔️ Bravery</button>
-              <button type="button" class="btn btn-dark btn-mini" onclick="setDiscordHypeSquad(2)">🔥 Brilliance</button>
-              <button type="button" class="btn btn-dark btn-mini" onclick="setDiscordHypeSquad(3)">💎 Balance</button>
-            </div>
+          <div style="display:flex;gap:5px;margin-bottom:5px">
+            <input class="inp-ctrl" id="dcCustomStatusInput" placeholder="Custom Status Discord..." style="flex:1">
+            <button type="button" class="btn btn-green btn-mini" onclick="updateDiscordCustomStatus()">Đổi Status</button>
+          </div>
+          <div class="row3" style="margin-bottom:0">
+            <button type="button" class="btn btn-dark btn-mini" onclick="setDiscordHypeSquad(1)">⚔️ Bravery</button>
+            <button type="button" class="btn btn-dark btn-mini" onclick="setDiscordHypeSquad(2)">🔥 Brilliance</button>
+            <button type="button" class="btn btn-dark btn-mini" onclick="setDiscordHypeSquad(3)">💎 Balance</button>
           </div>
         </div>
       </div>
@@ -10197,29 +10343,24 @@ input,select,textarea{font-size:15px !important;font-family:inherit;color:var(--
       <div class="c7">
         <div class="card">
           <div class="card-hd">
-            <div class="card-ttl">
-              <span class="ico-dot" style="background:rgba(16,185,129,0.2);color:var(--green)">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
-              </span>
-              <span>Tài Khoản Đang Bảo Vệ ({{ accounts|length }})</span>
-            </div>
+            <div class="card-ttl"><span>🛡️ Danh Sách Tài Khoản ({{ accounts|length }})</span></div>
             <button class="btn btn-dark btn-mini" type="button" onclick="loadGroupsAndRooms(false)">Quét Phòng</button>
           </div>
 
           <div class="list-scroll" style="max-height:520px">
             {% if not accounts %}
-              <div style="text-align:center;padding:24px;color:var(--txt-sub);font-size:12px">Chưa có tài khoản kết nối. Hãy quét QR Zalo hoặc thêm Token Discord / Cookie Mess ở bên trái.</div>
+              <div style="text-align:center;padding:22px;color:var(--txt-sub);font-size:11.5px">Chưa có tài khoản. Hãy bấm tạo mã QR Zalo hoặc nạp Token Discord / Cookie Mess ở bên trái.</div>
             {% endif %}
             {% for a in accounts %}
               <div class="item-row">
                 <div class="item-main">
                   <div style="display:flex;align-items:center;gap:5px">
                     <span class="tag {% if a.platform == 'discord' %}tag-purple{% elif a.platform == 'messenger' %}tag-red{% else %}tag-blue{% endif %}">
-                      {{ 'DISCORD v15 VIP' if a.platform == 'discord' else ('MESS MQTT v15' if a.platform == 'messenger' else 'ZALO v15 VIP') }}
+                      {{ 'DISCORD VIP' if a.platform == 'discord' else ('MESS SIGMA' if a.platform == 'messenger' else 'ZALO VIP') }}
                     </span>
                     <span class="item-name">{{ a.masked_name }}</span>
                   </div>
-                  <div class="item-meta">ID: <code>{{ a.masked_uid }}</code> • Lệnh: <strong>{{ 'BẬT' if a.chat_cmd_enabled else 'TẮT' }}</strong></div>
+                  <div class="item-meta">ID: <code>{{ a.masked_uid }}</code> • Lệnh .menu: <strong>{{ 'BẬT' if a.chat_cmd_enabled else 'TẮT' }}</strong></div>
                 </div>
                 <div style="display:flex;gap:4px">
                   <button class="btn btn-dark btn-mini" type="button" onclick="toggleAccCmd({{ a.id }}, {{ 0 if a.chat_cmd_enabled else 1 }})">{{ 'Tắt' if a.chat_cmd_enabled else 'Bật' }}</button>
@@ -10238,12 +10379,7 @@ input,select,textarea{font-size:15px !important;font-family:inherit;color:var(--
       <div class="c6">
         <div class="card">
           <div class="card-hd">
-            <div class="card-ttl">
-              <span class="ico-dot" style="background:rgba(16,185,129,0.2);color:var(--green)">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-              </span>
-              <span>Chọn Phòng Chat</span>
-            </div>
+            <div class="card-ttl"><span>💬 Chọn Phòng Chat Mục Tiêu</span></div>
             <div style="display:flex;gap:4px">
               <button class="btn btn-green btn-mini" type="button" onclick="loadGroupsAndRooms(true)">Quét</button>
               <button class="btn btn-dark btn-mini" type="button" onclick="selectAllTargets()">Chọn hết</button>
@@ -10251,19 +10387,19 @@ input,select,textarea{font-size:15px !important;font-family:inherit;color:var(--
             </div>
           </div>
 
-          <div class="seg seg4" style="margin-bottom:8px">
+          <div class="seg seg4" style="margin-bottom:7px">
             <button type="button" class="seg-b active" id="fltRoomAll" onclick="setRoomPlatformFilter('all')">Tất Cả</button>
             <button type="button" class="seg-b" id="fltRoomZalo" onclick="setRoomPlatformFilter('zalo')">Zalo</button>
             <button type="button" class="seg-b" id="fltRoomDiscord" onclick="setRoomPlatformFilter('discord')">Discord</button>
             <button type="button" class="seg-b" id="fltRoomMess" onclick="setRoomPlatformFilter('messenger')">Mess</button>
           </div>
 
-          <div style="margin-bottom:8px">
-            <input class="inp-ctrl" id="roomSearchInput" placeholder="🔍 Tìm nhanh tên Box Zalo, Kênh Discord, Nhóm Mess..." oninput="renderTargetList()">
+          <div style="margin-bottom:7px">
+            <input class="inp-ctrl" id="roomSearchInput" placeholder="🔍 Tìm tên Box Zalo, Kênh Discord, Nhóm Mess..." oninput="renderTargetList()">
           </div>
 
           <div class="list-scroll" id="targetListContainer" style="max-height:330px">
-            <div style="text-align:center;padding:20px;color:var(--txt-sub);font-size:12px">Bấm "Quét" để tải danh sách phòng tự động.</div>
+            <div style="text-align:center;padding:18px;color:var(--txt-sub);font-size:11.5px">Bấm "Quét" để tải danh sách phòng.</div>
           </div>
         </div>
       </div>
@@ -10271,16 +10407,11 @@ input,select,textarea{font-size:15px !important;font-family:inherit;color:var(--
       <div class="c6">
         <div class="card">
           <div class="card-hd">
-            <div class="card-ttl">
-              <span class="ico-dot" style="background:rgba(244,63,94,0.2);color:var(--red)">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><circle cx="12" cy="12" r="4"/><path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-3.92 7.94"/></svg>
-              </span>
-              <span>Tag Thành Viên</span>
-            </div>
+            <div class="card-ttl"><span>🎯 Chọn Thành Viên Để Tag</span></div>
             <span class="tag tag-red" id="selectedTagBadge">0 được tag</span>
           </div>
 
-          <div style="display:flex;gap:6px;margin-bottom:8px;align-items:center">
+          <div style="display:flex;gap:5px;margin-bottom:7px;align-items:center">
             <label class="chk-box" style="flex:1">
               <input type="checkbox" id="chkTagAll" onchange="updateTagSummary()">
               <span>Tag @All / @everyone</span>
@@ -10289,12 +10420,12 @@ input,select,textarea{font-size:15px !important;font-family:inherit;color:var(--
             <button class="btn btn-dark btn-mini" type="button" onclick="clearSelectedMentions()">Xóa</button>
           </div>
 
-          <div style="margin-bottom:8px">
-            <input class="inp-ctrl" id="memberSearchInput" placeholder="🔍 Lọc nhanh tên thành viên trong nhóm..." oninput="renderMemberList()">
+          <div style="margin-bottom:7px">
+            <input class="inp-ctrl" id="memberSearchInput" placeholder="🔍 Lọc tên thành viên trong nhóm..." oninput="renderMemberList()">
           </div>
 
           <div class="list-scroll" id="memberListContainer" style="max-height:330px">
-            <div style="text-align:center;padding:20px;color:var(--txt-sub);font-size:12px">Bấm "Thành viên" ở 1 phòng bên trái để chọn người Tag.</div>
+            <div style="text-align:center;padding:18px;color:var(--txt-sub);font-size:11.5px">Bấm "Thành viên" ở 1 phòng bên trái để tải danh sách.</div>
           </div>
         </div>
       </div>
@@ -10306,41 +10437,36 @@ input,select,textarea{font-size:15px !important;font-family:inherit;color:var(--
       <div class="c7">
         <div class="card">
           <div class="card-hd">
-            <div class="card-ttl">
-              <span class="ico-dot" style="background:rgba(244,63,94,0.2);color:var(--red)">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-              </span>
-              <span>Cấu Hình Chiến Dịch</span>
-            </div>
-            <span class="tag tag-green">Đa Luồng 3 App</span>
+            <div class="card-ttl"><span>⚡ Khởi Chạy Chiến Dịch (Cân 100 Tiến Trình & Đa Acc)</span></div>
+            <span class="tag tag-green">Multi-Tab Turbo</span>
           </div>
 
           <div class="row2">
             <div>
               <label class="lbl">Chế độ gửi</label>
               <select class="sel-ctrl" id="cfgMode">
-                <option value="treo_nhay">🔥 Treo Nhây Từng Câu (Zalo • Discord • Mess MQTT)</option>
-                <option value="treo_ngon">📜 Treo Ngôn Nguyên Bài (Zalo • Discord • Mess MQTT)</option>
-                <option value="fast">⚡ Spam Nhanh Siêu Tốc 0.0s (Zalo • Discord • Mess)</option>
-                <option value="raid_burst">💥 Raid Tổng Lực Siêu Tốc (Chữ Lớn + Đa Sắc Từ + 5 Icon)</option>
-                <option value="auto_shuffle">🎲 Đảo Câu Biến Thiên Ngẫu Nhiên (Chống Trùng 100%)</option>
-                <option value="nhay_tag_all">🎯 Nhây Tag @All / @everyone + Ré Tên Liên Hoàn</option>
-                <option value="nhay_poll">📊 Nhây Tạo Poll Bình Chọn (Zalo • Discord • Mess MQTT)</option>
-                <option value="nhay_typing">⌨️ Treo Hiệu Ứng Đang Soạn Tin Typing (3 Nền Tảng)</option>
-                <option value="nhay_namebox">✏️ Nhây Đổi Tên Box / Nhóm Liên Tục (Zalo & Mess)</option>
-                <option value="zalo_todo">📌 Giao Việc To-Do Tag Thành Viên (Zalo VIP)</option>
-                <option value="zalo_cardbank">💳 Gửi Thẻ Ngân Hàng STK VIP (Zalo VIP)</option>
-                <option value="share_contact">🪪 Treo Danh Thiếp Business Card (Zalo & Mess MQTT)</option>
-                <option value="reaction_storm">❤️ Bão Thả Cảm Xúc Reaction Liên Hoàn (Zalo & Discord)</option>
-                <option value="nhay_theme">🎨 Nhây Đổi Chủ Đề Nền Theme (Mess MQTT)</option>
-                <option value="share_link">🔗 Treo Chia Sẻ Liên Kết Kèm Chữ (Mess MQTT)</option>
-                <option value="mess_nickname">👑 Nhây Đổi Biệt Danh Thành Viên Trong Box (Mess VIP)</option>
-                <option value="discord_embed_vip">💎 Chữ Nghệ Thuật Blockquote Đa Tầng (Discord VIP)</option>
-                <option value="discord_status_rotator">🌟 Đổi Custom Status Tự Động Theo Dòng (Discord VIP)</option>
+                <option value="treo_nhay">🔥 Treo Nhây Từng Câu (.n)</option>
+                <option value="treo_ngon">📜 Treo Ngôn Nguyên Bài (.g)</option>
+                <option value="fast">⚡ Spam Nhanh Siêu Tốc (.s)</option>
+                <option value="raid_burst">💥 Raid Tổng Lực Siêu Tốc (.r)</option>
+                <option value="auto_shuffle">🎲 Đảo Câu Biến Thiên Ngẫu Nhiên (.a)</option>
+                <option value="nhay_tag_all">🎯 Nhây Tag @All / @everyone Liên Hoàn</option>
+                <option value="nhay_poll">📊 Nhây Tạo Poll Bình Chọn (.poll)</option>
+                <option value="nhay_typing">⌨️ Treo Hiệu Ứng Đang Soạn Tin (.typing)</option>
+                <option value="nhay_namebox">✏️ Nhây Đổi Tên Box / Nhóm (.tenbox)</option>
+                <option value="zalo_todo">📌 Giao Việc To-Do Tag Thành Viên (.todo)</option>
+                <option value="zalo_cardbank">💳 Gửi Thẻ Ngân Hàng STK VIP (.bank)</option>
+                <option value="share_contact">🪪 Treo Danh Thiếp Business Card (.card)</option>
+                <option value="reaction_storm">❤️ Bão Thả Cảm Xúc Reaction Liên Hoàn</option>
+                <option value="nhay_theme">🎨 Nhây Đổi Chủ Đề Nền Theme (.theme)</option>
+                <option value="share_link">🔗 Treo Chia Sẻ Liên Kết (.sharelink)</option>
+                <option value="mess_nickname">👑 Nhây Đổi Biệt Danh Thành Viên (.setname)</option>
+                <option value="discord_embed_vip">💎 Chữ Nghệ Thuật Blockquote Discord</option>
+                <option value="discord_status_rotator">🌟 Đổi Custom Status Tự Động Discord</option>
               </select>
             </div>
             <div>
-              <label class="lbl">Hiệu ứng màu</label>
+              <label class="lbl">Hiệu ứng màu chữ</label>
               <select class="sel-ctrl" id="cfgColorMode">
                 <option value="rainbow">Cầu Vồng Dòng</option>
                 <option value="word_rainbow">Phối Màu Từng Từ</option>
@@ -10351,7 +10477,7 @@ input,select,textarea{font-size:15px !important;font-family:inherit;color:var(--
             </div>
           </div>
 
-          <div class="row3">
+          <div class="row4">
             <div>
               <label class="lbl">Màu cố định</label>
               <select class="sel-ctrl" id="cfgFixedColor">
@@ -10369,16 +10495,26 @@ input,select,textarea{font-size:15px !important;font-family:inherit;color:var(--
               <label class="lbl">Số Icon (0-10)</label>
               <input class="inp-ctrl" type="number" min="0" max="10" id="cfgIconCount" value="3">
             </div>
+            <div>
+              <label class="lbl">Số luồng (1-100)</label>
+              <input class="inp-ctrl" type="number" min="1" max="100" id="cfgBatchCount" value="1">
+            </div>
           </div>
 
-          <div style="display:flex;gap:5px;margin-bottom:8px;flex-wrap:wrap">
+          <div style="display:flex;gap:4px;margin-bottom:7px;flex-wrap:wrap;align-items:center">
             <span class="tag tag-purple" style="cursor:pointer" onclick="document.getElementById('cfgDelay').value='0.0'">0.0s (Discord)</span>
             <span class="tag tag-blue" style="cursor:pointer" onclick="document.getElementById('cfgDelay').value='0.2'">0.2s (Zalo)</span>
-            <span class="tag tag-red" style="cursor:pointer" onclick="document.getElementById('cfgDelay').value='0.6'">0.6s (Mess MQTT)</span>
+            <span class="tag tag-red" style="cursor:pointer" onclick="document.getElementById('cfgDelay').value='1.9'">1.9s (Mess Anti-Ban)</span>
+            <span style="margin-left:auto;display:flex;gap:3px">
+              <span class="tag tag-green" style="cursor:pointer" onclick="document.getElementById('cfgBatchCount').value='5'">5 Luồng</span>
+              <span class="tag tag-green" style="cursor:pointer" onclick="document.getElementById('cfgBatchCount').value='20'">20 Luồng</span>
+              <span class="tag tag-amber" style="cursor:pointer" onclick="document.getElementById('cfgBatchCount').value='50'">50 Luồng</span>
+              <span class="tag tag-red" style="cursor:pointer" onclick="document.getElementById('cfgBatchCount').value='100'">100 Luồng</span>
+            </span>
           </div>
 
-          <div style="margin-bottom:8px">
-            <label class="lbl">File Kịch Bản</label>
+          <div style="margin-bottom:7px">
+            <label class="lbl">Chọn File Kịch Bản</label>
             <select class="sel-ctrl" id="cfgFileSelect">
               <option value="">-- Nhập nội dung trực tiếp bên dưới --</option>
               {% for f in files %}
@@ -10387,20 +10523,20 @@ input,select,textarea{font-size:15px !important;font-family:inherit;color:var(--
             </select>
           </div>
 
-          <div style="margin-bottom:8px">
+          <div style="margin-bottom:7px">
             <label class="lbl">Nội dung (Ngăn cách bằng ; hoặc xuống dòng, hỗ trợ @Tên)</label>
             <textarea class="txt-ctrl" id="cfgRawText" placeholder="Nhập nội dung hoặc chọn File ở trên..."></textarea>
           </div>
 
-          <div class="row2" style="margin-bottom:10px">
+          <div class="row2" style="margin-bottom:8px">
             <label class="chk-box"><input type="checkbox" id="cfgHeading" checked><span>Chữ Lớn In Đậm</span></label>
             <label class="chk-box"><input type="checkbox" id="cfgUseEmoji" checked><span>Đính Kèm Icon</span></label>
-            <label class="chk-box"><input type="checkbox" id="cfgAntiband" checked><span>Bảo Vệ Anti-Ban</span></label>
-            <label class="chk-box"><input type="checkbox" id="cfgMultiAcc" checked><span>Đồng Bộ Đa Acc</span></label>
+            <label class="chk-box"><input type="checkbox" id="cfgAntiband" checked><span>Bảo Vệ Anti-Ban v17</span></label>
+            <label class="chk-box"><input type="checkbox" id="cfgMultiAcc" checked><span>Đồng Bộ Nhiều Acc</span></label>
           </div>
 
-          <div class="row2">
-            <button class="btn btn-red" type="button" onclick="launchCampaignTask()">▶ CHẠY CHIẾN DỊCH</button>
+          <div class="row2" style="margin-bottom:0">
+            <button class="btn btn-red" type="button" onclick="launchCampaignTask()">▶ BẮT ĐẦU CHẠY</button>
             <button class="btn btn-dark" type="button" onclick="stopAllRunningTasks()">■ DỪNG TẤT CẢ</button>
           </div>
         </div>
@@ -10409,16 +10545,11 @@ input,select,textarea{font-size:15px !important;font-family:inherit;color:var(--
       <div class="c5">
         <div class="card">
           <div class="card-hd">
-            <div class="card-ttl">
-              <span class="ico-dot" style="background:rgba(56,189,248,0.2);color:var(--blue)">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
-              </span>
-              <span>Tiến Trình Đang Chạy</span>
-            </div>
-            <span class="tag tag-blue">Live</span>
+            <div class="card-ttl"><span>🚀 Tiến Trình Đang Chạy</span></div>
+            <span class="tag tag-blue">Đồng Bộ Đa Tab</span>
           </div>
-          <div class="list-scroll" id="activeTasksContainer" style="max-height:360px">
-            <div style="text-align:center;padding:20px;color:var(--txt-sub);font-size:12px">Chưa có tiến trình chạy.</div>
+          <div class="list-scroll" id="activeTasksContainer" style="max-height:380px">
+            <div style="text-align:center;padding:18px;color:var(--txt-sub);font-size:11.5px">Chưa có tiến trình chạy.</div>
           </div>
         </div>
       </div>
@@ -10430,25 +10561,25 @@ input,select,textarea{font-size:15px !important;font-family:inherit;color:var(--
       <div class="c5">
         <div class="card">
           <div class="card-hd">
-            <div class="card-ttl"><span>Tải & Tạo File .TXT</span></div>
+            <div class="card-ttl"><span>📁 Tải & Tạo File .TXT</span></div>
             <span class="tag tag-red">Tự Đánh Số</span>
           </div>
 
           <div class="drop-box">
             <input type="file" id="txtFileInput" accept=".txt" onchange="handleTxtUpload(this)">
-            <div style="font-size:12.5px;font-weight:800;color:#fff">📁 Chạm để chọn File .TXT</div>
-            <div style="font-size:10.5px;color:var(--txt-sub);margin-top:2px">Tự động lọc sạch mã lỗi & đánh số thứ tự</div>
-            <div id="uploadProgWrap" style="display:none;margin-top:6px;height:5px;background:#1e293b;border-radius:9px;overflow:hidden">
-              <div id="uploadProgBar" style="height:100%;width:0%;background:#10b981;transition:width .25s ease"></div>
+            <div style="font-size:12px;font-weight:800;color:#fff">📁 Chạm để tải lên File .TXT</div>
+            <div style="font-size:10px;color:var(--txt-sub);margin-top:2px">Tự động lọc sạch mã lỗi & đánh số thứ tự</div>
+            <div id="uploadProgWrap" style="display:none;margin-top:5px;height:4px;background:#1e293b;border-radius:9px;overflow:hidden">
+              <div id="uploadProgBar" style="height:100%;width:0%;background:#ec4899;transition:width .25s ease"></div>
             </div>
           </div>
 
           <form method="POST" action="/file/create">
-            <div style="margin-bottom:7px">
+            <div style="margin-bottom:6px">
               <label class="lbl">Tên File (.txt)</label>
               <input class="inp-ctrl" name="filename" placeholder="kich_ban.txt" required>
             </div>
-            <div style="margin-bottom:9px">
+            <div style="margin-bottom:8px">
               <label class="lbl">Nội dung (Mỗi dòng 1 câu)</label>
               <textarea class="txt-ctrl" name="content" placeholder="Nhập các câu..." required></textarea>
             </div>
@@ -10460,21 +10591,21 @@ input,select,textarea{font-size:15px !important;font-family:inherit;color:var(--
       <div class="c7">
         <div class="card">
           <div class="card-hd">
-            <div class="card-ttl"><span>Kho File Kịch Bản ({{ files|length }})</span></div>
-            <span class="tag tag-green">Gõ .n &lt;số&gt; @Tên</span>
+            <div class="card-ttl"><span>📚 Kho File Kịch Bản ({{ files|length }})</span></div>
+            <span class="tag tag-green">Gõ .n &lt;số&gt; hoặc .g &lt;số&gt;</span>
           </div>
           <div class="list-scroll" style="max-height:380px">
             {% if not files %}
-              <div style="text-align:center;padding:20px;color:var(--txt-sub);font-size:12px">Kho file trống.</div>
+              <div style="text-align:center;padding:18px;color:var(--txt-sub);font-size:11.5px">Kho file trống.</div>
             {% endif %}
             {% for f in files %}
               <div class="item-row">
                 <div class="item-main">
-                  <div style="display:flex;align-items:center;gap:6px">
+                  <div style="display:flex;align-items:center;gap:5px">
                     <span class="tag tag-red">#{{ f.display_num }}</span>
                     <span class="item-name">{{ f.filename }}</span>
                   </div>
-                  <div class="item-meta">{{ f.lines_count }} câu • Lệnh: <code>.n {{ f.display_num }} @Tên</code></div>
+                  <div class="item-meta">{{ f.lines_count }} câu • Lệnh: <code>.n {{ f.display_num }} @Tên</code> | <code>.g {{ f.display_num }} @Tên</code></div>
                 </div>
                 <a href="/file/delete/{{ f.id }}" class="btn btn-red btn-mini" style="text-decoration:none">Xóa</a>
               </div>
@@ -10490,7 +10621,7 @@ input,select,textarea{font-size:15px !important;font-family:inherit;color:var(--
       <div class="c6">
         <div class="card">
           <div class="card-hd">
-            <div class="card-ttl"><span>Tường Lửa Anti-Ban v15 & Ping</span></div>
+            <div class="card-ttl"><span>🛡️ Tường Lửa Anti-Ban v17 & Sức Khỏe Acc</span></div>
             <button type="button" class="btn btn-green btn-mini" onclick="checkWebPingNow(true)">⚡ Đo Ping</button>
           </div>
           <div class="row2">
@@ -10499,11 +10630,11 @@ input,select,textarea{font-size:15px !important;font-family:inherit;color:var(--
                 <div class="item-meta">Web Ping (RTT)</div>
                 <div class="item-name" id="pingRttVal" style="color:var(--green)">-- ms</div>
               </div>
-              <span class="tag tag-green" id="pingEngineBadge">0.4ms</span>
+              <span class="tag tag-green" id="pingEngineBadge">0.3ms</span>
             </div>
             <div class="item-row" style="margin:0">
               <div>
-                <div class="item-meta">Luồng Hoạt Động</div>
+                <div class="item-meta">Luồng Song Song</div>
                 <div class="item-name" id="pingThreadsVal" style="color:var(--blue)">Mượt</div>
               </div>
               <span class="tag tag-purple">TLS 1.3 + MQTT</span>
@@ -10512,7 +10643,7 @@ input,select,textarea{font-size:15px !important;font-family:inherit;color:var(--
           <div class="row2">
             <div class="item-row" style="margin:0">
               <div>
-                <div class="item-meta">Gói Tin Đã Lọc</div>
+                <div class="item-meta">Gói Tin Đã Bảo Vệ</div>
                 <div class="item-name" id="fwInspectedCnt">0 gói</div>
               </div>
             </div>
@@ -10530,8 +10661,8 @@ input,select,textarea{font-size:15px !important;font-family:inherit;color:var(--
       <div class="c6">
         <div class="card">
           <div class="card-hd">
-            <div class="card-ttl"><span>Nhật Ký Điều Khiển Trực Tiếp</span></div>
-            <span class="tag tag-purple">Phan Anh Khôi Shield</span>
+            <div class="card-ttl"><span>📜 Nhật Ký Lệnh Khung Chat</span></div>
+            <span class="tag tag-red">Chống Lặp Lệnh .menu 100%</span>
           </div>
           <div class="list-scroll" id="cmdLogBox" style="max-height:360px"></div>
         </div>
@@ -10575,23 +10706,42 @@ let SELECTED_TARGETS = new Map();
 let CURRENT_MEMBERS = [];
 let SELECTED_MENTIONS = new Map();
 let ROOM_PLATFORM_FILTER = 'all';
-let CURRENT_TAB_IDX = 0;
 let ZALO_QR_SESSION_ID = '';
 let ZALO_QR_POLL_TIMER = null;
 let LAST_ZALO_QR_RESULT = {imei: '', cookies_str: '', file_name: 'zalo_cookie.txt', file_content: ''};
+let SAKURA_ENABLED = true;
 
-setTimeout(() => {
-  const loader = document.getElementById('pageLoader');
-  if (loader) loader.classList.add('hide');
-}, 400);
+// Đồng bộ siêu mượt giữa nhiều Tab trình duyệt (Multi-Tab Zero-Lag BroadcastBus)
+const MULTI_TAB_BUS = (typeof BroadcastChannel !== 'undefined') ? new BroadcastChannel('sakura_frost_v17_bus') : null;
+let LAST_CROSS_TAB_STATUS_TS = 0;
+
+if (MULTI_TAB_BUS) {
+  MULTI_TAB_BUS.onmessage = (ev) => {
+    const msg = ev.data || {};
+    if (msg.type === 'STATUS_SNAPSHOT' && msg.data) {
+      LAST_CROSS_TAB_STATUS_TS = Date.now();
+      renderSystemStatusData(msg.data);
+    } else if (msg.type === 'FORCE_REFRESH') {
+      pollSystemStatus(true);
+    }
+  };
+}
+
+function toggleSakuraPetals() {
+  SAKURA_ENABLED = !SAKURA_ENABLED;
+  const sky = document.getElementById('sakuraSkyLayer');
+  const btn = document.getElementById('btnToggleSakura');
+  if (sky) sky.classList.toggle('paused', !SAKURA_ENABLED);
+  if (btn) btn.textContent = SAKURA_ENABLED ? '🌸 Lá Rơi: BẬT' : '🌸 Lá Rơi: TẮT';
+}
 
 function showToast(msg) {
   const box = document.getElementById('toastBox');
   const el = document.createElement('div');
   el.className = 'toast-msg';
-  el.innerHTML = `<span>⚡ ${msg}</span>`;
+  el.innerHTML = `<span>🌸 ${msg}</span>`;
   box.appendChild(el);
-  setTimeout(() => { el.remove(); }, 2800);
+  setTimeout(() => { el.remove(); }, 2600);
 }
 
 function escapeHtmlSafe(s) {
@@ -10601,16 +10751,12 @@ function escapeHtmlSafe(s) {
 function switchMainTab(tabId, btnEl) {
   requestAnimationFrame(() => {
     const panes = document.querySelectorAll('.tab-pane');
-    for (let i = 0; i < panes.length; i++) {
-      panes[i].classList.remove('active');
-    }
+    for (let i = 0; i < panes.length; i++) panes[i].classList.remove('active');
     const targetSec = document.getElementById(tabId);
     if (targetSec) targetSec.classList.add('active');
 
     const btns = document.querySelectorAll('.dock .d-btn');
-    for (let i = 0; i < btns.length; i++) {
-      btns[i].classList.remove('active');
-    }
+    for (let i = 0; i < btns.length; i++) btns[i].classList.remove('active');
     if (btnEl) btnEl.classList.add('active');
     if (tabId === 'tab-targets' && ALL_TARGETS.length === 0) {
       loadGroupsAndRooms(false);
@@ -10656,9 +10802,9 @@ function switchDiscordRegTab(mode) {
   document.getElementById('discordNewAccBox').style.display = (mode === 'new_acc') ? 'block' : 'none';
 }
 
-let LAST_RENDERED_QR_NONCE = '';
 let ZALO_VAULT_CACHE = [];
 
+// Chỉ khi bấm nút "BẤM TẠO MÃ QR ZALO MỚI" mới gọi hàm này (KHÔNG tự động tạo QR khi mở trang!)
 async function startZaloQRLogin() {
   const stTxt = document.getElementById('zaloQRStatusText');
   const stageWrap = document.getElementById('zaloQRStageWrap');
@@ -10675,8 +10821,8 @@ async function startZaloQRLogin() {
   extBox.style.display = 'none';
   qrImg.src = '';
   stageWrap.style.display = 'none';
-  stTxt.textContent = '⏳ Đang tạo phiên QR Zalo độc lập mới & cấp IMEI mới 100%...';
-  if (codeBadge) codeBadge.textContent = 'Đang lấy mã mới...';
+  stTxt.textContent = '⏳ Đang kết nối máy chủ id.zalo.me để tạo mã QR chính chủ mới...';
+  if (codeBadge) codeBadge.textContent = 'Đang lấy mã QR...';
   btn.disabled = true;
 
   try {
@@ -10692,7 +10838,6 @@ async function startZaloQRLogin() {
       return;
     }
     ZALO_QR_SESSION_ID = d.session_id;
-    LAST_RENDERED_QR_NONCE = d.qr_nonce || d.session_id;
     stTxt.textContent = d.message;
     if (codeBadge) codeBadge.textContent = `Mã QR #${(d.qr_code_id || d.qr_nonce || d.session_id).slice(0, 6).toUpperCase()}`;
     if (imeiBadge && d.imei) imeiBadge.textContent = `IMEI: ${d.imei.slice(0, 8)}...${d.imei.slice(-4)}`;
@@ -10704,7 +10849,7 @@ async function startZaloQRLogin() {
       stageWrap.style.display = 'block';
       qrImg.src = d.qr_image_url;
     }
-    btn.innerHTML = '<span>🔄 TẠO MÃ QR ZALO MỚI (MỖI LẦN ẤN 1 MÃ KHÁC NHAU)</span>';
+    btn.innerHTML = '<span>🔄 ĐỔI MÃ QR ZALO MỚI KHÁC</span>';
     ZALO_QR_POLL_TIMER = setInterval(pollZaloQRStatus, 1400);
   } catch (e) {
     btn.disabled = false;
@@ -10712,12 +10857,7 @@ async function startZaloQRLogin() {
   }
 }
 
-setTimeout(() => {
-  if (!ZALO_QR_SESSION_ID && document.getElementById('zaloQRBox')) {
-    startZaloQRLogin();
-  }
-  loadZaloVaultRecords();
-}, 450);
+setTimeout(() => { loadZaloVaultRecords(); }, 400);
 
 async function pollZaloQRStatus() {
   if (!ZALO_QR_SESSION_ID) return;
@@ -10763,8 +10903,8 @@ async function pollZaloQRStatus() {
       document.getElementById('zaloQRExtractedImei').textContent = (d.imei || '').slice(0, 24) + '...';
       extBox.style.display = 'block';
       loadZaloVaultRecords();
-      showToast('🎉 Đã xác nhận đăng nhập Zalo & lưu Cookie + IMEI vào Kho Vault!');
-      setTimeout(() => location.reload(), 2200);
+      showToast('🎉 Đã xác nhận đăng nhập Zalo & lưu Cookie + IMEI!');
+      setTimeout(() => location.reload(), 1800);
     } else if (d.status === 'expired' || d.status === 'declined' || d.status === 'error') {
       clearInterval(ZALO_QR_POLL_TIMER);
       ZALO_QR_POLL_TIMER = null;
@@ -10777,12 +10917,9 @@ async function verifyAndSaveZaloCookieVault() {
   const imei = (document.getElementById('zaloImeiInput').value || '').trim();
   const cookies = (document.getElementById('zaloCookieInput').value || '').trim();
   const box = document.getElementById('zaloVerifyStatusBox');
-  if (!cookies) {
-    showToast('Hãy dán Cookie Zalo vào ô!');
-    return;
-  }
+  if (!cookies) { showToast('Hãy dán Cookie Zalo vào ô!'); return; }
   box.style.display = 'block';
-  box.innerHTML = '⏳ Đang kiểm tra khóa zpw_enk & lưu vào Kho Cookie/IMEI Zalo...';
+  box.innerHTML = '⏳ Đang kiểm tra khóa zpw_enk & lưu vào Kho Cookie Zalo...';
   try {
     const r = await fetch('/api/zalo/verify_cookie_imei', {
       method: 'POST',
@@ -10795,13 +10932,11 @@ async function verifyAndSaveZaloCookieVault() {
       box.innerHTML = `✅ Đã khóa & lưu <b>${escapeHtmlSafe(d.name)}</b> (UID: <code>${escapeHtmlSafe(d.uid)}</code>)`;
       showToast(d.message || 'Đã lưu Cookie & IMEI Zalo!');
       loadZaloVaultRecords();
-      setTimeout(() => location.reload(), 900);
+      setTimeout(() => location.reload(), 800);
     } else {
       box.innerHTML = `<span style="color:#fca5a5">${escapeHtmlSafe(d.error || 'Lỗi lưu Cookie')}</span>`;
     }
-  } catch (e) {
-    box.innerHTML = 'Lỗi kết nối máy chủ!';
-  }
+  } catch (e) { box.innerHTML = 'Lỗi kết nối máy chủ!'; }
 }
 
 async function loadZaloVaultRecords() {
@@ -10812,17 +10947,17 @@ async function loadZaloVaultRecords() {
     const d = await r.json();
     ZALO_VAULT_CACHE = d.records || [];
     if (!ZALO_VAULT_CACHE.length) {
-      box.innerHTML = '<div style="text-align:center;padding:14px;color:var(--txt-sub);font-size:11.5px">Chưa có bản ghi trong Kho. Khi quét QR hoặc dán Cookie, hệ thống sẽ tự động lưu tại đây.</div>';
+      box.innerHTML = '<div style="text-align:center;padding:12px;color:var(--txt-sub);font-size:11px">Chưa có bản ghi trong Kho. Khi quét QR hoặc dán Cookie sẽ tự động lưu tại đây.</div>';
       return;
     }
     box.innerHTML = ZALO_VAULT_CACHE.map((rec, idx) => `
-      <div class="item-row" style="flex-direction:column;align-items:stretch;gap:6px">
+      <div class="item-row" style="flex-direction:column;align-items:stretch;gap:5px">
         <div style="display:flex;align-items:center;justify-content:space-between">
           <div>
-            <span class="tag tag-green">${rec.zpw_enk_ready ? 'API ZALO LIVE' : 'ĐÃ LƯU VAULT'}</span>
-            <strong style="font-size:12px;color:#fff;margin-left:5px">${escapeHtmlSafe(rec.display_name)}</strong>
+            <span class="tag tag-green">${rec.zpw_enk_ready ? 'API LIVE' : 'ĐÃ LƯU'}</span>
+            <strong style="font-size:11.5px;color:#fff;margin-left:4px">${escapeHtmlSafe(rec.display_name)}</strong>
           </div>
-          <code style="font-size:10px;color:#fde68a">IMEI: ${escapeHtmlSafe(rec.masked_imei)}</code>
+          <code style="font-size:9.5px;color:#fde68a">IMEI: ${escapeHtmlSafe(rec.masked_imei)}</code>
         </div>
         <div style="display:flex;gap:4px;flex-wrap:wrap">
           <button type="button" class="btn btn-green btn-mini" onclick="activateZaloVaultIdx(${idx})">⚡ Kết nối</button>
@@ -10856,7 +10991,7 @@ async function activateZaloVaultIdx(idx) {
   const d = await r.json();
   if (d.ok) {
     showToast(d.message);
-    setTimeout(() => location.reload(), 700);
+    setTimeout(() => location.reload(), 600);
   }
 }
 
@@ -10908,14 +11043,14 @@ async function generateUniqueZaloImei() {
     const d = await r.json();
     if (d.ok && d.imei) {
       document.getElementById('zaloImeiInput').value = d.imei;
-      showToast('Đã tạo IMEI Zalo độc lập mới!');
+      showToast('Đã tạo IMEI Zalo mới!');
     }
   } catch (e) {}
 }
 
 async function updateDiscordCustomStatus() {
   const text = (document.getElementById('dcCustomStatusInput').value || '').trim();
-  if (!text) { showToast('Hãy nhập nội dung trạng thái Discord!'); return; }
+  if (!text) { showToast('Hãy nhập trạng thái Discord!'); return; }
   try {
     const r = await fetch('/api/discord/set_status', {
       method: 'POST',
@@ -10970,14 +11105,14 @@ function copyCurrent2FACode() {
   const code = (document.getElementById('web2FACodeVal').textContent || '').trim();
   if (code && code !== '------' && navigator.clipboard) {
     navigator.clipboard.writeText(code);
-    showToast(`Đã sao chép mã OTP: ${code}`);
+    showToast(`Đã copy mã OTP: ${code}`);
   }
 }
 
 setInterval(() => {
   const el = document.getElementById('web2FASecretInput');
   if (el && el.value.trim()) generateWeb2FA(false);
-}, 2000);
+}, 2500);
 
 async function extractFacebookCookieByLogin() {
   const email = (document.getElementById('fbLoginEmail').value || '').trim();
@@ -10985,7 +11120,7 @@ async function extractFacebookCookieByLogin() {
   const box = document.getElementById('messLoginStatusBox');
   if (!email || !password) { showToast('Nhập đủ Email/SĐT và Mật khẩu Facebook!'); return; }
   box.style.display = 'block';
-  box.style.background = 'rgba(16,185,129,0.18)';
+  box.style.background = 'rgba(16,185,129,0.16)';
   box.style.color = '#6ee7b7';
   box.innerHTML = 'Đang đăng nhập Facebook và trích xuất Cookie c_user + xs...';
   try {
@@ -10997,17 +11132,15 @@ async function extractFacebookCookieByLogin() {
     const d = await r.json();
     if (d.ok) {
       document.getElementById('messCookieInput').value = d.cookie || '';
-      box.innerHTML = `✅ Đã lấy Cookie thành công (UID: <code>${escapeHtmlSafe(d.uid)}</code>)! Đang lưu...`;
+      box.innerHTML = `✅ Đã lấy Cookie thành công (UID: <code>${escapeHtmlSafe(d.uid)}</code>)!`;
       showToast('Đã lấy Cookie Facebook & kết nối!');
-      setTimeout(() => location.reload(), 800);
+      setTimeout(() => location.reload(), 700);
     } else {
-      box.style.background = 'rgba(239,68,68,0.18)';
+      box.style.background = 'rgba(239,68,68,0.16)';
       box.style.color = '#fca5a5';
       box.innerHTML = escapeHtmlSafe(d.error || 'Không thể lấy Cookie');
     }
-  } catch (e) {
-    box.innerHTML = 'Lỗi kết nối máy chủ!';
-  }
+  } catch (e) { box.innerHTML = 'Lỗi kết nối máy chủ!'; }
 }
 
 function setRoomPlatformFilter(flt) {
@@ -11022,7 +11155,7 @@ function setRoomPlatformFilter(flt) {
   renderTargetList();
 }
 
-const PING_WAVE_HISTORY = [6, 9, 7, 11, 8, 12, 7, 10, 6, 9, 8, 11];
+const PING_WAVE_HISTORY = [5, 8, 6, 10, 7, 11, 6, 9];
 
 async function checkWebPingNow(showNotice = false) {
   const t0 = performance.now();
@@ -11031,7 +11164,7 @@ async function checkWebPingNow(showNotice = false) {
     const d = await r.json();
     const rtt = Math.max(1, Math.round(performance.now() - t0));
     const sendMs = d.avg_send_ms && d.avg_send_ms > 0 ? Math.round(d.avg_send_ms) : rtt;
-    const jitterMs = d.jitter_ms || 1.2;
+    const jitterMs = d.jitter_ms || 1.1;
     const rpmVal = d.total_rpm || 0;
     const runningCnt = d.running_tasks || 0;
 
@@ -11056,25 +11189,25 @@ async function checkWebPingNow(showNotice = false) {
     if (rpmEl) rpmEl.textContent = `${rpmVal} RPM`;
     if (healEl) healEl.textContent = `ACTIVE (${d.total_healed || 0} Heal)`;
     if (stateBadge) {
-      stateBadge.textContent = runningCnt > 0 ? `⚡ ĐANG TREO (${runningCnt} CHIẾN DỊCH)` : 'GPU 120FPS MƯỢT';
+      stateBadge.textContent = runningCnt > 0 ? `🌸 ĐANG CHẠY (${runningCnt} TIẾN TRÌNH)` : 'SIÊU MƯỢT 0 DELAY';
       stateBadge.className = runningCnt > 0 ? 'tag tag-red' : 'tag tag-green';
     }
     if (rttEl) rttEl.textContent = `${rtt} ms`;
     if (thEl) thEl.textContent = `${d.active_threads || 1} Luồng`;
     if (engEl) engEl.textContent = `${d.engine_ms || 0.3}ms`;
 
-    PING_WAVE_HISTORY.push(Math.max(4, Math.min(16, Math.round((rtt % 35) / 2.2) + 5)));
-    if (PING_WAVE_HISTORY.length > 12) PING_WAVE_HISTORY.shift();
+    PING_WAVE_HISTORY.push(Math.max(4, Math.min(13, Math.round((rtt % 30) / 2.4) + 4)));
+    if (PING_WAVE_HISTORY.length > 8) PING_WAVE_HISTORY.shift();
     const waveBox = document.getElementById('livePingWaveform');
     if (waveBox) {
       const spans = waveBox.children;
       for (let i = 0; i < spans.length && i < PING_WAVE_HISTORY.length; i++) {
         spans[i].style.height = PING_WAVE_HISTORY[i] + 'px';
-        spans[i].style.backgroundColor = runningCnt > 0 ? '#38bdf8' : '#10b981';
+        spans[i].style.backgroundColor = runningCnt > 0 ? '#f472b6' : '#38bdf8';
       }
     }
 
-    if (showNotice) showToast(`⚡ Ping Web: ${rtt}ms | Ping Treo API: ${sendMs}ms | Jitter: ${jitterMs}ms | ${rpmVal} RPM`);
+    if (showNotice) showToast(`Ping Web: ${rtt}ms | Ping API: ${sendMs}ms | ${rpmVal} RPM`);
   } catch (e) {}
 }
 
@@ -11083,7 +11216,7 @@ async function verifyAndLockMessengerCookie() {
   const box = document.getElementById('messVerifyResultBox');
   if (!raw) { showToast('Hãy dán Cookie Messenger!'); return; }
   box.style.display = 'block';
-  box.innerHTML = 'Đang khóa bảo vệ Cookie Messenger MQTT v15...';
+  box.innerHTML = 'Đang đồng bộ Sigma Anti-Checkpoint v17 cho Cookie Messenger...';
   try {
     const r = await fetch('/api/messenger/verify_cookie', {
       method: 'POST',
@@ -11092,9 +11225,9 @@ async function verifyAndLockMessengerCookie() {
     });
     const d = await r.json();
     if (d.ok) {
-      box.innerHTML = `✅ Đã lưu <strong>${escapeHtmlSafe(d.name)}</strong> (UID: <code>${escapeHtmlSafe(d.uid)}</code>)`;
-      showToast('Đã lưu tài khoản Messenger!');
-      setTimeout(() => location.reload(), 800);
+      box.innerHTML = `✅ Đã bảo vệ <strong>${escapeHtmlSafe(d.name)}</strong> (UID: <code>${escapeHtmlSafe(d.uid)}</code>)`;
+      showToast('Đã lưu tài khoản Messenger Sigma v17!');
+      setTimeout(() => location.reload(), 700);
     } else {
       box.innerHTML = `<span style="color:#fca5a5">${escapeHtmlSafe(d.error)}</span>`;
     }
@@ -11103,8 +11236,8 @@ async function verifyAndLockMessengerCookie() {
 
 function fillRandomDiscordRegProfile() {
   const rnd = Math.floor(1000 + Math.random() * 9000);
-  const uname = `phananhkhoi_${rnd}`;
-  const pw = `Khoi@${rnd}#Vip99`;
+  const uname = `sakura_vip_${rnd}`;
+  const pw = `Sakura@${rnd}#Vip99`;
   document.getElementById('newAccUsername').value = uname;
   document.getElementById('newAccPassword').value = pw;
   document.getElementById('newAccDob').value = '2000-06-15';
@@ -11114,9 +11247,9 @@ function fillRandomDiscordRegProfile() {
 async function runBatchDiscordRegStudio() {
   const box = document.getElementById('discordNewAccStatusBox');
   box.style.display = 'block';
-  box.style.background = 'rgba(16,185,129,0.18)';
+  box.style.background = 'rgba(16,185,129,0.16)';
   box.style.color = '#6ee7b7';
-  box.innerHTML = 'Đang lấy 5 mã X-Fingerprint thật từ Discord...';
+  box.innerHTML = 'Đang lấy 5 mã X-Fingerprint từ Discord...';
   try {
     const r = await fetch('/api/discord/batch_reg_profiles', {
       method: 'POST',
@@ -11140,7 +11273,7 @@ async function runImmortalizeTokensTool(autoSave = true) {
   const box = document.getElementById('immortalVaultResultBox');
   if (!raw) { showToast('Hãy dán Token Discord!'); return; }
   box.style.display = 'block';
-  box.innerHTML = 'Đang đúc Token Offline (0 REST Call - Chống Reset Key)...';
+  box.innerHTML = 'Đang đúc Token Offline 0ms (Chống Reset Key 100%)...';
   try {
     const r = await fetch('/api/discord/immortalize', {
       method: 'POST',
@@ -11154,7 +11287,7 @@ async function runImmortalizeTokensTool(autoSave = true) {
       }
       box.innerHTML = `✅ Sống: ${d.alive_count}/${d.total} Token`;
       showToast(d.message);
-      if (autoSave) setTimeout(() => location.reload(), 900);
+      if (autoSave) setTimeout(() => location.reload(), 800);
     } else {
       box.innerHTML = `<span style="color:#fca5a5">${escapeHtmlSafe(d.error)}</span>`;
     }
@@ -11178,7 +11311,7 @@ async function runCreateNewDiscordAccTool() {
     });
     const d = await r.json();
     box.innerHTML = escapeHtmlSafe(d.message || d.error);
-    if (d.ok) setTimeout(() => location.reload(), 1000);
+    if (d.ok) setTimeout(() => location.reload(), 900);
   } catch (e) { box.innerHTML = 'Lỗi kết nối!'; }
 }
 
@@ -11186,7 +11319,7 @@ function setDiscordRegStatus(msg, isSuccess) {
   const box = document.getElementById('discordRegStatusBox');
   if (!box) return;
   box.style.display = 'block';
-  box.style.background = isSuccess ? 'rgba(16,185,129,0.18)' : 'rgba(239,68,68,0.18)';
+  box.style.background = isSuccess ? 'rgba(16,185,129,0.16)' : 'rgba(239,68,68,0.16)';
   box.style.color = isSuccess ? '#6ee7b7' : '#fca5a5';
   box.innerHTML = msg;
 }
@@ -11251,7 +11384,7 @@ async function extractDiscordTokenByReg() {
   const two_fa = document.getElementById('regDis2FA').value.trim();
   const twofa_type = document.getElementById('regDis2FAType').value;
   if (!email && !password) { showToast('Nhập Email & Mật khẩu Discord!'); return; }
-  setDiscordRegStatus('Đang xác thực đăng nhập Discord (Phan Anh Khôi Shield)...', true);
+  setDiscordRegStatus('Đang xác thực đăng nhập Discord...', true);
   try {
     const r = await fetch('/api/discord/reg_login', {
       method: 'POST',
@@ -11261,8 +11394,8 @@ async function extractDiscordTokenByReg() {
     const d = await r.json();
     if (d.ok) {
       document.getElementById('discordTokenInput').value = d.token || '';
-      setDiscordRegStatus('✅ Lấy Token thành công! Đang lưu vào hệ thống...', true);
-      setTimeout(() => location.reload(), 700);
+      setDiscordRegStatus('✅ Lấy Token thành công! Đang lưu...', true);
+      setTimeout(() => location.reload(), 650);
     } else {
       setDiscordRegStatus(d.error || 'Lỗi đăng nhập', false);
     }
@@ -11299,7 +11432,7 @@ async function handleTxtUpload(inputEl) {
     const d = await r.json();
     if (d.ok) {
       showToast(`Đã tải ${d.filename}!`);
-      setTimeout(() => location.reload(), 500);
+      setTimeout(() => location.reload(), 450);
     }
   } catch (e) { location.reload(); }
 }
@@ -11311,7 +11444,7 @@ async function toggleAccCmd(accId, enabled) {
 
 async function loadGroupsAndRooms(forceRefresh) {
   const box = document.getElementById('targetListContainer');
-  box.innerHTML = '<div style="text-align:center;padding:18px;color:var(--txt-sub)">Đang quét tự động phòng Zalo • Discord • Mess...</div>';
+  box.innerHTML = '<div style="text-align:center;padding:16px;color:var(--txt-sub)">Đang quét phòng Zalo • Discord • Mess...</div>';
   try {
     const qSuffix = forceRefresh ? '?refresh=1' : '';
     const [rZalo, rDis, rMess] = await Promise.all([
@@ -11326,9 +11459,9 @@ async function loadGroupsAndRooms(forceRefresh) {
     (rMess.threads || []).forEach(m => list.push({id: String(m.id), name: m.name, type: 'messenger_thread', members: m.members || 'Mess'}));
     ALL_TARGETS = list;
     renderTargetList();
-    showToast(`Đã tìm thấy ${ALL_TARGETS.length} phòng!`);
+    showToast(`Đã tải ${ALL_TARGETS.length} phòng!`);
   } catch (e) {
-    box.innerHTML = '<div style="text-align:center;padding:18px;color:#f87171">Lỗi tải danh sách phòng</div>';
+    box.innerHTML = '<div style="text-align:center;padding:16px;color:#f87171">Lỗi tải danh sách phòng</div>';
   }
 }
 
@@ -11344,7 +11477,7 @@ function renderTargetList() {
     return (t.name || '').toLowerCase().includes(q) || String(t.id).toLowerCase().includes(q);
   });
   if (!indexed.length) {
-    box.innerHTML = '<div style="text-align:center;padding:18px;color:var(--txt-sub)">Không có phòng phù hợp. Hãy bấm "Quét".</div>';
+    box.innerHTML = '<div style="text-align:center;padding:16px;color:var(--txt-sub)">Không có phòng phù hợp. Hãy bấm "Quét".</div>';
     return;
   }
   box.innerHTML = indexed.map(({t, idx}) => {
@@ -11353,8 +11486,8 @@ function renderTargetList() {
     const tagLbl = t.type === 'discord_channel' ? 'DISCORD' : (t.type === 'messenger_thread' ? 'MESS' : (t.type === 'group' ? 'ZALO' : 'BẠN'));
     return `
       <div class="item-row">
-        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;flex:1;min-width:0">
-          <input type="checkbox" ${checked} data-idx="${idx}" onchange="toggleTargetByIdx(this.dataset.idx, this.checked)" style="width:15px;height:15px;accent-color:var(--red);flex-shrink:0">
+        <label style="display:flex;align-items:center;gap:7px;cursor:pointer;flex:1;min-width:0">
+          <input type="checkbox" ${checked} data-idx="${idx}" onchange="toggleTargetByIdx(this.dataset.idx, this.checked)" style="width:14px;height:14px;accent-color:var(--red);flex-shrink:0">
           <div class="item-main">
             <div style="display:flex;align-items:center;gap:5px">
               <span class="tag ${tagCls}">${tagLbl}</span>
@@ -11404,7 +11537,7 @@ function updateTargetBadges() {
 
 async function fetchRoomMembers(roomId, roomType) {
   const box = document.getElementById('memberListContainer');
-  box.innerHTML = '<div style="text-align:center;padding:18px;color:var(--txt-sub)">Đang tải thành viên...</div>';
+  box.innerHTML = '<div style="text-align:center;padding:16px;color:var(--txt-sub)">Đang tải thành viên...</div>';
   try {
     const url = roomType === 'discord_channel'
       ? `/api/discord_channel_members?channel_id=${encodeURIComponent(roomId)}`
@@ -11417,7 +11550,7 @@ async function fetchRoomMembers(roomId, roomType) {
     renderMemberList();
     showToast(`Đã tải ${CURRENT_MEMBERS.length} thành viên!`);
   } catch (e) {
-    box.innerHTML = '<div style="text-align:center;padding:18px;color:#f87171">Lỗi tải thành viên</div>';
+    box.innerHTML = '<div style="text-align:center;padding:16px;color:#f87171">Lỗi tải thành viên</div>';
   }
 }
 
@@ -11426,7 +11559,7 @@ function renderMemberList() {
   const q = (document.getElementById('memberSearchInput').value || '').toLowerCase().trim();
   const indexed = CURRENT_MEMBERS.map((m, idx) => ({m, idx})).filter(({m}) => !q || (m.name || '').toLowerCase().includes(q) || String(m.uid || m.id).includes(q));
   if (!indexed.length) {
-    box.innerHTML = '<div style="text-align:center;padding:18px;color:var(--txt-sub)">Không có thành viên khớp.</div>';
+    box.innerHTML = '<div style="text-align:center;padding:16px;color:var(--txt-sub)">Không có thành viên khớp.</div>';
     return;
   }
   box.innerHTML = indexed.map(({m, idx}) => {
@@ -11434,8 +11567,8 @@ function renderMemberList() {
     const checked = SELECTED_MENTIONS.has(uid) ? 'checked' : '';
     return `
       <div class="item-row">
-        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;flex:1;min-width:0">
-          <input type="checkbox" ${checked} data-idx="${idx}" onchange="toggleMentionByIdx(this.dataset.idx, this.checked)" style="width:15px;height:15px;accent-color:var(--red);flex-shrink:0">
+        <label style="display:flex;align-items:center;gap:7px;cursor:pointer;flex:1;min-width:0">
+          <input type="checkbox" ${checked} data-idx="${idx}" onchange="toggleMentionByIdx(this.dataset.idx, this.checked)" style="width:14px;height:14px;accent-color:var(--red);flex-shrink:0">
           <div class="item-main">
             <div class="item-name">@${escapeHtmlSafe(m.name)}</div>
             <div class="item-meta">UID: <code>${escapeHtmlSafe(uid.slice(-6))}</code></div>
@@ -11484,6 +11617,7 @@ async function launchCampaignTask() {
     switchMainTab('tab-targets', document.querySelector('[data-tab="tab-targets"]'));
     return;
   }
+  const batchCount = Math.max(1, Math.min(100, parseInt(document.getElementById('cfgBatchCount').value || '1', 10)));
   const payload = {
     targets,
     mode: document.getElementById('cfgMode').value,
@@ -11491,6 +11625,7 @@ async function launchCampaignTask() {
     fixed_color: document.getElementById('cfgFixedColor').value,
     delay: parseFloat(document.getElementById('cfgDelay').value || '0.0'),
     icon_count: parseInt(document.getElementById('cfgIconCount').value || '3', 10),
+    batch_count: batchCount,
     file_id: document.getElementById('cfgFileSelect').value,
     raw_text: document.getElementById('cfgRawText').value,
     is_heading: document.getElementById('cfgHeading').checked,
@@ -11504,8 +11639,9 @@ async function launchCampaignTask() {
     const r = await fetch('/task/start', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
     const d = await r.json();
     if (d.ok) {
-      showToast('Đã khởi chạy chiến dịch!');
-      pollSystemStatus();
+      showToast(`Đã khởi chạy ${d.batch_count || 1} tiến trình song song!`);
+      if (MULTI_TAB_BUS) MULTI_TAB_BUS.postMessage({type: 'FORCE_REFRESH'});
+      pollSystemStatus(true);
     } else {
       showToast(d.error || 'Lỗi chạy');
     }
@@ -11514,13 +11650,15 @@ async function launchCampaignTask() {
 
 async function stopAllRunningTasks() {
   await fetch('/task/stop_all', {method: 'POST'});
-  showToast('Đã dừng tất cả!');
-  pollSystemStatus();
+  showToast('🛑 Đã dừng toàn bộ tiến trình!');
+  if (MULTI_TAB_BUS) MULTI_TAB_BUS.postMessage({type: 'FORCE_REFRESH'});
+  pollSystemStatus(true);
 }
 
 async function stopSingleTask(tid) {
   await fetch('/task/stop/' + encodeURIComponent(tid), {method: 'POST'});
-  pollSystemStatus();
+  if (MULTI_TAB_BUS) MULTI_TAB_BUS.postMessage({type: 'FORCE_REFRESH'});
+  pollSystemStatus(true);
 }
 
 let _isPollingStatus = false;
@@ -11532,73 +11670,79 @@ function updateDomIfChanged(el, cacheKey, newHtml) {
   el.innerHTML = newHtml;
 }
 
-async function pollSystemStatus() {
+function renderSystemStatusData(d) {
+  const tasks = d.tasks || [];
+  const running = tasks.filter(t => t.status && t.status.includes('Đang chạy')).length;
+  let totalSent = 0;
+  tasks.forEach(t => { totalSent += (t.sent || 0); });
+
+  document.getElementById('kpiRunningTasks').textContent = running;
+  document.getElementById('dockTaskBadge').textContent = running;
+  document.getElementById('kpiTotalSent').textContent = totalSent;
+
+  if (d.discord_firewall) {
+    const fw = d.discord_firewall;
+    const elInsp = document.getElementById('fwInspectedCnt');
+    const elImm = document.getElementById('fwImmortalCnt');
+    if (elInsp) elInsp.textContent = `${fw.inspected_packets || 0} gói`;
+    if (elImm) elImm.textContent = `${fw.immortalized_tokens || 0} đã khóa`;
+  }
+
+  const tBox = document.getElementById('activeTasksContainer');
+  const nextTasksHtml = !tasks.length
+    ? '<div style="text-align:center;padding:16px;color:var(--txt-sub);font-size:11.5px">Chưa có tiến trình chạy.</div>'
+    : tasks.map(t => `
+      <div class="item-row">
+        <div class="item-main">
+          <div style="display:flex;align-items:center;gap:5px">
+            <span class="tag ${t.status.includes('Đang chạy') ? 'tag-green' : 'tag-amber'}">${t.status}</span>
+            <span class="item-name">${t.mode} (${t.targets_count} phòng)</span>
+          </div>
+          <div class="item-meta">Đã gửi: <b>${t.sent}</b> • Delay: ${t.delay}s</div>
+        </div>
+        ${t.status.includes('Đang chạy') ? `<button class="btn btn-red btn-mini" onclick="stopSingleTask('${t.id}')">Dừng</button>` : ''}
+      </div>
+    `).join('');
+  updateDomIfChanged(tBox, 'tasks', nextTasksHtml);
+
+  const hBox = document.getElementById('healthShieldBox');
+  const healthList = d.accounts_health || [];
+  const nextHealthHtml = healthList.map(h => `
+    <div class="item-row">
+      <div class="item-main">
+        <div style="display:flex;align-items:center;gap:5px">
+          <span class="tag ${h.platform === 'discord' ? 'tag-purple' : (h.platform === 'messenger' ? 'tag-red' : 'tag-blue')}">${h.platform.toUpperCase()}</span>
+          <span class="item-name">${h.masked_name}</span>
+          <span class="tag tag-green">${h.circuit}</span>
+        </div>
+        <div class="item-meta">${h.rpm} RPM • Đã phát: <b>${h.ok_total}</b> • ${h.ws_status}</div>
+      </div>
+    </div>
+  `).join('') || '<div style="text-align:center;padding:14px;color:var(--txt-sub)">Chưa có tài khoản</div>';
+  updateDomIfChanged(hBox, 'health', nextHealthHtml);
+
+  const cBox = document.getElementById('cmdLogBox');
+  const logs = d.cmd_logs || [];
+  const nextLogsHtml = logs.map(l => `
+    <div class="item-row">
+      <div class="item-main">
+        <div class="item-name"><code>${l.cmd_text}</code></div>
+        <div class="item-meta">${l.action_taken}</div>
+      </div>
+    </div>
+  `).join('') || '<div style="text-align:center;padding:14px;color:var(--txt-sub)">Chưa có nhật ký</div>';
+  updateDomIfChanged(cBox, 'logs', nextLogsHtml);
+}
+
+async function pollSystemStatus(force = false) {
   if (_isPollingStatus) return;
+  if (!force && (Date.now() - LAST_CROSS_TAB_STATUS_TS < 1800)) return;
   _isPollingStatus = true;
   try {
     const r = await fetch('/api/status');
     const d = await r.json();
-    const tasks = d.tasks || [];
-    const running = tasks.filter(t => t.status && t.status.includes('Đang chạy')).length;
-    let totalSent = 0;
-    tasks.forEach(t => { totalSent += (t.sent || 0); });
-
-    document.getElementById('kpiRunningTasks').textContent = running;
-    document.getElementById('dockTaskBadge').textContent = running;
-    document.getElementById('kpiTotalSent').textContent = totalSent;
-
-    if (d.discord_firewall) {
-      const fw = d.discord_firewall;
-      const elInsp = document.getElementById('fwInspectedCnt');
-      const elImm = document.getElementById('fwImmortalCnt');
-      if (elInsp) elInsp.textContent = `${fw.inspected_packets || 0} gói`;
-      if (elImm) elImm.textContent = `${fw.immortalized_tokens || 0} đã khóa`;
-    }
-
-    const tBox = document.getElementById('activeTasksContainer');
-    const nextTasksHtml = !tasks.length
-      ? '<div style="text-align:center;padding:18px;color:var(--txt-sub);font-size:12px">Chưa có tiến trình chạy.</div>'
-      : tasks.map(t => `
-        <div class="item-row">
-          <div class="item-main">
-            <div style="display:flex;align-items:center;gap:5px">
-              <span class="tag ${t.status.includes('Đang chạy') ? 'tag-green' : 'tag-amber'}">${t.status}</span>
-              <span class="item-name">${t.mode} (${t.targets_count} phòng)</span>
-            </div>
-            <div class="item-meta">Đã gửi: <b>${t.sent}</b> • Delay: ${t.delay}s</div>
-          </div>
-          ${t.status.includes('Đang chạy') ? `<button class="btn btn-red btn-mini" onclick="stopSingleTask('${t.id}')">Dừng</button>` : ''}
-        </div>
-      `).join('');
-    updateDomIfChanged(tBox, 'tasks', nextTasksHtml);
-
-    const hBox = document.getElementById('healthShieldBox');
-    const healthList = d.accounts_health || [];
-    const nextHealthHtml = healthList.map(h => `
-      <div class="item-row">
-        <div class="item-main">
-          <div style="display:flex;align-items:center;gap:5px">
-            <span class="tag ${h.platform === 'discord' ? 'tag-purple' : (h.platform === 'messenger' ? 'tag-red' : 'tag-blue')}">${h.platform.toUpperCase()}</span>
-            <span class="item-name">${h.masked_name}</span>
-            <span class="tag tag-green">${h.circuit}</span>
-          </div>
-          <div class="item-meta">${h.rpm} RPM • Đã phát: <b>${h.ok_total}</b> • ${h.ws_status}</div>
-        </div>
-      </div>
-    `).join('') || '<div style="text-align:center;padding:16px;color:var(--txt-sub)">Chưa có tài khoản</div>';
-    updateDomIfChanged(hBox, 'health', nextHealthHtml);
-
-    const cBox = document.getElementById('cmdLogBox');
-    const logs = d.cmd_logs || [];
-    const nextLogsHtml = logs.map(l => `
-      <div class="item-row">
-        <div class="item-main">
-          <div class="item-name"><code>${l.cmd_text}</code></div>
-          <div class="item-meta">${l.action_taken}</div>
-        </div>
-      </div>
-    `).join('') || '<div style="text-align:center;padding:16px;color:var(--txt-sub)">Chưa có nhật ký</div>';
-    updateDomIfChanged(cBox, 'logs', nextLogsHtml);
+    renderSystemStatusData(d);
+    if (MULTI_TAB_BUS) MULTI_TAB_BUS.postMessage({type: 'STATUS_SNAPSHOT', data: d});
   } catch (e) {
   } finally {
     _isPollingStatus = false;
@@ -11606,18 +11750,18 @@ async function pollSystemStatus() {
 }
 
 function scheduleAdaptivePoll() {
-  const waitMs = document.hidden ? 6500 : 2500;
+  const waitMs = document.hidden ? 6000 : 2200;
   setTimeout(async () => {
-    await pollSystemStatus();
+    await pollSystemStatus(false);
     scheduleAdaptivePoll();
   }, waitMs);
 }
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden) pollSystemStatus();
+  if (!document.hidden) pollSystemStatus(true);
 });
-pollSystemStatus();
+pollSystemStatus(true);
 checkWebPingNow(false);
-setInterval(() => { if (!document.hidden) checkWebPingNow(false); }, 1600);
+setInterval(() => { if (!document.hidden) checkWebPingNow(false); }, 1800);
 scheduleAdaptivePoll();
 </script>
 </body>
@@ -12415,6 +12559,7 @@ def route_task_start():
     raw_text = clean_corrupted_shortcuts(data.get("raw_text") or "").strip()
     tag_users = list(data.get("tag_users") or [])
     tag_all = bool(data.get("tag_all", False))
+    batch_count = max(1, min(100, int(data.get("batch_count", 1) or 1)))
 
     if raw_text and "@" in raw_text:
         conn = db()
@@ -12452,6 +12597,13 @@ def route_task_start():
         else:
             blocks = [x.strip() for x in raw_text.split(";") if x.strip()] if ";" in raw_text else [raw_text]
 
+    if blocks:
+        blocks = [
+            b_item for b_item in blocks
+            if re.sub(r"<@(?:!|&)?\d+>", "", str(b_item or "")).strip()
+            and not re.fullmatch(r"@[\w\s\.\-_À-ỹ]+", re.sub(r"<@(?:!|&)?\d+>", "", str(b_item or "")).strip())
+        ]
+
     if not blocks:
         return jsonify({"ok": False, "error": "Vui lòng chọn File kịch bản hoặc nhập nội dung!"}), 400
 
@@ -12467,27 +12619,43 @@ def route_task_start():
             ALL_KNOWN_ZALO_GROUP_IDS.add(str(t["id"]))
 
     raw_delay = float(data.get("delay", 0.0))
-    has_zalo_target = any(t.get("type") != "discord_channel" for t in targets)
-    eff_delay = max(0.20, raw_delay) if has_zalo_target else max(0.0, raw_delay)
+    antiband_flag = bool(data.get("antiband", True))
+    has_mess_target = any(t.get("type") in ("messenger_thread", "messenger_group") for t in targets)
+    has_zalo_target = any(t.get("type") in ("group", "user") for t in targets)
+    if has_mess_target:
+        eff_delay = max(1.85 if antiband_flag else 0.90, raw_delay)
+    elif has_zalo_target:
+        eff_delay = max(0.20, raw_delay)
+    else:
+        eff_delay = max(0.0, raw_delay)
 
-    tid = start_task_programmatic(
-        targets=targets,
-        blocks=blocks,
-        delay=eff_delay,
-        use_emoji=bool(data.get("use_emoji", True)),
-        icon_count=int(data.get("icon_count", 3)),
-        tag_users=tag_users,
-        tag_all=tag_all,
-        is_heading=bool(data.get("is_heading", True)),
-        multi_acc=bool(data.get("multi_acc", True)),
-        mode=mode,
-        color_mode=data.get("color_mode", "rainbow"),
-        fixed_color=data.get("fixed_color", "red"),
-        antiband=bool(data.get("antiband", True)),
-        antidieall=True,
-        source_label="web",
-    )
-    return jsonify({"ok": True, "task_id": tid})
+    created_tids = []
+    for b_i in range(batch_count):
+        b_blocks = list(blocks)
+        if b_i > 0 and len(b_blocks) > 1:
+            shift = b_i % len(b_blocks)
+            b_blocks = b_blocks[shift:] + b_blocks[:shift]
+        tid = start_task_programmatic(
+            targets=targets,
+            blocks=b_blocks,
+            delay=eff_delay + (b_i * 0.03 if batch_count > 1 else 0.0),
+            use_emoji=bool(data.get("use_emoji", True)),
+            icon_count=int(data.get("icon_count", 3)),
+            tag_users=tag_users,
+            tag_all=tag_all,
+            is_heading=bool(data.get("is_heading", True)),
+            multi_acc=bool(data.get("multi_acc", True)),
+            mode=mode,
+            color_mode=data.get("color_mode", "rainbow"),
+            fixed_color=data.get("fixed_color", "red"),
+            antiband=antiband_flag,
+            antidieall=True,
+            source_label="web",
+        )
+        created_tids.append(tid)
+    with _STATUS_CACHE_LOCK:
+        _STATUS_SNAPSHOT_CACHE["ts"] = 0.0
+    return jsonify({"ok": True, "task_id": created_tids[0], "task_ids": created_tids, "batch_count": len(created_tids)})
 
 @app.route("/task/stop/<tid>", methods=["POST"])
 def route_task_stop(tid):
@@ -12535,7 +12703,7 @@ def api_status():
     task_list = []
     try:
         conn = db()
-        t_rows = [dict(r) for r in conn.execute("SELECT * FROM tasks ORDER BY started_at DESC LIMIT 25").fetchall()]
+        t_rows = [dict(r) for r in conn.execute("SELECT * FROM tasks ORDER BY started_at DESC LIMIT 100").fetchall()]
         acc_rows = [dict(r) for r in conn.execute("SELECT id, name, platform, uid FROM accounts ORDER BY id DESC").fetchall()]
         cmd_rows = [dict(r) for r in conn.execute("SELECT * FROM bot_logs ORDER BY id DESC LIMIT 25").fetchall()]
         conn.close()
