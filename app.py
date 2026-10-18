@@ -579,7 +579,7 @@ def init_db():
 
     try:
         cur.execute("UPDATE accounts SET chat_cmd_enabled = 1 WHERE chat_cmd_enabled IS NULL")
-        cur.execute("UPDATE accounts SET allow_all_cmd = 1 WHERE allow_all_cmd IS NULL OR allow_all_cmd = 0")
+        cur.execute("UPDATE accounts SET allow_all_cmd = 1 WHERE allow_all_cmd IS NULL")
         z_rows = cur.execute("SELECT id, imei, cookies FROM accounts WHERE platform='zalo'").fetchall()
         for zr in z_rows:
             norm_c = normalize_zalo_cookies(zr["cookies"])
@@ -633,7 +633,10 @@ TASKS_RAM_STORE = {}
 TASKS_RAM_LOCK = threading.RLock()
 BOT_LOGS_RAM_DEQUE = deque(maxlen=40)
 
+_LAST_ACCOUNTS_SYNC_TS = 0.0
+
 def refresh_accounts_ram_cache():
+    global _LAST_ACCOUNTS_SYNC_TS
     try:
         conn = db()
         rows = conn.execute("SELECT * FROM accounts ORDER BY id DESC").fetchall()
@@ -642,40 +645,35 @@ def refresh_accounts_ram_cache():
         with ACCOUNTS_RAM_LOCK:
             ACCOUNTS_RAM_CACHE.clear()
             ACCOUNTS_RAM_CACHE.update(new_map)
+            _LAST_ACCOUNTS_SYNC_TS = time.time()
         return list(new_map.values())
     except Exception:
         with ACCOUNTS_RAM_LOCK:
             return list(ACCOUNTS_RAM_CACHE.values())
 
 def get_account_from_ram(acc_id):
+    if time.time() - _LAST_ACCOUNTS_SYNC_TS > 0.25:
+        refresh_accounts_ram_cache()
     with ACCOUNTS_RAM_LOCK:
-        acc = ACCOUNTS_RAM_CACHE.get(acc_id)
+        acc = ACCOUNTS_RAM_CACHE.get(int(acc_id) if str(acc_id).isdigit() else acc_id)
         if acc is not None:
             return dict(acc)
     refresh_accounts_ram_cache()
     with ACCOUNTS_RAM_LOCK:
-        acc = ACCOUNTS_RAM_CACHE.get(acc_id)
+        acc = ACCOUNTS_RAM_CACHE.get(int(acc_id) if str(acc_id).isdigit() else acc_id)
         return dict(acc) if acc is not None else None
 
 def get_all_accounts_from_ram(platform=None, enabled_only=False):
+    if time.time() - _LAST_ACCOUNTS_SYNC_TS > 0.25 or not ACCOUNTS_RAM_CACHE:
+        refresh_accounts_ram_cache()
     with ACCOUNTS_RAM_LOCK:
-        if not ACCOUNTS_RAM_CACHE:
-            pass
-        else:
-            items = list(ACCOUNTS_RAM_CACHE.values())
-            if platform:
-                items = [a for a in items if (a.get("platform") or "zalo") == platform]
-            if enabled_only:
-                en = [a for a in items if a.get("enabled", 1)]
-                items = en if en else items
-            return [dict(a) for a in items]
-    all_accs = refresh_accounts_ram_cache()
+        items = list(ACCOUNTS_RAM_CACHE.values())
     if platform:
-        all_accs = [a for a in all_accs if (a.get("platform") or "zalo") == platform]
+        items = [a for a in items if (a.get("platform") or "zalo").lower() == platform.lower()]
     if enabled_only:
-        en = [a for a in all_accs if a.get("enabled", 1)]
-        all_accs = en if en else all_accs
-    return [dict(a) for a in all_accs]
+        en = [a for a in items if a.get("enabled", 1)]
+        items = en if en else items
+    return [dict(a) for a in items]
 
 GLOBAL_STOP_EPOCH = 0
 BOX_STOP_EPOCHS = defaultdict(int)
@@ -781,19 +779,22 @@ GLOBAL_CMD_DEDUPE_CACHE = {}
 GLOBAL_CMD_DEDUPE_LOCK = threading.RLock()
 
 def claim_command_execution_slot(platform, thread_id, sender_id, raw_msg, msg_id=None):
-    """Khóa nguyên tử 2 tầng (RAM + SQLite Cross-Process Lock) chống lặp lệnh tuyệt đối 100%:
-    - Đảm bảo gõ .menu, .chao, .g, .n chỉ phản hồi ĐÚNG 1 LẦN duy nhất dù chạy nhiều luồng,
-      nhiều tài khoản hay nhiều worker Gunicorn cùng lúc!"""
+    """Khóa điều phối lệnh Đa Tài Khoản (Multi-Account Command Coordinator Lock):
+    - Giữ khóa theo msg_id trong 90s để HTTP Poller của các tài khoản Zalo/Discord thứ 2, thứ 3
+      không bao giờ kích hoạt lại tin nhắn cũ làm ngắt chiến dịch vừa khởi chạy!
+    - Khi lệnh hợp lệ đi qua, bộ điều phối sẽ tự động huy động TẤT CẢ các tài khoản đang bật cùng thực thi!"""
     now = time.time()
     norm_txt = re.sub(r"\s+", " ", str(raw_msg or "").strip()).lower()[:120]
     plat_s = str(platform or "zalo").lower()
     tid_s = str(thread_id or "").strip()
     mid_s = str(msg_id or "").strip()
-    cmd_key = f"cmd:{plat_s}:{tid_s}:{norm_txt}"
+    sender_s = str(sender_id or "").strip()
+    cmd_key = f"cmd:{plat_s}:{tid_s}:{sender_s}:{norm_txt}"
 
     with GLOBAL_CMD_DEDUPE_LOCK:
         for k, ts_old in list(GLOBAL_CMD_DEDUPE_CACHE.items()):
-            if now - ts_old > 20.0:
+            ttl = 90.0 if k.startswith("mid:") else 4.0
+            if now - ts_old > ttl:
                 GLOBAL_CMD_DEDUPE_CACHE.pop(k, None)
         if mid_s and mid_s not in ("0", ""):
             m_key = f"mid:{plat_s}:{tid_s}:{mid_s}"
@@ -801,15 +802,14 @@ def claim_command_execution_slot(platform, thread_id, sender_id, raw_msg, msg_id
                 return False
             GLOBAL_CMD_DEDUPE_CACHE[m_key] = now
         last_ts = GLOBAL_CMD_DEDUPE_CACHE.get(cmd_key, 0.0)
-        if now - last_ts < 1.2:
+        if now - last_ts < 3.2:
             return False
         GLOBAL_CMD_DEDUPE_CACHE[cmd_key] = now
 
-    # Khóa nguyên tử cấp cơ sở dữ liệu SQLite (chống 2 worker process cùng thực thi 1 lệnh)
     try:
         conn = db()
         cur = conn.cursor()
-        cur.execute("DELETE FROM cmd_execution_locks WHERE created_at < ?", (now - 20.0,))
+        cur.execute("DELETE FROM cmd_execution_locks WHERE created_at < ?", (now - 90.0,))
         if mid_s and mid_s not in ("0", ""):
             cur.execute(
                 "INSERT OR IGNORE INTO cmd_execution_locks (lock_key, created_at) VALUES (?, ?)",
@@ -819,7 +819,7 @@ def claim_command_execution_slot(platform, thread_id, sender_id, raw_msg, msg_id
                 conn.commit()
                 conn.close()
                 return False
-        time_bucket = int(now // 2)
+        time_bucket = int(now // 3)
         row_ex = cur.execute(
             "SELECT 1 FROM cmd_execution_locks WHERE lock_key = ?",
             (f"{cmd_key}:{time_bucket}",)
@@ -973,7 +973,7 @@ def refresh_owner_uids():
     except Exception:
         pass
 
-def is_user_authorized_for_cmd(sender_uid, client_uid=None, client_send2me_id=None, allow_all=False):
+def is_user_authorized_for_cmd(sender_uid, client_uid=None, client_send2me_id=None, allow_all=False, sender_name=""):
     s_uid = str(sender_uid or "").strip()
     if s_uid in ("0", ""):
         return True
@@ -981,27 +981,45 @@ def is_user_authorized_for_cmd(sender_uid, client_uid=None, client_send2me_id=No
         return True
     if client_send2me_id and s_uid == str(client_send2me_id).strip():
         return True
+    if not OWNER_UIDS_CACHE:
+        refresh_owner_uids()
     if s_uid in OWNER_UIDS_CACHE:
         return True
-    if allow_all:
-        return True
+
+    s_name = ( str(sender_name or GLOBAL_USER_NAME_CACHE.get(s_uid) or "").strip().lstrip("@") )
+    s_name_norm = remove_vn_accents(s_name) if s_name else ""
 
     try:
         conn = db()
-        row = conn.execute("SELECT id FROM authorized_users WHERE uid = ?", (s_uid,)).fetchone()
+        rows = conn.execute("SELECT uid, name FROM authorized_users").fetchall()
         conn.close()
-        return bool(row)
+        for r in rows:
+            r_uid = str(r["uid"] or "").strip().lstrip("@")
+            r_name = str(r["name"] or "").strip().lstrip("@")
+            if r_uid and (r_uid == s_uid or r_uid.lower() == s_uid.lower()):
+                return True
+            if s_name and (
+                r_uid.lower() == s_name.lower()
+                or r_name.lower() == s_name.lower()
+                or (s_name_norm and (remove_vn_accents(r_uid) == s_name_norm or remove_vn_accents(r_name) == s_name_norm))
+            ):
+                return True
     except Exception:
-        return False
+        pass
+
+    if allow_all:
+        return True
+    return False
 
 def add_authorized_user(uid, name="", acc_id=0):
-    uid_str = str(uid or "").strip()
+    uid_str = str(uid or "").strip().lstrip("@")
     if not uid_str or uid_str in ("0", "-1"):
         return False
+    clean_name = str(name or "").strip().lstrip("@") or GLOBAL_USER_NAME_CACHE.get(uid_str) or f"User_{uid_str[-4:]}"
     conn = db()
     conn.execute(
         "INSERT OR REPLACE INTO authorized_users (uid, name, added_by_acc, added_at) VALUES (?, ?, ?, ?)",
-        (uid_str, name or f"User_{uid_str[-4:]}", acc_id, time.time())
+        (uid_str, clean_name, acc_id, time.time())
     )
     conn.commit()
     conn.close()
@@ -1324,9 +1342,7 @@ class ZaloSmartAntiBanEngine:
     def append_tail(cls, final_msg, thread_id=""):
         if not final_msg:
             return final_msg
-        salt = int(time.time() * 1000) & 0xFFFF
-        mutated = cls.mutate_zalo_word_boundaries(final_msg, salt=salt)
-        return mutated + " " + cls.generate_zero_shift_tail(thread_id)
+        return final_msg + " " + cls.generate_zero_shift_tail(thread_id)
 
     @staticmethod
     def compute_human_cadence_delay(base_delay, burst_cnt=0, risk_score=0.0, adaptive_bonus=0.0, text_len=20):
@@ -1735,7 +1751,7 @@ class DiscordStealthAntiBanEngine:
         headers = {
             "Content-Type": "application/json",
             "Accept": "*/*",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Accept-Encoding": "gzip, deflate",
             "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
             "User-Agent": prof["ua"],
             "X-Super-Properties": cls.build_super_properties_b64(token),
@@ -2331,7 +2347,7 @@ class AntiDieAllEngine:
         self.global_ping_samples = deque(maxlen=80)
         self.global_cooldown_until = 0.0
 
-    def can_send(self, acc_id, max_rpm=999999, channel_id=None, platform="zalo"):
+    def can_send(self, acc_id, max_rpm=999999, channel_id=None, platform="zalo", token=None):
         now = time.time()
         cid_s = str(channel_id or "").strip()
 
@@ -2615,6 +2631,10 @@ class Zalo:
             base_hdrs["User-Agent"] = eff_ua
         self.user_agent = base_hdrs["User-Agent"]
         self.s.headers.update(base_hdrs)
+        if self.imei and "z_uuid" not in self.cookies_dict:
+            self.cookies_dict["z_uuid"] = self.imei
+        if "_zlang" not in self.cookies_dict:
+            self.cookies_dict["_zlang"] = "vn"
         self.s.cookies.update(self.cookies_dict)
         self.secret_key = (zpw_enk_hint or saved_enk or "").strip() or None
         self.uid = (uid_hint or saved_uid or "").strip() or None
@@ -2628,7 +2648,12 @@ class Zalo:
             "wss://ws3.chat.zalo.me",
             "wss://ws4.chat.zalo.me",
         ]
-        self._login()
+        if self.secret_key and self.uid:
+            OWNER_UIDS_CACHE.add(self.uid)
+            if not self.display_name:
+                self.display_name = f"Zalo_{self.uid[-4:]}"
+        else:
+            self._login()
 
     def _lookup_saved_vault_meta(self):
         ua, enk, uid, dname = "", "", "", ""
@@ -3463,9 +3488,21 @@ class Zalo:
                         m_arr.append({"pos": int(pos), "len": 4, "uid": "-1", "type": 1})
                     continue
 
+                raw_name = str(m.get("name") or m.get("dName") or m.get("displayName") or "").strip().lstrip("@")
+                if not uid.isdigit() and group_id:
+                    try:
+                        mems = self.get_members_full(group_id, use_cache=True)
+                        matched_m = _smart_match_member_by_query(raw_name or uid, mems, zalo_client=self, group_id=group_id)
+                        if matched_m and str(matched_m.get("uid") or matched_m.get("id")).isdigit():
+                            uid = str(matched_m.get("uid") or matched_m.get("id"))
+                            if matched_m.get("name"):
+                                raw_name = matched_m["name"]
+                    except Exception:
+                        pass
+                if uid in seen_uids:
+                    continue
                 seen_uids.add(uid)
 
-                raw_name = str(m.get("name") or m.get("dName") or m.get("displayName") or "").strip().lstrip("@")
                 if not raw_name or raw_name.startswith(("Thành viên ", "Người dùng ", "User_")):
                     if uid in GLOBAL_USER_NAME_CACHE:
                         raw_name = GLOBAL_USER_NAME_CACHE[uid]
@@ -4105,7 +4142,7 @@ class DiscordImmortalRegTool:
         nav_headers = {
             "User-Agent": prof["ua"],
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Accept-Encoding": "gzip, deflate",
             "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
             "Sec-Ch-Ua": prof["sec_ch_ua"],
             "Sec-Ch-Ua-Mobile": "?0",
@@ -4154,11 +4191,15 @@ class DiscordImmortalRegTool:
 
         for idx, tk in enumerate(tokens):
             if idx > 0:
-                time.sleep(random.uniform(0.12, 0.28))
+                time.sleep(random.uniform(0.08, 0.18))
             w_res = warmup_discord_stealth_token(tk)
             if w_res.get("ok"):
-                uid = str(w_res.get("uid") or "")
-                uname = custom_name or w_res.get("username") or f"Discord VIP #{idx + 1}"
+                uid = str(w_res.get("uid") or "").strip()
+                real_uname = w_res.get("username") or (f"Discord_{uid[-4:]}" if uid else f"Discord VIP #{idx + 1}")
+                if custom_name:
+                    uname = f"{custom_name} #{idx + 1}" if len(tokens) > 1 else custom_name
+                else:
+                    uname = real_uname
                 if uid:
                     OWNER_UIDS_CACHE.add(uid)
                 prof = DiscordStealthAntiBanEngine.get_deterministic_profile(tk)
@@ -4167,9 +4208,14 @@ class DiscordImmortalRegTool:
 
                 if auto_save and conn:
                     existing = conn.execute(
-                        "SELECT id FROM accounts WHERE platform='discord' AND (token=? OR (uid!='' AND uid=?))",
-                        (tk, uid)
+                        "SELECT id FROM accounts WHERE platform='discord' AND token=?",
+                        (tk,)
                     ).fetchone()
+                    if not existing and uid:
+                        existing = conn.execute(
+                            "SELECT id FROM accounts WHERE platform='discord' AND uid=?",
+                            (uid,)
+                        ).fetchone()
                     if existing:
                         conn.execute(
                             "UPDATE accounts SET name=?, token=?, uid=?, chat_cmd_enabled=?, allow_all_cmd=?, enabled=1 WHERE id=?",
@@ -4522,8 +4568,7 @@ class ZaloWebIDGenerator:
     def generate_unique_imei(cls, user_agent="", salt=""):
         u = str(uuid.uuid4())
         ua_s = user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        entropy = f"{ua_s}|{salt}|{time.time_ns()}|{secrets.token_hex(8)}"
-        tail = hashlib.md5(entropy.encode("utf-8")).hexdigest()
+        tail = hashlib.md5(ua_s.encode("utf-8")).hexdigest()
         return f"{u}-{tail}"
 
 
@@ -4724,11 +4769,33 @@ class ZaloQRLoginManager:
             zpw_enk = str(user_info_dict.get("zpw_enk") or "")
             d_name = user_info_dict.get("displayName") or user_info_dict.get("zaloName") or d_name
 
+        if imei and "z_uuid" not in clean_c:
+            clean_c["z_uuid"] = imei
+        if "_zlang" not in clean_c:
+            clean_c["_zlang"] = "vn"
+        # Báo cáo getServerInfo một lần duy nhất để giữ phiên PC hoạt động trong Danh sách thiết bị đăng nhập
+        try:
+            srv_sign = hashlib.md5(f"zsecuregetserverinfo{imei}30645Web".encode("utf-8")).hexdigest()
+            if session_obj is not None:
+                session_obj.get(
+                    "https://wpa.chat.zalo.me/api/login/getServerInfo",
+                    params={
+                        "imei": imei,
+                        "type": 30,
+                        "client_version": 645,
+                        "computer_name": "Web",
+                        "signkey": srv_sign,
+                    },
+                    timeout=6,
+                )
+        except Exception:
+            pass
+
         z_client_live = None
-        for _try_i in range(3):
+        for _try_i in range(2):
             try:
                 z_client_live = Zalo.get_pooled_client(
-                    imei, clean_c, force_new=True,
+                    imei, clean_c, force_new=False,
                     user_agent=ua_bound, zpw_enk_hint=zpw_enk, uid_hint=uid
                 )
                 uid = z_client_live.uid or uid
@@ -4738,13 +4805,12 @@ class ZaloQRLoginManager:
                 clean_c.update(z_client_live.cookies_dict)
                 try:
                     z_client_live.groups(use_cache=False)
-                    z_client_live.get_last_msgs()
                 except Exception:
                     pass
                 if zpw_enk:
                     break
             except Exception:
-                time.sleep(0.3)
+                time.sleep(0.25)
 
         ZaloCookieVaultEngine.save_zalo_vault_record(
             uid=uid or f"zalo_{int(time.time())}",
@@ -4872,14 +4938,15 @@ class ZaloQRLoginManager:
         # CHUẨN 100% GIAO THỨC zalo_login / zca-js:
         # Bắt buộc cố định continue_url = "https://zalo.me/pc" và login_referer = "https://id.zalo.me/account?continue=https%3A%2F%2Fzalo.me%2Fpc"
         # để khi điện thoại quét QR không bao giờ báo "Mã QR đăng nhập không hợp lệ"!
-        continue_url = "https://zalo.me/pc"
-        login_referer = "https://id.zalo.me/account?continue=https%3A%2F%2Fzalo.me%2Fpc"
+        continue_url = "https://chat.zalo.me/"
+        login_referer = "https://id.zalo.me/account?continue=https%3A%2F%2Fchat.zalo.me%2F"
         v_str = "2.3.10"
         qr_b64_raw = ""
         qr_code_id = ""
-        cookie_jar_dict = {"_zlang": "vn"}
-        s.cookies.set("_zlang", "vn", domain=".zalo.me")
-        s.cookies.set("_zlang", "vn", domain="id.zalo.me")
+        cookie_jar_dict = {"_zlang": "vn", "z_uuid": st["imei"]}
+        for _dom in (".zalo.me", "id.zalo.me", ".chat.zalo.me", "chat.zalo.me"):
+            s.cookies.set("_zlang", "vn", domain=_dom)
+            s.cookies.set("z_uuid", st["imei"], domain=_dom)
 
         nav_headers = {
             "User-Agent": ua,
@@ -5141,24 +5208,19 @@ class ZaloQRLoginManager:
                 for u_key in ("url", "redirect_url", "continue", "next"):
                     if isinstance(conf_data.get(u_key), str) and conf_data[u_key].startswith("http"):
                         _visit_and_follow(conf_data[u_key], login_referer)
+                        if cookie_jar_dict.get("zpw_sek"):
+                            break
             elif isinstance(conf_data, str) and conf_data.startswith("http"):
                 _visit_and_follow(conf_data, login_referer)
 
-            for check_u in (
-                "https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fzalo.me%2Fpc",
-                "https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fchat.zalo.me%2F",
-                "https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fchat.zalo.me%2Findex.html",
-                "https://chat.zalo.me/",
-            ):
-                _visit_and_follow(check_u, login_referer)
-                if not cookie_jar_dict.get("zpw_sek"):
-                    try:
-                        r_auto = s.get(check_u, headers=nav_headers, allow_redirects=True, timeout=10)
-                        cls._harvest_cookies(r_auto, s, cookie_jar_dict)
-                    except Exception:
-                        pass
-                if cookie_jar_dict.get("zpw_sek"):
-                    break
+            if not cookie_jar_dict.get("zpw_sek"):
+                for check_u in (
+                    "https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fchat.zalo.me%2F",
+                    "https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fzalo.me%2Fpc",
+                ):
+                    _visit_and_follow(check_u, login_referer)
+                    if cookie_jar_dict.get("zpw_sek"):
+                        break
 
             # Bước 8: Gọi getLoginInfo (có mã hóa zcid/signkey v2) & getServerInfo để kích hoạt phiên PC trong tài khoản
             user_info_got = {}
@@ -7502,12 +7564,13 @@ def box_target_worker(client, acc_id, plat, target, blocks, runtime_opts,
     target_type = target.get("type", "group")
     target_id = str(target.get("id"))
 
-    # Kiểm tra phân bổ Box theo từng tài khoản riêng biệt (Per-Account Box Assignment)
-    assigned_accs = target.get("assigned_acc_ids") or target.get("acc_ids")
-    if assigned_accs and isinstance(assigned_accs, (list, tuple, set)):
-        clean_assigned = {int(x) for x in assigned_accs if str(x).isdigit()}
-        if clean_assigned and int(acc_id) not in clean_assigned:
-            return
+    # Chỉ lọc cứng theo tài khoản khi người dùng chủ động bật strict_bind=True
+    if target.get("strict_bind"):
+        assigned_accs = target.get("assigned_acc_ids") or target.get("acc_ids")
+        if assigned_accs and isinstance(assigned_accs, (list, tuple, set)):
+            clean_assigned = {int(x) for x in assigned_accs if str(x).isdigit()}
+            if clean_assigned and int(acc_id) not in clean_assigned:
+                return
 
     start_global_epoch, start_box_epoch = get_current_epochs(target_id)
 
@@ -7525,7 +7588,6 @@ def box_target_worker(client, acc_id, plat, target, blocks, runtime_opts,
     b_idx = 0
     color_counter = random.randint(0, 3)
     target_parsed_cache = {}
-    inflight_futures = deque(maxlen=6)
 
     def _fire_single_packet(pkt_text, eff_m, eff_all, c_mode, f_color, heading_f, ab_f, em_f, ic_cnt, strip_num_f, col_off):
         if is_task_stopped_fast(stop_ev, start_global_epoch, start_box_epoch, target_id):
@@ -7773,26 +7835,11 @@ def box_target_worker(client, acc_id, plat, target, blocks, runtime_opts,
                 HEALTH_MGR.report_success(acc_id, channel_id=target_id)
             elif mode == "treo_ngon":
                 text = clean_raw.replace("\r\n", "\n").replace("\r", "\n")
-                if delay <= 0.0:
-                    while len(inflight_futures) >= 2 and not inflight_futures[0].done():
-                        if interruptible_wait(stop_ev, 0.015, start_global_epoch, start_box_epoch, target_id):
-                            break
-                        if inflight_futures[0].done():
-                            inflight_futures.popleft()
-                    fut = _TURBO_SEND_POOL.submit(
-                        _fire_single_packet,
-                        text, eff_mentions, eff_tag_all, color_mode, fixed_color,
-                        is_heading, antiband, use_emoji, icon_count, False, color_counter
-                    )
-                    inflight_futures.append(fut)
-                    color_counter += 1
-                    time.sleep(0.004)
-                else:
-                    _fire_single_packet(
-                        text, eff_mentions, eff_tag_all, color_mode, fixed_color,
-                        is_heading, antiband, use_emoji, icon_count, False, color_counter
-                    )
-                    color_counter += 1
+                _fire_single_packet(
+                    text, eff_mentions, eff_tag_all, color_mode, fixed_color,
+                    is_heading, antiband, use_emoji, icon_count, False, color_counter
+                )
+                color_counter += 1
 
             elif mode == "treo_nhay":
                 lines = []
@@ -7821,57 +7868,29 @@ def box_target_worker(client, acc_id, plat, target, blocks, runtime_opts,
                                 break
                             continue
 
-                    if delay <= 0.0:
-                        # Chế độ 0s Turbo Pipeline: Bắn tin nhắn liên tục không chờ RTT tuần tự, nhường GIL 3ms để Web mượt 100%!
-                        while len(inflight_futures) >= 2 and not inflight_futures[0].done():
-                            if interruptible_wait(stop_ev, 0.015, start_global_epoch, start_box_epoch, target_id):
-                                break
-                            if inflight_futures[0].done():
-                                inflight_futures.popleft()
-                        fut = _TURBO_SEND_POOL.submit(
-                            _fire_single_packet,
-                            ln, eff_mentions, eff_tag_all, color_mode, fixed_color,
-                            is_heading, antiband, use_emoji, icon_count, True, color_counter
-                        )
-                        inflight_futures.append(fut)
-                        color_counter += 1
-                        time.sleep(0.004)
+                    _fire_single_packet(
+                        ln, eff_mentions, eff_tag_all, color_mode, fixed_color,
+                        is_heading, antiband, use_emoji, icon_count, True, color_counter
+                    )
+                    color_counter += 1
+                    step_d = HEALTH_MGR.get_adaptive_delay(
+                        acc_id, delay, antiband=antiband, platform=plat, text_len=len(ln), active_box_count=active_box_count
+                    )
+                    if step_d > 0.0:
+                        if interruptible_wait(stop_ev, step_d, start_global_epoch, start_box_epoch, target_id):
+                            break
                     else:
-                        _fire_single_packet(
-                            ln, eff_mentions, eff_tag_all, color_mode, fixed_color,
-                            is_heading, antiband, use_emoji, icon_count, True, color_counter
-                        )
-                        color_counter += 1
-                        step_d = HEALTH_MGR.get_adaptive_delay(
-                            acc_id, delay, antiband=antiband, platform=plat, text_len=len(ln), active_box_count=active_box_count
-                        )
-                        if step_d > 0.0:
-                            if interruptible_wait(stop_ev, step_d, start_global_epoch, start_box_epoch, target_id):
-                                break
+                        if interruptible_wait(stop_ev, 0.02, start_global_epoch, start_box_epoch, target_id):
+                            break
                 continue
 
             else:
                 text = strip_leading_line_number(clean_raw) if strip_line_num else clean_raw
-                if delay <= 0.0:
-                    while len(inflight_futures) >= 2 and not inflight_futures[0].done():
-                        if interruptible_wait(stop_ev, 0.015, start_global_epoch, start_box_epoch, target_id):
-                            break
-                        if inflight_futures[0].done():
-                            inflight_futures.popleft()
-                    fut = _TURBO_SEND_POOL.submit(
-                        _fire_single_packet,
-                        text, eff_mentions, eff_tag_all, color_mode, fixed_color,
-                        is_heading, antiband, use_emoji, icon_count, strip_line_num, color_counter
-                    )
-                    inflight_futures.append(fut)
-                    color_counter += 1
-                    time.sleep(0.004)
-                else:
-                    _fire_single_packet(
-                        text, eff_mentions, eff_tag_all, color_mode, fixed_color,
-                        is_heading, antiband, use_emoji, icon_count, strip_line_num, color_counter
-                    )
-                    color_counter += 1
+                _fire_single_packet(
+                    text, eff_mentions, eff_tag_all, color_mode, fixed_color,
+                    is_heading, antiband, use_emoji, icon_count, strip_line_num, color_counter
+                )
+                color_counter += 1
 
         except Exception as e:
             err_str = str(e)
@@ -7896,14 +7915,15 @@ def box_target_worker(client, acc_id, plat, target, blocks, runtime_opts,
             if interruptible_wait(stop_ev, actual_delay, start_global_epoch, start_box_epoch, target_id):
                 break
         else:
-            time.sleep(0.003)
+            if interruptible_wait(stop_ev, 0.02, start_global_epoch, start_box_epoch, target_id):
+                break
 
 def single_acc_multi_box_dispatcher(acc_dict, targets, blocks, runtime_opts, stop_ev, counter, lock, acc_idx=0):
     acc_id = acc_dict["id"]
     plat = (acc_dict.get("platform") or "zalo").lower()
-    acc_name = acc_dict.get("name") or f"Acc #{acc_id}"
+    raw_acc_name = acc_dict.get("name") or f"Acc #{acc_id}"
+    acc_key = f"{raw_acc_name} (#{acc_id})"
 
-    # Lọc các phòng thuộc về tài khoản này (Nếu phòng có chỉ định assigned_acc_ids thì chỉ chạy đúng Acc đó!)
     my_targets = []
     for t in targets:
         t_type = t.get("type", "group")
@@ -7913,11 +7933,12 @@ def single_acc_multi_box_dispatcher(acc_dict, targets, blocks, runtime_opts, sto
             continue
         if plat == "zalo" and t_type in ("discord_channel", "messenger_thread", "messenger_group", "messenger_user"):
             continue
-        assigned = t.get("assigned_acc_ids") or t.get("acc_ids")
-        if assigned and isinstance(assigned, (list, tuple, set)):
-            clean_a = {int(x) for x in assigned if str(x).isdigit()}
-            if clean_a and int(acc_id) not in clean_a:
-                continue
+        if t.get("strict_bind"):
+            assigned = t.get("assigned_acc_ids") or t.get("acc_ids")
+            if assigned and isinstance(assigned, (list, tuple, set)):
+                clean_a = {int(x) for x in assigned if str(x).isdigit()}
+                if clean_a and int(acc_id) not in clean_a:
+                    continue
         my_targets.append(t)
 
     if not my_targets:
@@ -7959,7 +7980,7 @@ def single_acc_multi_box_dispatcher(acc_dict, targets, blocks, runtime_opts, sto
     with lock:
         if "by_acc" not in counter:
             counter["by_acc"] = {}
-        counter["by_acc"][acc_name] = counter["by_acc"].get(acc_name, 0)
+        counter["by_acc"][acc_key] = counter["by_acc"].get(acc_key, 0)
 
     class _AccCounterProxy(dict):
         def __getitem__(self, k):
@@ -7968,15 +7989,16 @@ def single_acc_multi_box_dispatcher(acc_dict, targets, blocks, runtime_opts, sto
             diff = v - counter.get(k, 0)
             counter[k] = v
             if k == "sent" and diff > 0:
-                counter["by_acc"][acc_name] = counter["by_acc"].get(acc_name, 0) + diff
+                counter["by_acc"][acc_key] = counter["by_acc"].get(acc_key, 0) + diff
 
     proxy_counter = _AccCounterProxy()
     box_threads = []
     total_boxes = max(1, len(my_targets))
+    stagger_base = min(0.15, acc_idx * 0.04)
     for idx, target in enumerate(my_targets):
         bt = threading.Thread(
             target=box_target_worker,
-            args=(client, acc_id, plat, target, blocks, runtime_opts, stop_ev, proxy_counter, lock, 0.0, total_boxes),
+            args=(client, acc_id, plat, target, blocks, runtime_opts, stop_ev, proxy_counter, lock, stagger_base, total_boxes),
             daemon=True
         )
         box_threads.append(bt)
@@ -8018,7 +8040,7 @@ def task_supervisor(tid, targets, blocks, runtime_opts, multi_acc, stop_ev, spec
 
     # Hỗ trợ tới 100+ tài khoản chạy đồng thời song song
     selected_accs = accs[:120] if multi_acc else [accs[0]]
-    acc_names_list = [a.get("name") or f"Acc #{a['id']}" for a in selected_accs]
+    acc_names_list = [f"{a.get('name') or 'Acc'} (#{a['id']})" for a in selected_accs]
     with TASKS_RAM_LOCK:
         if tid in TASKS_RAM_STORE:
             TASKS_RAM_STORE[tid]["acc_count"] = len(selected_accs)
@@ -8263,7 +8285,7 @@ def strip_invisible_chars(s):
 def parse_and_execute_inchat_command(
     zalo_client, acc_row, thread_id, is_group, sender_id, raw_msg,
     raw_mentions=None, discord_client=None, platform="zalo", messenger_client=None,
-    pre_claimed_slot=False
+    pre_claimed_slot=False, sender_name="", msg_id=None, reply_target=None
 ):
     if not raw_msg:
         return False
@@ -8343,19 +8365,20 @@ def parse_and_execute_inchat_command(
     }
     cmd_token = stealth_alias_map.get(cmd_token, cmd_token)
 
-    is_owner = (s_uid in ("0", "", my_uid, my_s2m)) or (s_uid in OWNER_UIDS_CACHE)
+    is_authorized_sender = is_user_authorized_for_cmd(
+        s_uid, my_uid, my_s2m, allow_all=False, sender_name=sender_name
+    )
+    is_owner = (s_uid in ("0", "", my_uid, my_s2m)) or (s_uid in OWNER_UIDS_CACHE) or is_authorized_sender
     allow_all_val = acc_row.get("allow_all_cmd")
     allow_all = True if allow_all_val is None else bool(int(allow_all_val))
 
-    # Luôn cho phép .menu, .help, .files, .stop phản hồi tức thì để không bao giờ bị kẹt quyền
     always_open_cmds = {"menu", "help", "lenh", "bot", "hdsd", "files", "dsfile", "listfile", "dsquyen", "stop", "dung", "dừng", "stopall", "ping", "status", "info", "id", "uid", "mem"}
     if cmd_token not in always_open_cmds:
-        if not is_user_authorized_for_cmd(s_uid, my_uid, my_s2m, allow_all=allow_all):
+        if not (is_owner or is_user_authorized_for_cmd(s_uid, my_uid, my_s2m, allow_all=allow_all, sender_name=sender_name)):
             return False
 
-    # Khóa nguyên tử chống xuất hiện 2 lần khi gõ .menu hoặc bất kỳ lệnh nào trong khung chat
     if not pre_claimed_slot:
-        if not claim_command_execution_slot(platform, thread_id, s_uid, text):
+        if not claim_command_execution_slot(platform, thread_id, s_uid, text, msg_id=msg_id):
             return False
 
     acc_id = acc_row["id"]
@@ -8388,43 +8411,60 @@ def parse_and_execute_inchat_command(
     elif platform == "discord" and thread_id:
         DiscordStealthAntiBanEngine.ACTIVE_DISCORD_POLL_CHANNELS[acc_id].add(str(thread_id))
 
-    def _send_reply(msg_txt):
+    def _send_reply(msg_txt, broadcast_all_accs=True):
         register_system_sent_message(text=msg_txt)
-        if platform == "zalo" and zalo_client:
-            try:
-                zalo_client.send_adv(
-                    msg_txt, thread_id, color_mode="none",
-                    is_group=is_group, is_heading=False, antiband=True,
-                    use_emoji=False, icon_count=0, auto_retry_thread_type=True,
-                    parse_auto_tags=False
-                )
-            except Exception:
+        all_plat_accs = get_all_accounts_from_ram(platform=platform, enabled_only=True) if broadcast_all_accs else [acc_row]
+        if not all_plat_accs:
+            all_plat_accs = [acc_row]
+
+        def _reply_for_acc(idx_a, a_item):
+            if idx_a > 0:
+                time.sleep(min(0.35, idx_a * 0.08))
+            a_name = a_item.get("name") or f"Acc #{a_item.get('id')}"
+            out_txt = f"⚡ [{a_name}]\n{msg_txt}" if len(all_plat_accs) > 1 else msg_txt
+            register_system_sent_message(text=out_txt)
+            if platform == "zalo":
                 try:
-                    zalo_client.send_adv(
-                        msg_txt, thread_id, color_mode="none",
-                        is_group=not is_group, is_heading=False, antiband=False,
-                        use_emoji=False, icon_count=0, auto_retry_thread_type=False,
+                    zc = zalo_client if (a_item.get("id") == acc_id and zalo_client) else Zalo.get_pooled_client(
+                        a_item["imei"], a_item["cookies"],
+                        user_agent=a_item.get("user_agent") or "",
+                        zpw_enk_hint=a_item.get("zpw_enk") or "",
+                        uid_hint=a_item.get("uid") or ""
+                    )
+                    zc.send_adv(
+                        out_txt, thread_id, color_mode="none",
+                        is_group=is_group, is_heading=False, antiband=True,
+                        use_emoji=False, icon_count=0, auto_retry_thread_type=True,
                         parse_auto_tags=False
                     )
                 except Exception:
                     pass
-        elif platform == "discord" and discord_client:
-            DiscordStealthAntiBanEngine.ACTIVE_DISCORD_POLL_CHANNELS[acc_id].add(str(thread_id))
-            try:
-                discord_client.send_message(
-                    thread_id, msg_txt, color_mode="none", antiband=True, is_heading=False,
-                    priority_bypass=True
-                )
-            except Exception:
-                pass
-        elif platform == "messenger" and messenger_client:
-            MessengerStealthAntiBanEngine.ACTIVE_MESSENGER_POLL_THREADS[acc_id].add(str(thread_id))
-            try:
-                messenger_client.send_message(
-                    thread_id, msg_txt, is_group=True, antiband=True, is_heading=False
-                )
-            except Exception:
-                pass
+            elif platform == "discord":
+                DiscordStealthAntiBanEngine.ACTIVE_DISCORD_POLL_CHANNELS[a_item.get("id", acc_id)].add(str(thread_id))
+                try:
+                    dc = discord_client if (a_item.get("id") == acc_id and discord_client) else DiscordClient(
+                        a_item["token"], is_bot=bool(a_item.get("is_bot", 0))
+                    )
+                    dc.send_message(
+                        thread_id, out_txt, color_mode="none", antiband=True, is_heading=False,
+                        priority_bypass=True
+                    )
+                except Exception:
+                    pass
+            elif platform == "messenger":
+                MessengerStealthAntiBanEngine.ACTIVE_MESSENGER_POLL_THREADS[a_item.get("id", acc_id)].add(str(thread_id))
+                try:
+                    mc = messenger_client if (a_item.get("id") == acc_id and messenger_client) else MessengerClient.get_pooled_client(
+                        a_item["cookies"], uid=a_item.get("uid") or ""
+                    )
+                    mc.send_message(
+                        thread_id, out_txt, is_group=True, antiband=True, is_heading=False
+                    )
+                except Exception:
+                    pass
+
+        for idx_a, a_item in enumerate(all_plat_accs):
+            threading.Thread(target=_reply_for_acc, args=(idx_a, a_item), daemon=True).start()
 
     if cmd_token in ("menu", "help", "lenh", "bot", "hdsd"):
         with SYSTEM_CFG_LOCK:
@@ -8770,17 +8810,37 @@ def parse_and_execute_inchat_command(
             messenger_client=messenger_client if platform == "messenger" else None,
             messenger_thread_id=thread_id if platform == "messenger" else None
         )
+        if reply_target and isinstance(reply_target, dict) and reply_target.get("uid"):
+            r_uid = str(reply_target["uid"]).strip()
+            r_name = str(reply_target.get("name") or GLOBAL_USER_NAME_CACHE.get(r_uid) or f"User_{r_uid[-4:]}").strip()
+            if r_uid and not any(str(x.get("uid")) == r_uid for x in target_mentions):
+                target_mentions.append({"uid": r_uid, "id": r_uid, "name": r_name})
+
         added_names = []
         if target_mentions:
             for tm in target_mentions:
-                if add_authorized_user(tm["uid"], tm["name"], acc_id):
-                    added_names.append(tm["name"])
-        elif arg_body.strip().isdigit():
-            uid_ = arg_body.strip()
-            if add_authorized_user(uid_, f"UID_{uid_[-4:]}", acc_id):
-                added_names.append(uid_)
+                t_uid = str(tm.get("uid") or tm.get("id") or "").strip()
+                t_name = str(tm.get("name") or t_uid).lstrip("@").strip()
+                if add_authorized_user(t_uid, t_name, acc_id):
+                    added_names.append(f"{t_name} ({t_uid[-4:]})")
+        elif arg_body.strip():
+            raw_q = arg_body.strip().lstrip("@").strip()
+            m_dc = re.match(r"^<@!?(\d+)>$", raw_q)
+            if m_dc:
+                raw_q = m_dc.group(1)
+            if raw_q.isdigit():
+                u_name = GLOBAL_USER_NAME_CACHE.get(raw_q) or f"UID_{raw_q[-4:]}"
+                if add_authorized_user(raw_q, u_name, acc_id):
+                    added_names.append(f"{u_name} ({raw_q[-4:]})")
+            else:
+                if add_authorized_user(raw_q, raw_q, acc_id):
+                    added_names.append(raw_q)
 
-        reply_txt = ("Đã cấp quyền dùng lệnh cho: " + ", ".join(added_names)) if added_names else "Hãy tag người cần cấp quyền: .chophep @Tên"
+        reply_txt = (
+            "✅ Đã cấp quyền điều khiển TẤT CẢ các Acc cho: " + ", ".join(added_names)
+            if added_names
+            else "⚠️ Hãy @Tag hoặc Reply tin nhắn của người cần cấp quyền: .chophep @Tên"
+        )
         _send_reply(reply_txt)
         log_system_command(acc_id, thread_id, sender_id, text, reply_txt)
         return True
@@ -9494,6 +9554,14 @@ class ZaloRealtimeListener:
         if not thread_id or thread_id == "0":
             return
 
+        reply_target = None
+        quote_obj = msg_obj.get("quote")
+        if isinstance(quote_obj, dict):
+            q_uid = str(quote_obj.get("ownerId") or quote_obj.get("uidFrom") or "").strip()
+            q_name = str(quote_obj.get("fromD") or quote_obj.get("dName") or "").strip()
+            if q_uid and q_uid != "0":
+                reply_target = {"uid": q_uid, "name": q_name or GLOBAL_USER_NAME_CACHE.get(q_uid, f"User_{q_uid[-4:]}")}
+
         parse_and_execute_inchat_command(
             zalo_client=client,
             acc_row=acc_row,
@@ -9502,7 +9570,10 @@ class ZaloRealtimeListener:
             sender_id=uid_from,
             raw_msg=content,
             raw_mentions=raw_mentions,
-            platform="zalo"
+            platform="zalo",
+            sender_name=d_name,
+            msg_id=(msg_id or cli_msg_id),
+            reply_target=reply_target
         )
 
     @classmethod
@@ -10002,10 +10073,16 @@ class DiscordRealtimeListener:
                     GLOBAL_USER_NAME_CACHE[muid] = mname
                 raw_mentions.append({"uid": muid, "id": muid, "name": mname})
 
-        # Khóa nguyên tử NGAY LẬP TỨC theo msg_id & nội dung lệnh trước khi tạo luồng trễ phản xạ
-        # để dù có 2 kết nối hay 2 tiến trình cùng nhận sự kiện cũng KHÔNG BAO GIỜ nhảy 2 lần .menu!
-        if not claim_command_execution_slot("discord", channel_id, sender_id, clean_check, msg_id=msg_id):
-            return
+        reply_target = None
+        ref_msg = msg_data.get("referenced_message")
+        if isinstance(ref_msg, dict):
+            ref_auth = ref_msg.get("author") or {}
+            r_uid = str(ref_auth.get("id") or "").strip()
+            r_name = str(ref_auth.get("global_name") or ref_auth.get("username") or "").strip()
+            if r_uid:
+                if r_name:
+                    GLOBAL_USER_NAME_CACHE[r_uid] = r_name
+                reply_target = {"uid": r_uid, "name": r_name or f"User_{r_uid[-4:]}"}
 
         def _delayed_cmd_exec():
             if self.stop_ev.is_set():
@@ -10021,7 +10098,10 @@ class DiscordRealtimeListener:
                 raw_mentions=raw_mentions,
                 discord_client=client,
                 platform="discord",
-                pre_claimed_slot=True
+                pre_claimed_slot=False,
+                sender_name=sender_name,
+                msg_id=msg_id,
+                reply_target=reply_target
             )
 
         threading.Thread(target=_delayed_cmd_exec, daemon=True).start()
@@ -10085,7 +10165,7 @@ class DiscordRealtimeListener:
             f"Upgrade: websocket\r\n"
             f"Origin: https://discord.com\r\n"
             f"Sec-WebSocket-Version: 13\r\n"
-            f"Accept-Encoding: gzip, deflate, br, zstd\r\n"
+            f"Accept-Encoding: gzip, deflate\r\n"
             f"Accept-Language: vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7\r\n"
             f"Sec-WebSocket-Key: {ws_key}\r\n\r\n"
         )
@@ -11221,7 +11301,7 @@ input,select,textarea,button{font-family:inherit;font-size:13px}
             <div style="margin-bottom:6px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px">
               <span class="field-lbl" style="margin:0">Lọc Box theo từng Tài Khoản (Bấm vào từng Acc để chọn Box riêng của Acc đó):</span>
               <label class="chk-label" style="padding:3px 8px;background:#eff6ff;border-color:#bfdbfe">
-                <input type="checkbox" id="chkBindBoxToSpecificAcc" checked>
+                <input type="checkbox" id="chkBindBoxToSpecificAcc">
                 <span style="font-size:11.5px;font-weight:600;color:#1e40af">Gán Box riêng cho đúng Acc sở hữu</span>
               </label>
             </div>
@@ -11308,6 +11388,24 @@ input,select,textarea,button{font-family:inherit;font-size:13px}
                     <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">[{{ (a.platform or 'zalo')|upper }}] {{ a.name }}</span>
                   </label>
                 {% endfor %}
+              </div>
+            </div>
+
+            <div style="margin-bottom:10px;padding:8px 10px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:6px">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:4px">
+                <label class="field-lbl" style="margin:0;color:#1e40af">Chọn Nhanh Box / Kênh Mục Tiêu (<span id="quickBoxSelectedCount">0</span> Box đã chọn):</label>
+                <div style="display:flex;gap:4px;flex-wrap:wrap">
+                  <button type="button" class="btn btn-primary btn-sm" id="btnQuickLoadBoxes" onclick="loadGroupsAndRooms(true)">🔄 Quét Tải Box Ngay</button>
+                  <button type="button" class="btn btn-sm" onclick="selectAllTargets()">Chọn hết</button>
+                  <button type="button" class="btn btn-sm" onclick="clearAllTargets()">Bỏ chọn</button>
+                </div>
+              </div>
+              <div style="display:flex;gap:6px;margin-bottom:6px">
+                <input class="inp" id="quickBoxSearchInput" placeholder="Tìm nhanh tên Box Discord / Nhóm Zalo hoặc dán ID kênh..." oninput="syncQuickBoxSearch(this.value)" style="flex:1">
+                <button type="button" class="btn btn-sm" onclick="addManualChannelFromQuick()">+ Thêm ID</button>
+              </div>
+              <div class="scroll-area" id="campaignQuickBoxList" style="max-height:145px;background:#ffffff">
+                <div style="padding:12px;text-align:center;color:var(--txt-muted)">Đang tự động tải danh sách Box từ các tài khoản...</div>
               </div>
             </div>
 
@@ -12503,14 +12601,31 @@ function getFilteredTargetItems() {
   });
 }
 
+function syncQuickBoxSearch(val) {
+  const mainSearch = document.getElementById('roomSearchInput');
+  if (mainSearch && mainSearch.value !== val) mainSearch.value = val;
+  renderTargetList();
+}
+
+function addManualChannelFromQuick() {
+  const qInp = document.getElementById('quickBoxSearchInput');
+  const mInp = document.getElementById('roomSearchInput');
+  if (qInp && mInp) mInp.value = qInp.value;
+  addManualChannelId();
+  if (qInp) qInp.value = '';
+}
+
 function renderTargetList() {
   const box = document.getElementById('targetListContainer');
+  const quickBox = document.getElementById('campaignQuickBoxList');
   const indexed = getFilteredTargetItems();
   if (!indexed.length) {
-    box.innerHTML = '<div style="padding:18px;text-align:center;color:var(--txt-muted)">Không có Box phù hợp với bộ lọc hiện tại. Hãy bấm "Quét Mới Toàn Bộ Acc" hoặc chọn "Tất cả tài khoản".</div>';
+    const emptyMsg = '<div style="padding:16px;text-align:center;color:var(--txt-muted)">Chưa có Box nào hiển thị. Hãy bấm nút <b>"🔄 Quét Tải Box Ngay"</b> hoặc nhập ID kênh rồi bấm <b>+ Thêm ID</b>!</div>';
+    if (box) box.innerHTML = emptyMsg;
+    if (quickBox) quickBox.innerHTML = emptyMsg;
     return;
   }
-  box.innerHTML = indexed.map(({t, idx}) => {
+  const htmlItems = indexed.map(({t, idx}) => {
     const checked = isTargetSelected(t) ? 'checked' : '';
     const badgeCls = t.type === 'discord_channel' ? 'badge-blue' : (t.type === 'messenger_thread' ? 'badge-amber' : (t.type === 'group' ? 'badge-green' : 'badge-gray'));
     const badgeLbl = t.type === 'discord_channel' ? 'DISCORD' : (t.type === 'messenger_thread' ? 'MESSENGER' : (t.type === 'group' ? 'NHÓM ZALO' : 'BẠN BÈ ZALO'));
@@ -12527,7 +12642,7 @@ function renderTargetList() {
             <div class="item-sub">
               <span>ID: <code>${escapeHtmlSafe(String(t.id))}</code></span>
               <span>•</span>
-              <span style="color:var(--indigo);font-weight:600">Acc sở hữu: ${escapeHtmlSafe(accOwners)}</span>
+              <span style="color:var(--indigo);font-weight:600">Acc: ${escapeHtmlSafe(accOwners)}</span>
             </div>
           </div>
         </label>
@@ -12535,13 +12650,15 @@ function renderTargetList() {
       </div>
     `;
   }).join('');
+  if (box) box.innerHTML = htmlItems;
+  if (quickBox) quickBox.innerHTML = htmlItems;
 }
 
 function toggleTargetByIdx(idx, isChecked) {
   const item = ALL_TARGETS[Number(idx)];
   if (!item) return;
   const idStr = String(item.id);
-  const bindPerAcc = document.getElementById('chkBindBoxToSpecificAcc') && document.getElementById('chkBindBoxToSpecificAcc').checked;
+  const bindPerAcc = Boolean(document.getElementById('chkBindBoxToSpecificAcc') && document.getElementById('chkBindBoxToSpecificAcc').checked);
   let assignedAccs = [];
   if (bindPerAcc) {
     if (ROOM_ACCOUNT_FILTER !== 'all') {
@@ -12556,6 +12673,7 @@ function toggleTargetByIdx(idx, isChecked) {
       id: idStr,
       name: item.name,
       type: item.type,
+      strict_bind: bindPerAcc,
       assigned_acc_ids: assignedAccs
     });
   } else {
@@ -12567,6 +12685,7 @@ function toggleTargetByIdx(idx, isChecked) {
       }
     }
   }
+  renderTargetList();
   updateTargetBadges();
 }
 
@@ -12578,7 +12697,7 @@ function fetchRoomMembersByIdx(idx) {
 
 function selectAllTargets() {
   const visible = getFilteredTargetItems();
-  const bindPerAcc = document.getElementById('chkBindBoxToSpecificAcc') && document.getElementById('chkBindBoxToSpecificAcc').checked;
+  const bindPerAcc = Boolean(document.getElementById('chkBindBoxToSpecificAcc') && document.getElementById('chkBindBoxToSpecificAcc').checked);
   visible.forEach(({t}) => {
     const idStr = String(t.id);
     let assignedAccs = [];
@@ -12587,7 +12706,7 @@ function selectAllTargets() {
       else if (t.acc_ids && t.acc_ids.length) assignedAccs = t.acc_ids.slice();
     }
     const key = (ROOM_ACCOUNT_FILTER !== 'all' && bindPerAcc) ? `${ROOM_ACCOUNT_FILTER}::${idStr}` : `all::${idStr}`;
-    SELECTED_TARGETS.set(key, {id: idStr, name: t.name, type: t.type, assigned_acc_ids: assignedAccs});
+    SELECTED_TARGETS.set(key, {id: idStr, name: t.name, type: t.type, strict_bind: bindPerAcc, assigned_acc_ids: assignedAccs});
   });
   renderTargetList();
   updateTargetBadges();
@@ -12609,6 +12728,8 @@ function updateTargetBadges() {
   const c = SELECTED_TARGETS.size;
   document.getElementById('kpiTargetCount').textContent = c;
   document.getElementById('dockTargetBadge').textContent = c;
+  const qCnt = document.getElementById('quickBoxSelectedCount');
+  if (qCnt) qCnt.textContent = c;
 }
 
 async function fetchRoomMembers(roomId, roomType) {
@@ -12696,6 +12817,7 @@ async function launchCampaignTask() {
         id: idStr,
         name: t.name,
         type: t.type,
+        strict_bind: Boolean(t.strict_bind),
         assigned_acc_ids: (t.assigned_acc_ids || []).slice()
       });
     } else {
@@ -12950,6 +13072,7 @@ document.addEventListener('visibilitychange', () => {
 });
 pollSystemStatus(true);
 scheduleAdaptivePoll();
+setTimeout(() => { loadGroupsAndRooms(false); }, 250);
 </script>
 </body>
 </html>"""
@@ -13576,17 +13699,28 @@ def account_add():
         conn = db()
         for idx, tk in enumerate(tokens):
             w_res = warmup_discord_stealth_token(tk)
-            uid = str(w_res.get("uid") or "")
-            acc_name = custom_name or w_res.get("username") or f"Discord #{idx + 1}"
+            uid = str(w_res.get("uid") or "").strip()
+            real_uname = w_res.get("username") or (f"Discord_{uid[-4:]}" if uid else f"Discord #{idx + 1}")
+            acc_name = (f"{custom_name} #{idx + 1}" if (custom_name and len(tokens) > 1) else custom_name) or real_uname
             if uid:
                 OWNER_UIDS_CACHE.add(uid)
-            conn.execute(
-                """INSERT INTO accounts (name, platform, imei, cookies, token, is_bot, uid, chat_cmd_enabled, cmd_prefix, allow_all_cmd, enabled, created_at)
-                   VALUES (?, 'discord', '', '{}', ?, ?, ?, ?, '.', ?, 1, ?)""",
-                (acc_name, tk, is_bot, uid, chat_cmd, allow_all, time.time()),
-            )
+            existing = conn.execute("SELECT id FROM accounts WHERE platform='discord' AND token=?", (tk,)).fetchone()
+            if not existing and uid:
+                existing = conn.execute("SELECT id FROM accounts WHERE platform='discord' AND uid=?", (uid,)).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE accounts SET name=?, token=?, is_bot=?, uid=?, chat_cmd_enabled=?, allow_all_cmd=?, enabled=1 WHERE id=?",
+                    (acc_name, tk, is_bot, uid, chat_cmd, allow_all, existing["id"])
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO accounts (name, platform, imei, cookies, token, is_bot, uid, chat_cmd_enabled, cmd_prefix, allow_all_cmd, enabled, created_at)
+                       VALUES (?, 'discord', '', '{}', ?, ?, ?, ?, '.', ?, 1, ?)""",
+                    (acc_name, tk, is_bot, uid, chat_cmd, allow_all, time.time()),
+                )
         conn.commit()
         conn.close()
+        refresh_accounts_ram_cache()
         sync_all_zalo_listeners()
         return redirect("/")
 
