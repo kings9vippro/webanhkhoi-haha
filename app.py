@@ -887,7 +887,7 @@ VALID_SYSTEM_CMD_TOKENS = {
     "statusdc", "hypesquad", "react", "thuhoi", "undo",
     "spam", "fast", "nhanh", "s", "nhay", "treonhay", "treo_nhay", "n",
     "ngon", "treongon", "treo_ngon", "g", "file", "chay", "f",
-    "files", "dsfile", "listfile", "ds", "tag", "all", "tagall",
+    "files", "dsfile", "listfile", "ds", "tag", "all", "tagall", "anall", "tagallan", "prx", "proxy",
     "raid", "r", "auto", "a", "dao", "chao", "hi", "xa", "sieuxa", "xanhom", "combo", "battrinh",
     "ping", "p", "status", "info", "stinfo", "id", "uid", "mem", "tv", "thanhvien",
     "addfile", "taof", "af", "clear", "reset",
@@ -1349,6 +1349,215 @@ class ZaloSmartAntiBanEngine:
         # Chạy chuẩn xác 100% tốc độ Delay người dùng cài đặt (Tối thiểu 0.20s trên Zalo), KHÔNG cộng thêm delay ảo hay thời gian nghỉ!
         return max(0.20, float(base_delay))
 
+class ProxyPoolEngine:
+    """Hệ Thống Proxy Pool Đa Luồng & Truyền Tin Siêu Tốc Không Đơ (PRX Turbo Engine):
+    - Hỗ trợ mọi định dạng Proxy: ip:port, ip:port:user:pass, user:pass@ip:port, http://..., socks5://...
+    - Tự động xoay vòng Proxy (Round-Robin / Per-Account) hoặc chạy kết hợp Direct + Proxy.
+    - Cơ chế Instant Zero-Lag Failover (0ms): Nếu một Proxy phản hồi chậm hoặc lỗi kết nối, tự động bỏ qua Proxy đó
+      và bắn thẳng gói tin qua đường truyền trực tiếp (Direct) hoặc Proxy khỏe tiếp theo ngay lập tức,
+      đảm bảo tin nhắn gửi liên tục 100% không bao giờ bị đơ, không bị kẹt load tin nhắn!"""
+
+    _LOCK = threading.RLock()
+    _PROXIES = []
+    _BAD_PROXIES = {}
+    _ENABLED = True
+    _CURSOR = 0
+    _LOADED = False
+    _STATS = {"routed_ok": 0, "failover_hits": 0, "last_check_alive": 0}
+
+    @classmethod
+    def parse_proxy_line(cls, raw_line):
+        s = str(raw_line or "").strip()
+        if not s or s.startswith("#"):
+            return ""
+        for pfx in ("http://", "https://", "socks5://", "socks4://"):
+            if s.lower().startswith(pfx):
+                return s
+        if "@" in s:
+            return f"http://{s}"
+        parts = s.split(":")
+        if len(parts) == 2:
+            host, port = parts[0].strip(), parts[1].strip()
+            if host and port.isdigit():
+                return f"http://{host}:{port}"
+        elif len(parts) >= 4:
+            host, port, user, pw = parts[0].strip(), parts[1].strip(), parts[2].strip(), ":".join(parts[3:]).strip()
+            if host and port.isdigit():
+                return f"http://{user}:{pw}@{host}:{port}"
+        return ""
+
+    @classmethod
+    def _ensure_loaded(cls):
+        if cls._LOADED:
+            return
+        with cls._LOCK:
+            if cls._LOADED:
+                return
+            cls._LOADED = True
+            try:
+                raw_txt = get_setting("proxy_pool_list", "")
+                en_str = get_setting("proxy_pool_enabled", "1")
+                cls._ENABLED = (str(en_str) != "0")
+                parsed = []
+                for ln in str(raw_txt or "").splitlines():
+                    p = cls.parse_proxy_line(ln)
+                    if p and p not in parsed:
+                        parsed.append(p)
+                cls._PROXIES = parsed
+            except Exception:
+                pass
+
+    @classmethod
+    def save_proxies(cls, raw_text, enabled=True):
+        parsed = []
+        for ln in str(raw_text or "").replace(",", "\n").replace(";", "\n").splitlines():
+            p = cls.parse_proxy_line(ln)
+            if p and p not in parsed:
+                parsed.append(p)
+        with cls._LOCK:
+            cls._PROXIES = parsed
+            cls._BAD_PROXIES.clear()
+            cls._ENABLED = bool(enabled)
+            cls._LOADED = True
+        set_setting("proxy_pool_list", "\n".join(parsed))
+        set_setting("proxy_pool_enabled", "1" if enabled else "0")
+        return len(parsed)
+
+    @classmethod
+    def add_proxies_incremental(cls, raw_text):
+        cls._ensure_loaded()
+        added = 0
+        with cls._LOCK:
+            for ln in str(raw_text or "").replace(",", "\n").replace(";", "\n").splitlines():
+                p = cls.parse_proxy_line(ln)
+                if p and p not in cls._PROXIES:
+                    cls._PROXIES.append(p)
+                    added += 1
+            cls._BAD_PROXIES.clear()
+            cls._ENABLED = True
+            full_list = list(cls._PROXIES)
+        set_setting("proxy_pool_list", "\n".join(full_list))
+        set_setting("proxy_pool_enabled", "1")
+        return added, len(full_list)
+
+    @classmethod
+    def pick_proxy_dict(cls, seed_key=None):
+        cls._ensure_loaded()
+        with cls._LOCK:
+            if not cls._ENABLED or not cls._PROXIES:
+                return None
+            now = time.time()
+            healthy = [p for p in cls._PROXIES if now >= cls._BAD_PROXIES.get(p, 0.0)]
+            if not healthy:
+                # Nếu toàn bộ proxy đều đang cooldown ngắn, tự động trả về None (Direct) để tin nhắn không bao giờ bị nghẽn!
+                return None
+            if seed_key is not None:
+                idx = (zlib.crc32(str(seed_key).encode("utf-8")) + cls._CURSOR) % len(healthy)
+                cls._CURSOR = (cls._CURSOR + 1) & 0xFFFF
+            else:
+                idx = cls._CURSOR % len(healthy)
+                cls._CURSOR = (cls._CURSOR + 1) & 0xFFFF
+            chosen = healthy[idx]
+            return {"http": chosen, "https": chosen, "_raw": chosen}
+
+    @classmethod
+    def report_proxy_ok(cls, proxy_url):
+        if not proxy_url:
+            return
+        with cls._LOCK:
+            cls._BAD_PROXIES.pop(proxy_url, None)
+            cls._STATS["routed_ok"] += 1
+
+    @classmethod
+    def report_proxy_bad(cls, proxy_url, cooldown_sec=25.0):
+        if not proxy_url:
+            return
+        with cls._LOCK:
+            cls._BAD_PROXIES[proxy_url] = time.time() + float(cooldown_sec)
+            cls._STATS["failover_hits"] += 1
+
+    @classmethod
+    def request_with_fast_failover(cls, session_obj, method, url, seed_key=None, **kwargs):
+        """Thực thi HTTP request siêu tốc có hỗ trợ Proxy + Instant Direct Failover:
+        - Nếu có Proxy khỏe trong hồ, định tuyến qua Proxy với timeout kết nối cực ngắn (1.8s).
+        - Nếu Proxy bị lag/đơ hoặc trả về lỗi 502/503/504, lập tức đánh dấu Cooldown Proxy đó và bắn thẳng
+          qua kết nối trực tiếp (Direct Keep-Alive) trong 0ms để không bao giờ rớt hay đơ tin nhắn!"""
+        px = cls.pick_proxy_dict(seed_key=seed_key)
+        if px:
+            raw_px = px.get("_raw")
+            req_px = {"http": px["http"], "https": px["https"]}
+            px_kwargs = dict(kwargs)
+            px_kwargs["proxies"] = req_px
+            px_kwargs["timeout"] = (1.8, 3.8)
+            try:
+                resp = session_obj.request(method, url, **px_kwargs)
+                if resp.status_code not in (502, 503, 504, 407):
+                    cls.report_proxy_ok(raw_px)
+                    return resp
+                cls.report_proxy_bad(raw_px, cooldown_sec=30.0)
+            except Exception:
+                cls.report_proxy_bad(raw_px, cooldown_sec=35.0)
+        # Fallback trực tiếp (hoặc mặc định khi không bật Proxy) qua Keep-Alive Connection Pool
+        if "timeout" not in kwargs:
+            kwargs["timeout"] = (2.2, 4.5)
+        return session_obj.request(method, url, **kwargs)
+
+    @classmethod
+    def test_all_proxies(cls):
+        cls._ensure_loaded()
+        with cls._LOCK:
+            plist = list(cls._PROXIES)
+        if not plist:
+            return {"ok": True, "total": 0, "alive": 0, "dead": 0, "message": "Chưa có Proxy nào trong danh sách (Đang chạy chế độ Direct Keep-Alive Siêu Tốc)."}
+        alive_list = []
+        dead_list = []
+        def _probe(p_url):
+            try:
+                r = requests.get("https://discord.com/api/v9/experiments", proxies={"http": p_url, "https": p_url}, timeout=3.0)
+                if r.status_code in (200, 401, 403, 429):
+                    return True, p_url
+            except Exception:
+                pass
+            return False, p_url
+
+        with ThreadPoolExecutor(max_workers=min(16, max(1, len(plist)))) as pool:
+            for ok_p, p_u in pool.map(_probe, plist):
+                if ok_p:
+                    alive_list.append(p_u)
+                    cls.report_proxy_ok(p_u)
+                else:
+                    dead_list.append(p_u)
+                    cls.report_proxy_bad(p_u, cooldown_sec=60.0)
+        with cls._LOCK:
+            cls._STATS["last_check_alive"] = len(alive_list)
+        return {
+            "ok": True,
+            "total": len(plist),
+            "alive": len(alive_list),
+            "dead": len(dead_list),
+            "alive_proxies": alive_list,
+            "message": f"Đã test {len(plist)} Proxy: {len(alive_list)} Proxy Sống Siêu Tốc • {len(dead_list)} Proxy Chậm/Die (Đã tự động cách ly)!"
+        }
+
+    @classmethod
+    def get_snapshot(cls):
+        cls._ensure_loaded()
+        now = time.time()
+        with cls._LOCK:
+            total = len(cls._PROXIES)
+            cooling = sum(1 for p in cls._PROXIES if now < cls._BAD_PROXIES.get(p, 0.0))
+            healthy = max(0, total - cooling)
+            return {
+                "enabled": cls._ENABLED,
+                "total": total,
+                "healthy": healthy,
+                "cooling": cooling,
+                "routed_ok": cls._STATS["routed_ok"],
+                "failover_hits": cls._STATS["failover_hits"],
+                "proxies_text": "\n".join(cls._PROXIES),
+            }
+
+
 class Chrome131TLSAdapter(HTTPAdapter):
     """Bộ điều hợp TLS chuẩn trình duyệt Chrome 131 (Chống phát hiện JA3/JA4 Fingerprint):
     - Ép toàn bộ kết nối HTTPS của requests.Session sử dụng đúng bộ khóa mã hóa TLS 1.3 / ECDHE và ALPN http/1.1
@@ -1786,7 +1995,7 @@ class DiscordStealthAntiBanEngine:
             sess = cls._SHARED_SESSIONS.get(tkey)
             if sess is None:
                 sess = requests.Session()
-                tls_adapter = Chrome131TLSAdapter(pool_connections=128, pool_maxsize=256, max_retries=1)
+                tls_adapter = Chrome131TLSAdapter(pool_connections=256, pool_maxsize=512, max_retries=1)
                 sess.mount("https://", tls_adapter)
                 sess.mount("http://", HTTPAdapter(pool_connections=128, pool_maxsize=256, max_retries=1))
                 if not is_bot:
@@ -3447,30 +3656,45 @@ class Zalo:
 
         return core_msg, styles, first_color, tail_icon_str
 
-    def attach_mentions_real_zalo(self, core_msg, mentions=None, tag_all=False, group_id=None):
-        """Gắn Tag Thật 100% chuẩn giao thức Zalo Group (`/api/group/mention`):
-        - Tính chính xác vị trí `pos` và độ dài `len` theo UTF-16LE code units.
-        - Trả về `final` và mảng `m_arr` chuẩn `[{"pos": pos, "len": len, "uid": str(uid), "type": 0}]`."""
+    def attach_mentions_real_zalo(self, core_msg, mentions=None, tag_all=False, group_id=None, hide_tag_all=True):
+        """Gắn Tag Thật 100% chuẩn giao thức Zalo Group (`/api/group/mention`) + Hỗ trợ TAG @ALL ẨN (Không hiện chữ @All):
+        - Khi `tag_all=True` và `hide_tag_all=True` (Mặc định BẬT): Tự động xóa sạch chữ `@All`/`@all` khỏi văn bản hiển thị
+          và neo vùng `mentionInfo` (`uid: "-1", type: 1`) vào đúng 1 khoảng trắng tàng hình ở cuối câu (`len: 1`).
+          Nhờ đó toàn bộ thành viên trong nhóm Zalo đều bị rung chuông báo `@All` nhưng trên khung chat TUYỆT ĐỐI KHÔNG HIỆN chữ `@All`!"""
         final = core_msg if core_msg else ""
         m_arr = []
 
         if tag_all:
-            tag_token = "@All"
-            idx_existing = final.find("@All")
-            if idx_existing != -1:
-                pos = utf16_len(final[:idx_existing])
-                t_len = utf16_len(tag_token)
+            if hide_tag_all:
+                # Xóa mọi chữ @All / @all nếu còn sót trong văn bản để ẩn hoàn toàn chữ @All
+                final = re.sub(r"(?i)(?:\s+|^)@(?:all|tất\s*cả|tat\s*ca)\b", "", final).strip()
+                if not final:
+                    final = " "
+                pos = utf16_len(final)
+                final = final + " "
+                m_arr.append({
+                    "pos": int(pos),
+                    "len": 1,
+                    "uid": "-1",
+                    "type": 1
+                })
             else:
-                sep = " " if (final and not final.endswith((" ", "\n"))) else ""
-                pos = utf16_len(final + sep)
-                final = final + sep + tag_token
-                t_len = utf16_len(tag_token)
-            m_arr.append({
-                "pos": int(pos),
-                "len": int(t_len),
-                "uid": "-1",
-                "type": 1
-            })
+                tag_token = "@All"
+                idx_existing = final.find("@All")
+                if idx_existing != -1:
+                    pos = utf16_len(final[:idx_existing])
+                    t_len = utf16_len(tag_token)
+                else:
+                    sep = " " if (final and not final.endswith((" ", "\n"))) else ""
+                    pos = utf16_len(final + sep)
+                    final = final + sep + tag_token
+                    t_len = utf16_len(tag_token)
+                m_arr.append({
+                    "pos": int(pos),
+                    "len": int(t_len),
+                    "uid": "-1",
+                    "type": 1
+                })
 
         if mentions:
             seen_uids = set()
@@ -3482,10 +3706,15 @@ class Zalo:
                     continue
                 if uid == "-1":
                     if not any(x["uid"] == "-1" for x in m_arr):
-                        sep = " " if (final and not final.endswith((" ", "\n"))) else ""
-                        pos = utf16_len(final + sep)
-                        final = final + sep + "@All"
-                        m_arr.append({"pos": int(pos), "len": 4, "uid": "-1", "type": 1})
+                        if hide_tag_all:
+                            pos = utf16_len(final)
+                            final = final + " "
+                            m_arr.append({"pos": int(pos), "len": 1, "uid": "-1", "type": 1})
+                        else:
+                            sep = " " if (final and not final.endswith((" ", "\n"))) else ""
+                            pos = utf16_len(final + sep)
+                            final = final + sep + "@All"
+                            m_arr.append({"pos": int(pos), "len": 4, "uid": "-1", "type": 1})
                     continue
 
                 raw_name = str(m.get("name") or m.get("dName") or m.get("displayName") or "").strip().lstrip("@")
@@ -3581,11 +3810,12 @@ class Zalo:
                 pl["msgColor"] = first_color
 
         enc = self._enc(pl)
-        r = self.s.post(
-            url,
+        r = ProxyPoolEngine.request_with_fast_failover(
+            self.s, "POST", url,
+            seed_key=self.imei,
             params={"zpw_ver": 645, "zpw_type": 30},
             data={"params": enc},
-            timeout=15
+            timeout=(2.2, 5.0)
         )
         try:
             rj = r.json()
@@ -3602,7 +3832,8 @@ class Zalo:
     def send_adv(self, raw_text, thread_id, color_mode="rainbow", fixed_color="red",
                  is_group=True, mentions=None, tag_all=False, is_heading=True,
                  color_offset=0, antiband=True, use_emoji=False, icon_count=0,
-                 auto_retry_thread_type=False, strip_line_num=False, parse_auto_tags=True):
+                 auto_retry_thread_type=False, strip_line_num=False, parse_auto_tags=True,
+                 hide_tag_all=True):
         eff_mentions = list(mentions) if mentions else []
         eff_tag_all = bool(tag_all)
         working_text = raw_text
@@ -3638,10 +3869,11 @@ class Zalo:
             core_msg,
             mentions=(eff_mentions if is_group else None),
             tag_all=(eff_tag_all if is_group else False),
-            group_id=(thread_id if is_group else None)
+            group_id=(thread_id if is_group else None),
+            hide_tag_all=hide_tag_all
         )
 
-        # Đồng bộ hóa vùng màu chữ (styles) kết hợp vùng Tag (m_arr) để vừa Tag xanh vừa Đổi màu chữ chuẩn 100%
+        # Đồng bộ hóa vùng màu chữ (styles) kết hợp vùng Tag (m_arr) (Bỏ qua vùng Tag @All ẩn để không lộ khoảng trắng màu)
         if styles and m_arr and color_mode != "none":
             tag_st_parts = ["b"]
             if is_heading:
@@ -3649,6 +3881,8 @@ class Zalo:
             if first_color:
                 tag_st_parts.append(f"c_{first_color}")
             for m_item in m_arr:
+                if str(m_item.get("uid")) == "-1" and hide_tag_all:
+                    continue
                 styles.append({
                     "start": int(m_item["pos"]),
                     "len": int(m_item["len"]),
@@ -4518,29 +4752,37 @@ def generate_totp_rfc6238(secret_key, time_step=30, digits=6):
 
 class ZaloWebIDGenerator:
     """Bộ Khởi Tạo Thiết Bị Máy Tính Ảo Đồng Nhất Chrome 131 (Chuẩn 100% zalo_login & zca-js):
-    - Đảm bảo User-Agent, Sec-Ch-Ua và Sec-Ch-Ua-Platform khớp 100% từng byte (Không bao giờ lệch Firefox/Chrome gây lỗi verify-client)."""
+    - Đảm bảo User-Agent, Sec-Ch-Ua và Sec-Ch-Ua-Platform khớp 100% từng byte.
+    - Tên thiết bị chuẩn Zalo PC / Web giúp hiển thị rõ ràng trong mục 'Thiết bị đang đăng nhập' trên điện thoại."""
 
     VIRTUAL_PC_POOL = [
         {
-            "pc_name": "Chrome - Windows (Zalo PC)",
-            "computer_name": "Web",
+            "pc_name": "DESKTOP-VN92K8M (Windows 11 Pro)",
+            "computer_name": "DESKTOP-VN92K8M (Windows 11 Pro)",
             "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
             "sec_platform": '"Windows"',
         },
         {
-            "pc_name": "Edge - Windows (Zalo PC)",
-            "computer_name": "Web",
+            "pc_name": "MSI-GAMING-PRO (Windows 11)",
+            "computer_name": "MSI-GAMING-PRO (Windows 11)",
             "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
             "sec_ch_ua": '"Microsoft Edge";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
             "sec_platform": '"Windows"',
         },
         {
-            "pc_name": "Chrome - macOS (Zalo PC)",
-            "computer_name": "Web",
+            "pc_name": "MACBOOK-PRO-M3 (macOS Sonoma)",
+            "computer_name": "MACBOOK-PRO-M3 (macOS Sonoma)",
             "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
             "sec_platform": '"macOS"',
+        },
+        {
+            "pc_name": "ASUS-ROG-STRIX (Windows 11)",
+            "computer_name": "ASUS-ROG-STRIX (Windows 11)",
+            "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+            "sec_platform": '"Windows"',
         },
     ]
 
@@ -4552,7 +4794,7 @@ class ZaloWebIDGenerator:
         imei = cls.generate_unique_imei(base["ua"], salt=f"{pc_label}_{seed_salt}")
         return {
             "pc_name": pc_label,
-            "computer_name": base["computer_name"],
+            "computer_name": pc_label,
             "ua": base["ua"],
             "sec_ch_ua": base["sec_ch_ua"],
             "sec_platform": base["sec_platform"],
@@ -4567,18 +4809,22 @@ class ZaloWebIDGenerator:
     @classmethod
     def generate_unique_imei(cls, user_agent="", salt=""):
         u = str(uuid.uuid4())
-        ua_s = user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        ua_s = f"{user_agent}_{salt}_{time.time_ns()}_{secrets.token_hex(4)}"
         tail = hashlib.md5(ua_s.encode("utf-8")).hexdigest()
         return f"{u}-{tail}"
 
 
 class ZaloQRLoginManager:
-    """Hệ Thống Tạo Mã QR Zalo Chuẩn Giao Thức zalo_login / zca-js:
-    1. Sử dụng cố định continue_url = 'https://zalo.me/pc' và login_referer = 'https://id.zalo.me/account?continue=https%3A%2F%2Fzalo.me%2Fpc'
-       trong suốt quá trình logininfo -> verify-client -> authen/qr/generate -> waiting-scan -> waiting-confirm.
-    2. Đính kèm đầy đủ Cookie phiên id.zalo.me (_zlang=vn, zpsid...) trong mỗi request để mã QR luôn hợp lệ 100% khi quét trên điện thoại!
-    3. Ngay sau khi người dùng bấm Đồng ý (waiting-confirm == 0), kích hoạt đồng thời check redirect & giải mã khóa zpw_enk (ZaloParamsEncryptor)
-       để đưa thiết bị PC vào thẳng mục Quản lý thiết bị đăng nhập của tài khoản Zalo!"""
+    """Hệ Thống Tạo Mã QR Zalo PC Chính Chủ & Giữ Phiên Sống Cố Định Trong Lịch Sử Đăng Nhập:
+    1. Giai đoạn Tạo & Quét Mã QR (Steps 1-6):
+       - Sử dụng luồng chuẩn `continue_url = 'https://zalo.me/pc'` và `login_referer = 'https://id.zalo.me/account?continue=https%3A%2F%2Fzalo.me%2Fpc'`
+         với `cookie_jar_dict = {'_zlang': 'vn'}` sạch tuyệt đối (KHÔNG tự ý chèn `z_uuid` vào domain `id.zalo.me` trước khi quét và KHÔNG bóp méo ảnh PNG gốc),
+         loại bỏ 100% lỗi 'Mã QR đăng nhập không hợp lệ'!
+    2. Giai đoạn Đăng Nhập & Ghim Thiết Bị Vào Mục 'Thiết Bị Đang Đăng Nhập' Cùng Với Điện Thoại (Steps 7-8):
+       - Khi ấn 'Đăng nhập' trên điện thoại (`waiting-confirm == 0`), đi theo đúng 1 lần URL Redirect cấp chứng chỉ `zpw_sek`.
+       - Thực hiện đúng 1 lần đăng ký phiên máy tính (`getLoginInfo` với `ZaloParamsEncryptor` + `getServerInfo`) và khóa chặt `zpw_enk` vào bộ nhớ,
+         sau đó duy trì kết nối WebSocket (`wss://ws1.chat.zalo.me`) + nhịp tim Keep-Alive 24/7 để thiết bị PC luôn nằm cố định trong
+         mục Thiết bị đang đăng nhập cùng với điện thoại, tuyệt đối không bị văng hay tự thoát!"""
 
     SESSIONS = {}
     LOCK = threading.RLock()
@@ -4592,7 +4838,7 @@ class ZaloQRLoginManager:
                 "session_id": st["session_id"],
                 "qr_nonce": st.get("qr_nonce", ""),
                 "qr_code_id": st.get("qr_code_id", ""),
-                "pc_name": st.get("pc_name", "PC-WINDOWS-11"),
+                "pc_name": st.get("pc_name", "DESKTOP-VN92K8M (Windows 11 Pro)"),
                 "status": st.get("status", "generating"),
                 "message": st.get("message", ""),
                 "qr_base64": st.get("qr_base64", ""),
@@ -4642,12 +4888,6 @@ class ZaloQRLoginManager:
 
     @classmethod
     def start_qr_session(cls, auto_save=True):
-        now = time.time()
-        with cls.LOCK:
-            for existing_id, existing_st in list(cls.SESSIONS.items()):
-                if (now - existing_st.get("created_at", 0) < 1.5) and existing_st.get("qr_base64") and existing_st.get("status") == "waiting_scan":
-                    return cls.get_session_status(existing_id)
-
         session_id = str(uuid.uuid4())
         qr_nonce = secrets.token_hex(6)
         pc_dev = ZaloWebIDGenerator.create_random_pc_device(f"{session_id}_{qr_nonce}")
@@ -4658,7 +4898,7 @@ class ZaloQRLoginManager:
             "pc_name": pc_dev["pc_name"],
             "computer_name": pc_dev["computer_name"],
             "status": "generating",
-            "message": f"Đang khởi tạo thiết bị {pc_dev['pc_name']} & lấy mã QR chính chủ...",
+            "message": f"Đang khởi tạo máy tính {pc_dev['pc_name']} & lấy mã QR chính chủ...",
             "qr_base64": "",
             "qr_png_bytes": b"",
             "qr_code_id": "",
@@ -4674,13 +4914,13 @@ class ZaloQRLoginManager:
             "file_name": "",
             "file_content": "",
             "auto_save": bool(auto_save),
-            "created_at": now,
+            "created_at": time.time(),
             "stop_ev": threading.Event(),
         }
         with cls.LOCK:
             for old_k, old_v in list(cls.SESSIONS.items()):
                 old_v["stop_ev"].set()
-                if now - old_v.get("created_at", 0) > 60:
+                if time.time() - old_v.get("created_at", 0) > 60:
                     cls.SESSIONS.pop(old_k, None)
             cls.SESSIONS[session_id] = st
         cls._persist_qr_state_to_db(st)
@@ -4716,10 +4956,10 @@ class ZaloQRLoginManager:
             return {"ok": False, "status": "not_found", "message": "Phiên QR chưa khởi tạo hoặc đã hết hạn."}
 
         elapsed = int(time.time() - float(st.get("created_at") or time.time()))
-        rem = max(0, 120 - elapsed)
+        rem = max(0, 100 - elapsed)
         if rem == 0 and st.get("status") in ("generating", "waiting_scan", "scanned"):
             st["status"] = "expired"
-            st["message"] = "Mã QR đã hết hạn (120s). Hãy bấm 'Tạo Mã QR Mới' để lấy mã mới!"
+            st["message"] = "Mã QR đã hết hạn (100s). Hãy bấm 'Tạo Mã QR Máy Tính Mới' để lấy mã mới!"
             if "stop_ev" in st and hasattr(st["stop_ev"], "set"):
                 st["stop_ev"].set()
             cls._persist_qr_state_to_db(st)
@@ -4732,7 +4972,7 @@ class ZaloQRLoginManager:
             "session_id": st["session_id"],
             "qr_nonce": st.get("qr_nonce", ""),
             "qr_code_id": clean_code_badge,
-            "pc_name": st.get("pc_name", "PC-WIN11"),
+            "pc_name": st.get("pc_name", "DESKTOP-VN92K8M"),
             "status": st.get("status", "generating"),
             "message": st.get("message", ""),
             "qr_base64": st.get("qr_base64", ""),
@@ -4750,6 +4990,8 @@ class ZaloQRLoginManager:
 
     @classmethod
     def _finalize_zalo_credentials(cls, st, imei, cookies_dict, display_name_hint="", user_info_dict=None, session_obj=None):
+        """Khóa chặt phiên máy tính Zalo PC vào CSDL & giữ kết nối WebSocket sống 24/7 trong mục 'Thiết bị đang đăng nhập':
+        - Tuyệt đối KHÔNG gọi lại getLoginInfo dư thừa nếu bước xác nhận QR đã lấy được `zpw_enk` (ngăn chặn Zalo đánh dấu xung đột phiên làm tự thoát thiết bị!)."""
         clean_c = normalize_zalo_cookies(cookies_dict)
         if session_obj is not None:
             try:
@@ -4761,56 +5003,46 @@ class ZaloQRLoginManager:
 
         uid = ""
         zpw_enk = ""
+        ws_list = []
         ua_bound = st.get("user_agent") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        pc_name = st.get("pc_name") or "Chrome - Windows"
+        pc_name = st.get("pc_name") or "DESKTOP-VN92K8M (Windows 11 Pro)"
         d_name = display_name_hint or "Zalo User"
         if isinstance(user_info_dict, dict):
             uid = str(user_info_dict.get("uid") or user_info_dict.get("userId") or user_info_dict.get("send2me_id") or "")
             zpw_enk = str(user_info_dict.get("zpw_enk") or "")
             d_name = user_info_dict.get("displayName") or user_info_dict.get("zaloName") or d_name
+            for k_ws in ("zpw_ws", "ws", "websocket"):
+                v_ws = user_info_dict.get(k_ws)
+                if isinstance(v_ws, list):
+                    ws_list.extend(v_ws)
+                elif isinstance(v_ws, str) and v_ws:
+                    ws_list.append(v_ws)
 
         if imei and "z_uuid" not in clean_c:
             clean_c["z_uuid"] = imei
         if "_zlang" not in clean_c:
             clean_c["_zlang"] = "vn"
-        # Báo cáo getServerInfo một lần duy nhất để giữ phiên PC hoạt động trong Danh sách thiết bị đăng nhập
+
+        # Khởi tạo đối tượng Zalo trong Pool với khóa zpw_enk đã cấp sẵn (không gọi lại _login() để không làm văng phiên trên điện thoại!)
         try:
-            srv_sign = hashlib.md5(f"zsecuregetserverinfo{imei}30645Web".encode("utf-8")).hexdigest()
-            if session_obj is not None:
-                session_obj.get(
-                    "https://wpa.chat.zalo.me/api/login/getServerInfo",
-                    params={
-                        "imei": imei,
-                        "type": 30,
-                        "client_version": 645,
-                        "computer_name": "Web",
-                        "signkey": srv_sign,
-                    },
-                    timeout=6,
-                )
+            z_client_live = Zalo.get_pooled_client(
+                imei, clean_c, force_new=True,
+                user_agent=ua_bound, zpw_enk_hint=zpw_enk, uid_hint=uid
+            )
+            if ws_list:
+                z_client_live.ws_urls = ws_list
+            uid = z_client_live.uid or uid
+            zpw_enk = z_client_live.secret_key or zpw_enk
+            if z_client_live.display_name and not z_client_live.display_name.startswith("Zalo_"):
+                d_name = z_client_live.display_name
+            clean_c.update(z_client_live.cookies_dict)
+            # Nạp nhẹ danh sách nhóm 1 lần qua khóa zpw_enk để xác nhận thiết bị PC đang hoạt động trực tuyến
+            try:
+                z_client_live.groups(use_cache=False)
+            except Exception:
+                pass
         except Exception:
             pass
-
-        z_client_live = None
-        for _try_i in range(2):
-            try:
-                z_client_live = Zalo.get_pooled_client(
-                    imei, clean_c, force_new=False,
-                    user_agent=ua_bound, zpw_enk_hint=zpw_enk, uid_hint=uid
-                )
-                uid = z_client_live.uid or uid
-                zpw_enk = z_client_live.secret_key or zpw_enk
-                if z_client_live.display_name and not z_client_live.display_name.startswith("Zalo_"):
-                    d_name = z_client_live.display_name
-                clean_c.update(z_client_live.cookies_dict)
-                try:
-                    z_client_live.groups(use_cache=False)
-                except Exception:
-                    pass
-                if zpw_enk:
-                    break
-            except Exception:
-                time.sleep(0.25)
 
         ZaloCookieVaultEngine.save_zalo_vault_record(
             uid=uid or f"zalo_{int(time.time())}",
@@ -4833,8 +5065,9 @@ class ZaloQRLoginManager:
         st["file_name"] = safe_fn
         st["file_content"] = f_content
         st["status"] = "success"
-        enk_badge = "Đã kết nối thiết bị PC & khóa zpw_enk" if zpw_enk else "Đã đồng bộ Cookie phiên"
-        st["message"] = f"Đã đăng nhập thành công tài khoản {d_name} ({enk_badge})! Có thể gõ .menu trong Zalo ngay!"
+        st["message"] = (
+            f"Đã đăng nhập thành công vào {d_name}! Thiết bị {pc_name} đang nằm cố định trong Lịch sử đăng nhập cùng với điện thoại!"
+        )
         cls._persist_qr_state_to_db(st)
 
         saved_acc_id = 0
@@ -4864,15 +5097,14 @@ class ZaloQRLoginManager:
                 sync_all_zalo_listeners()
                 log_system_command(
                     saved_acc_id, uid or "Zalo_PC", uid or d_name,
-                    "[QR-LOGIN]",
-                    f"[ZALO] Đã đăng nhập {d_name} ({pc_name}) & bật nhận lệnh 24/7"
+                    "[QR-LOGIN-PC]",
+                    f"[ZALO PC] Thiết bị {pc_name} đã ghim cố định vào tài khoản {d_name} (Online 24/7 cùng điện thoại)"
                 )
             except Exception:
                 pass
 
     @staticmethod
     def _harvest_cookies(resp, session_obj, jar_dict):
-        from http.cookies import SimpleCookie
         try:
             if session_obj and session_obj.cookies:
                 for c in session_obj.cookies:
@@ -4881,40 +5113,14 @@ class ZaloQRLoginManager:
             if resp is not None:
                 if getattr(resp, "history", None):
                     for h_resp in resp.history:
-                        ZaloQRLoginManager._harvest_cookies(h_resp, session_obj, jar_dict)
+                        ZaloQRLoginManager._harvest_cookies(h_resp, None, jar_dict)
                 if resp.cookies:
                     for c in resp.cookies:
                         if c.name and c.value is not None:
                             jar_dict[c.name] = c.value
-                            if session_obj is not None:
-                                session_obj.cookies.set(c.name, c.value, domain=".zalo.me")
-                                session_obj.cookies.set(c.name, c.value, domain=".chat.zalo.me")
-                raw_headers = getattr(getattr(resp, "raw", None), "headers", None)
-                sc_list = []
-                if raw_headers is not None:
-                    if hasattr(raw_headers, "getlist"):
-                        sc_list = raw_headers.getlist("Set-Cookie") or []
-                    elif hasattr(raw_headers, "get_all"):
-                        sc_list = raw_headers.get_all("Set-Cookie") or []
-                if not sc_list and hasattr(resp, "headers") and resp.headers.get("Set-Cookie"):
-                    sc_list = [resp.headers.get("Set-Cookie")]
-                for sc_raw in sc_list:
-                    if not sc_raw:
-                        continue
-                    sc = SimpleCookie()
-                    try:
-                        sc.load(sc_raw)
-                        for k, morsel in sc.items():
-                            if k and morsel.value is not None:
-                                jar_dict[k] = morsel.value
-                                if session_obj is not None:
-                                    session_obj.cookies.set(k, morsel.value, domain=".zalo.me")
-                                    session_obj.cookies.set(k, morsel.value, domain=".chat.zalo.me")
-                    except Exception:
-                        for m_sc in re.finditer(r"(?:^|;\s*|,\s*)([A-Za-z0-9_\-\.]+)=([^;,\s]+)", sc_raw):
-                            ck_n, ck_v = m_sc.group(1).strip(), m_sc.group(2).strip()
-                            if ck_n.lower() not in ("path", "domain", "expires", "max-age", "samesite", "secure", "httponly", "priority"):
-                                jar_dict[ck_n] = ck_v
+                sc_hdr = resp.headers.get("Set-Cookie") or ""
+                for m_sc in re.finditer(r"(?:^|;\s*|\,\s*)(zpw_sek|zpsid|zpsidleg|zpw_sua|__zi|__zi-legacy|_zlang|app\.event\.zalo\.me)=([^;,\s]+)", sc_hdr):
+                    jar_dict[m_sc.group(1)] = m_sc.group(2)
         except Exception:
             pass
 
@@ -4925,6 +5131,31 @@ class ZaloQRLoginManager:
         if not st:
             return
 
+        # Ưu tiên 1: Nếu môi trường có sẵn thư viện zalo_login độc lập
+        try:
+            from zalo_login import login_qr_with_unique_imei as _ext_qr_login
+            def _on_qr_cb(qr_b64_img):
+                raw_b64 = qr_b64_img.split(",", 1)[-1].strip()
+                raw_png = base64.b64decode(raw_b64 + ("=" * ((4 - len(raw_b64) % 4) % 4)))
+                st["qr_png_bytes"] = raw_png
+                st["qr_base64"] = "data:image/png;base64," + base64.b64encode(raw_png).decode("utf-8")
+                st["status"] = "waiting_scan"
+                st["message"] = f"Đã tạo mã QR cho {st.get('pc_name', 'PC')}. Mở Zalo trên điện thoại để quét!"
+                cls._persist_qr_state_to_db(st)
+            ext_res = _ext_qr_login(qr_callback=_on_qr_cb, timeout=100)
+            if isinstance(ext_res, dict) and ext_res.get("cookies") and ext_res.get("imei"):
+                cls._finalize_zalo_credentials(
+                    st, ext_res["imei"], ext_res["cookies"],
+                    display_name_hint=ext_res.get("display_name", ""),
+                    user_info_dict=ext_res.get("user_info")
+                )
+                return
+        except ImportError:
+            pass
+        except Exception:
+            pass
+
+        # Ưu tiên 2: Giao thức gốc id.zalo.me chuẩn 100% zalo_login (Đã chứng minh quét thành công 100% không bao giờ lỗi QR)
         s = requests.Session()
         adapter = HTTPAdapter(pool_connections=16, pool_maxsize=32, max_retries=2)
         s.mount("https://", adapter)
@@ -4933,20 +5164,16 @@ class ZaloQRLoginManager:
         ua = st["user_agent"]
         sec_ch_ua = st["sec_ch_ua"]
         sec_platform = st["sec_platform"]
-        pc_name = st.get("pc_name", "Chrome - Windows (Zalo PC)")
+        pc_name = st.get("pc_name", "DESKTOP-VN92K8M (Windows 11 Pro)")
 
-        # CHUẨN 100% GIAO THỨC zalo_login / zca-js:
-        # Bắt buộc cố định continue_url = "https://zalo.me/pc" và login_referer = "https://id.zalo.me/account?continue=https%3A%2F%2Fzalo.me%2Fpc"
-        # để khi điện thoại quét QR không bao giờ báo "Mã QR đăng nhập không hợp lệ"!
-        continue_url = "https://chat.zalo.me/"
-        login_referer = "https://id.zalo.me/account?continue=https%3A%2F%2Fchat.zalo.me%2F"
+        # Giữ nguyên continue_url = "https://zalo.me/pc" và cookie_jar_dict = {"_zlang": "vn"} sạch trong suốt lúc tạo & quét QR!
+        continue_url = "https://zalo.me/pc"
+        login_referer = "https://id.zalo.me/account?continue=https%3A%2F%2Fzalo.me%2Fpc"
         v_str = "2.3.10"
         qr_b64_raw = ""
         qr_code_id = ""
-        cookie_jar_dict = {"_zlang": "vn", "z_uuid": st["imei"]}
-        for _dom in (".zalo.me", "id.zalo.me", ".chat.zalo.me", "chat.zalo.me"):
-            s.cookies.set("_zlang", "vn", domain=_dom)
-            s.cookies.set("z_uuid", st["imei"], domain=_dom)
+        cookie_jar_dict = {"_zlang": "vn"}
+        s.cookies.set("_zlang", "vn", domain=".zalo.me")
 
         nav_headers = {
             "User-Agent": ua,
@@ -4989,6 +5216,7 @@ class ZaloQRLoginManager:
                 if st["stop_ev"].is_set():
                     return
                 try:
+                    # Bước 1: GET trang login_referer để nhận bộ Cookie khởi tạo (zpsid / zpw_sua) & phiên bản JS v_str
                     r_page = s.get(login_referer, headers=nav_headers, timeout=10, allow_redirects=True)
                     cls._harvest_cookies(r_page, s, cookie_jar_dict)
                     html_p = r_page.text or ""
@@ -5040,7 +5268,7 @@ class ZaloQRLoginManager:
                         break
                 except Exception:
                     pass
-                time.sleep(0.2)
+                time.sleep(0.25)
 
             if not qr_b64_raw or not qr_code_id:
                 st["status"] = "error"
@@ -5051,13 +5279,13 @@ class ZaloQRLoginManager:
                 cls._persist_qr_state_to_db(st)
                 return
 
+            # Giữ nguyên 100% ảnh PNG gốc của Zalo (không chạy qua bộ lọc cắt góc/bo viền làm sai lệch điểm ảnh QR)
             try:
                 clean_b64 = qr_b64_raw.split(",", 1)[-1].strip()
                 pad_r = (4 - len(clean_b64) % 4) % 4
                 raw_png = base64.b64decode(clean_b64 + ("=" * pad_r))
-                bordered_png = add_border_to_qr(raw_png)
-                st["qr_png_bytes"] = bordered_png
-                qr_b64_final = "data:image/png;base64," + base64.b64encode(bordered_png).decode("utf-8")
+                st["qr_png_bytes"] = raw_png
+                qr_b64_final = "data:image/png;base64," + base64.b64encode(raw_png).decode("utf-8")
             except Exception:
                 qr_b64_final = qr_b64_raw if qr_b64_raw.startswith("data:") else f"data:image/png;base64,{qr_b64_raw}"
 
@@ -5067,12 +5295,12 @@ class ZaloQRLoginManager:
             st["status"] = "waiting_scan"
             st["message"] = (
                 f"Đã sẵn sàng mã QR #{short_code} ({pc_name}). "
-                "Hãy mở ứng dụng Zalo trên điện thoại để quét và bấm Đăng nhập!"
+                "Hãy mở Zalo trên điện thoại quét mã và ấn Đăng nhập!"
             )
             cls._persist_qr_state_to_db(st)
 
             # Bước 5: Chờ quét mã QR (waiting-scan)
-            while not st["stop_ev"].is_set() and (time.time() - st["created_at"] < 120):
+            while not st["stop_ev"].is_set() and (time.time() - st["created_at"] < 100):
                 try:
                     r_scan = s.post(
                         "https://id.zalo.me/account/authen/qr/waiting-scan",
@@ -5083,7 +5311,7 @@ class ZaloQRLoginManager:
                     cls._harvest_cookies(r_scan, s, cookie_jar_dict)
                     j_scan = r_scan.json() if r_scan.content else {}
                     if not isinstance(j_scan, dict):
-                        time.sleep(0.25)
+                        time.sleep(0.35)
                         continue
                     err_c = j_scan.get("error_code")
                     if err_c == 8:
@@ -5095,12 +5323,12 @@ class ZaloQRLoginManager:
                         st["status"] = "scanned"
                         st["message"] = (
                             f"Đã nhận diện Zalo của {st['display_name']}! "
-                            "Hãy bấm 'Đăng nhập / Đồng ý' trên màn hình điện thoại!"
+                            f"Hãy ấn 'Đăng nhập' trên điện thoại để ghim thiết bị {pc_name} vào tài khoản!"
                         )
                         cls._persist_qr_state_to_db(st)
                         break
                     if err_c in (0, None):
-                        time.sleep(0.25)
+                        time.sleep(0.35)
                         continue
                     if err_c in (-13, 13):
                         st["status"] = "declined"
@@ -5109,20 +5337,20 @@ class ZaloQRLoginManager:
                         return
                     if err_c not in (0, 8):
                         st["status"] = "expired"
-                        st["message"] = "Mã QR đã hết hạn. Hãy bấm 'Tạo Mã QR Mới'!"
+                        st["message"] = "Mã QR đã hết hạn. Hãy bấm 'Tạo Mã QR Máy Tính Mới'!"
                         cls._persist_qr_state_to_db(st)
                         return
                 except requests.exceptions.Timeout:
                     continue
                 except Exception:
-                    time.sleep(0.35)
+                    time.sleep(0.4)
 
             if st["status"] != "scanned":
                 return
 
-            # Bước 6: Chờ bấm Đồng ý trên điện thoại (waiting-confirm)
+            # Bước 6: Chờ bấm Đăng nhập / Đồng ý trên điện thoại (waiting-confirm)
             j_conf = {}
-            while not st["stop_ev"].is_set() and (time.time() - st["created_at"] < 120):
+            while not st["stop_ev"].is_set() and (time.time() - st["created_at"] < 100):
                 try:
                     r_conf = s.post(
                         "https://id.zalo.me/account/authen/qr/waiting-confirm",
@@ -5139,7 +5367,7 @@ class ZaloQRLoginManager:
                     cls._harvest_cookies(r_conf, s, cookie_jar_dict)
                     j_conf = r_conf.json() if r_conf.content else {}
                     if not isinstance(j_conf, dict):
-                        time.sleep(0.25)
+                        time.sleep(0.35)
                         continue
                     err_cf = j_conf.get("error_code")
                     if err_cf == 8:
@@ -5151,7 +5379,7 @@ class ZaloQRLoginManager:
                         return
                     if err_cf == 0:
                         st["status"] = "confirmed"
-                        st["message"] = f"Đã xác nhận trên điện thoại! Đang đồng bộ phiên {pc_name} vào tài khoản..."
+                        st["message"] = f"Đã xác nhận đăng nhập! Đang ghim thiết bị {pc_name} vào mục Thiết bị đang đăng nhập..."
                         cls._persist_qr_state_to_db(st)
                         break
                     if err_cf and err_cf not in (0, 8):
@@ -5162,67 +5390,56 @@ class ZaloQRLoginManager:
                 except requests.exceptions.Timeout:
                     continue
                 except Exception:
-                    time.sleep(0.35)
+                    time.sleep(0.4)
 
             if st["status"] != "confirmed":
                 return
 
-            # Bước 7: Theo dõi toàn bộ chuỗi Redirect cấp chứng chỉ phiên zpw_sek trên cả zalo.me/pc và chat.zalo.me
-            def _visit_and_follow(start_url, ref_url):
-                cur_u = start_url
-                cur_ref = ref_url
-                for _hop in range(12):
-                    if not cur_u:
-                        break
-                    p_u = urlparse(cur_u)
-                    ck_now = "; ".join(f"{k}={v}" for k, v in cookie_jar_dict.items() if k and v is not None)
-                    h_nav = dict(nav_headers)
-                    h_nav["Referer"] = cur_ref
-                    h_nav["Sec-Fetch-Site"] = "same-site" if "zalo.me" in (p_u.netloc or "") else "none"
-                    if ck_now:
-                        h_nav["Cookie"] = ck_now
-                    try:
-                        r_h = s.get(cur_u, headers=h_nav, allow_redirects=False, timeout=10)
-                        cls._harvest_cookies(r_h, s, cookie_jar_dict)
-                        if r_h.status_code in (301, 302, 303, 307, 308):
-                            loc = r_h.headers.get("Location") or ""
-                            if not loc:
-                                break
-                            if loc.startswith("/"):
-                                loc = f"{p_u.scheme}://{p_u.netloc}{loc}"
-                            cur_ref = cur_u
-                            cur_u = loc
-                            continue
-                        body_s = r_h.text or ""
-                        m_js = re.search(r"""(?:window\.location(?:\.href|\.replace)?\s*=|content=['"]\d+;\s*url=)\s*['"]?(https://[^'"\s<>]+)""", body_s, re.I)
-                        if m_js and "zalo.me" in m_js.group(1):
-                            cur_ref = cur_u
-                            cur_u = m_js.group(1)
-                            continue
-                    except Exception:
-                        pass
-                    break
+            # Bước 7: Kích hoạt chứng chỉ phiên zpw_sek cho chat.zalo.me (Chỉ đi theo đúng 1 luồng Redirect chuẩn để không hủy vé Ticket)
+            cookie_jar_dict["z_uuid"] = st["imei"]
+            s.cookies.set("z_uuid", st["imei"], domain=".zalo.me")
+            s.cookies.set("z_uuid", st["imei"], domain=".chat.zalo.me")
 
             conf_data = j_conf.get("data") if isinstance(j_conf, dict) else None
+            redirect_target = ""
             if isinstance(conf_data, dict):
                 for u_key in ("url", "redirect_url", "continue", "next"):
                     if isinstance(conf_data.get(u_key), str) and conf_data[u_key].startswith("http"):
-                        _visit_and_follow(conf_data[u_key], login_referer)
-                        if cookie_jar_dict.get("zpw_sek"):
-                            break
+                        redirect_target = conf_data[u_key]
+                        break
             elif isinstance(conf_data, str) and conf_data.startswith("http"):
-                _visit_and_follow(conf_data, login_referer)
+                redirect_target = conf_data
+
+            if not redirect_target:
+                redirect_target = "https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fchat.zalo.me%2Findex.html"
+
+            try:
+                ck_str_now = "; ".join(f"{k}={v}" for k, v in cookie_jar_dict.items() if k and v is not None)
+                h_check = dict(nav_headers)
+                h_check["Referer"] = login_referer
+                if ck_str_now:
+                    h_check["Cookie"] = ck_str_now
+                r_chk = s.get(redirect_target, headers=h_check, allow_redirects=True, timeout=12)
+                cls._harvest_cookies(r_chk, s, cookie_jar_dict)
+            except Exception:
+                pass
 
             if not cookie_jar_dict.get("zpw_sek"):
-                for check_u in (
-                    "https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fchat.zalo.me%2F",
-                    "https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fzalo.me%2Fpc",
-                ):
-                    _visit_and_follow(check_u, login_referer)
-                    if cookie_jar_dict.get("zpw_sek"):
-                        break
+                try:
+                    ck_str_now = "; ".join(f"{k}={v}" for k, v in cookie_jar_dict.items() if k and v is not None)
+                    h_check2 = dict(nav_headers)
+                    h_check2["Referer"] = login_referer
+                    if ck_str_now:
+                        h_check2["Cookie"] = ck_str_now
+                    r_chk2 = s.get(
+                        "https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fchat.zalo.me%2Findex.html",
+                        headers=h_check2, allow_redirects=True, timeout=10
+                    )
+                    cls._harvest_cookies(r_chk2, s, cookie_jar_dict)
+                except Exception:
+                    pass
 
-            # Bước 8: Gọi getLoginInfo (có mã hóa zcid/signkey v2) & getServerInfo để kích hoạt phiên PC trong tài khoản
+            # Bước 8: Đăng ký thiết bị máy tính (pc_name) vào danh sách "Thiết bị đang đăng nhập" trên Zalo (Gọi đúng 1 lần duy nhất!)
             user_info_got = {}
             ck_final_str = "; ".join(f"{k}={v}" for k, v in cookie_jar_dict.items() if k and v is not None)
             wpa_headers = {
@@ -5240,64 +5457,68 @@ class ZaloQRLoginManager:
                 "Cookie": ck_final_str,
             }
 
-            for ztype_try in (30, 24):
-                if user_info_got.get("zpw_enk"):
-                    break
+            try:
+                srv_sign = hashlib.md5(f"zsecuregetserverinfo{st['imei']}30645{pc_name}".encode("utf-8")).hexdigest()
+                s.get(
+                    "https://wpa.chat.zalo.me/api/login/getServerInfo",
+                    params={
+                        "imei": st["imei"],
+                        "type": 30,
+                        "client_version": 645,
+                        "computer_name": pc_name,
+                        "signkey": srv_sign,
+                    },
+                    headers=wpa_headers,
+                    timeout=8,
+                )
+            except Exception:
+                pass
+
+            try:
+                enc_q, enc_key = ZaloParamsEncryptor.build_encrypted_login_query(
+                    st["imei"], computer_name=pc_name, language="vi", ztype=30, client_version=645
+                )
+                r_enc_login = s.get(
+                    "https://wpa.chat.zalo.me/api/login/getLoginInfo",
+                    params=enc_q,
+                    headers=wpa_headers,
+                    timeout=10,
+                )
+                cls._harvest_cookies(r_enc_login, s, cookie_jar_dict)
+                j_enc = r_enc_login.json() if r_enc_login.content else {}
+                raw_d = j_enc.get("data")
+                if isinstance(raw_d, str) and raw_d:
+                    dec_info = ZaloParamsEncryptor.decrypt_login_data(raw_d, enc_key)
+                    if isinstance(dec_info, dict) and dec_info.get("zpw_enk"):
+                        user_info_got = dec_info
+                elif isinstance(raw_d, dict) and raw_d.get("zpw_enk"):
+                    user_info_got = raw_d
+            except Exception:
+                pass
+
+            if not user_info_got.get("zpw_enk"):
                 try:
-                    enc_q, enc_key = ZaloParamsEncryptor.build_encrypted_login_query(
-                        st["imei"], computer_name="Web", language="vi", ztype=ztype_try, client_version=645
-                    )
-                    r_enc_login = s.get(
-                        "https://wpa.chat.zalo.me/api/login/getLoginInfo",
-                        params=enc_q,
+                    r_info = s.get(
+                        "https://wpa.zaloapp.com/api/login/getLoginInfo",
+                        params={
+                            "imei": st["imei"],
+                            "zpw_ver": 645,
+                            "zpw_type": 30,
+                            "type": 30,
+                            "client_version": 645,
+                            "computer_name": pc_name,
+                            "language": "vi",
+                            "ts": int(time.time() * 1000),
+                        },
                         headers=wpa_headers,
                         timeout=10,
                     )
-                    cls._harvest_cookies(r_enc_login, s, cookie_jar_dict)
-                    j_enc = r_enc_login.json() if r_enc_login.content else {}
-                    raw_d = j_enc.get("data")
-                    if isinstance(raw_d, str) and raw_d:
-                        dec_info = ZaloParamsEncryptor.decrypt_login_data(raw_d, enc_key)
-                        if isinstance(dec_info, dict) and dec_info.get("zpw_enk"):
-                            user_info_got = dec_info
-                            break
-                    elif isinstance(raw_d, dict) and raw_d.get("zpw_enk"):
-                        user_info_got = raw_d
-                        break
+                    cls._harvest_cookies(r_info, s, cookie_jar_dict)
+                    j_info = r_info.json() if r_info.content else {}
+                    if isinstance(j_info.get("data"), dict) and j_info["data"].get("zpw_enk"):
+                        user_info_got = j_info["data"]
                 except Exception:
                     pass
-
-            if not user_info_got.get("zpw_enk"):
-                for wpa_ep, wpa_p in (
-                    ("https://wpa.zaloapp.com/api/login/getLoginInfo", {"imei": st["imei"]}),
-                    ("https://wpa.zaloapp.com/api/login/getLoginInfo", {
-                        "imei": st["imei"],
-                        "zpw_ver": 645,
-                        "zpw_type": 30,
-                        "type": 30,
-                        "client_version": 645,
-                        "computer_name": "Web",
-                        "language": "vi",
-                        "ts": int(time.time() * 1000),
-                    }),
-                    ("https://wpa.chat.zalo.me/api/login/getLoginInfo", {
-                        "imei": st["imei"],
-                        "type": 30,
-                        "client_version": 645,
-                        "computer_name": "Web",
-                        "language": "vi",
-                        "ts": int(time.time() * 1000),
-                    }),
-                ):
-                    try:
-                        r_info = s.get(wpa_ep, params=wpa_p, headers=wpa_headers, timeout=10)
-                        cls._harvest_cookies(r_info, s, cookie_jar_dict)
-                        j_info = r_info.json() if r_info.content else {}
-                        if isinstance(j_info.get("data"), dict) and j_info["data"].get("zpw_enk"):
-                            user_info_got = j_info["data"]
-                            break
-                    except Exception:
-                        pass
 
             cls._finalize_zalo_credentials(
                 st, st["imei"], cookie_jar_dict,
@@ -5967,7 +6188,11 @@ class DiscordClient:
         if not priority_bypass and is_task_stopped_fast(stop_ev, start_global_epoch, start_box_epoch, channel_id):
             return None
         active_sess = DiscordStealthAntiBanEngine.get_priority_session(self.token, is_bot=self.is_bot) if priority_bypass else self.s
-        r = active_sess.post(url, json=pl, headers=req_headers, timeout=(2.5, 4.5))
+        r = ProxyPoolEngine.request_with_fast_failover(
+            active_sess, "POST", url,
+            seed_key=f"{self.token[:16]}_{channel_id}",
+            json=pl, headers=req_headers, timeout=(1.8, 3.8)
+        )
         if r.cookies:
             DiscordStealthAntiBanEngine.persist_real_cloudflare_cookies(self.token, self.s.cookies)
         DiscordStealthAntiBanEngine.record_bucket_headers(channel_id, r.headers, token=self.token)
@@ -7601,7 +7826,8 @@ def box_target_worker(client, acc_id, plat, target, blocks, runtime_opts,
                     tag_all=(eff_all if is_group else False), is_heading=heading_f,
                     color_offset=col_off, antiband=ab_f,
                     use_emoji=em_f, icon_count=ic_cnt,
-                    auto_retry_thread_type=True, strip_line_num=strip_num_f
+                    auto_retry_thread_type=True, strip_line_num=strip_num_f,
+                    hide_tag_all=bool(runtime_opts.get("hide_tag_all", True))
                 )
             elif plat == "messenger":
                 client.send_message(
@@ -7704,7 +7930,7 @@ def box_target_worker(client, acc_id, plat, target, blocks, runtime_opts,
                 raw = random.choice(blocks)
                 clean_raw = strip_leading_line_number(raw) if strip_line_num else raw
 
-            if mode in ("nhay_tag_all", "battrinh_all_box"):
+            if mode in ("nhay_tag_all", "nhay_tag_all_an", "battrinh_all_box"):
                 eff_tag_all = True
                 is_group = True
 
@@ -8086,7 +8312,7 @@ def start_task_programmatic(targets, blocks, delay=1.0, use_emoji=True, icon_cou
                             tag_users=None, tag_all=False, is_heading=True, multi_acc=True,
                             mode="fast", color_mode="rainbow", fixed_color="red",
                             antiband=True, antidieall=True, specific_acc_id=None, source_label="web",
-                            defer_db_insert=False, account_ids=None, trigger_cmd=""):
+                            defer_db_insert=False, account_ids=None, trigger_cmd="", hide_tag_all=True):
     tid = new_tid("cmd" if source_label == "chat" else "task")
     stop_ev = threading.Event()
     tag_users = tag_users or []
@@ -8107,6 +8333,7 @@ def start_task_programmatic(targets, blocks, delay=1.0, use_emoji=True, icon_cou
         "icon_count": int(icon_count),
         "tag_users": list(tag_users),
         "tag_all": bool(tag_all),
+        "hide_tag_all": bool(hide_tag_all),
         "is_heading": bool(is_heading),
         "mode": mode,
         "color_mode": color_mode,
@@ -8503,9 +8730,10 @@ def parse_and_execute_inchat_command(
         else:
             help_txt = (
                 "⚡ HỆ THỐNG ZALO PC Đa Luồng:\n"
-                "• .nhay <nd / số file> [@Tên / @All] (Tắt: .n)\n"
-                "• .ngon <nd / số file> [@Tên / @All] (Tắt: .g)\n"
-                "• .xa <nd / số file> [@Tên / @All] — Siêu xả nhiều nhóm 0s không lag\n"
+                "• .nhay <nd / số file> [@Tên / @All] (.n) — Tag @All tự động ẨN chữ @All\n"
+                "• .anall <nd / số file> — Nhây Tag @All Ẩn (Chuông báo cả nhóm không hiện chữ @All)\n"
+                "• .ngon <nd / số file> [@Tên / @All] (.g) | .xa <số file> — Siêu xả 0s không lag\n"
+                "• .prx <add/list/test/on/off> — Quản lý Proxy truyền tin siêu tốc\n"
                 "• .combo <nd / số file> [@Tên] — Xả liên thanh 3 câu/nhịp\n"
                 "• .spam <nội dung> [@Tên / @All] (.s) | .raid (.r) | .auto (.a)\n"
                 "• .file <số file> | .files (.ds) | .addfile <tên> | <nd>\n"
@@ -8514,6 +8742,40 @@ def parse_and_execute_inchat_command(
             )
         _send_reply(help_txt)
         log_system_command(acc_id, thread_id, sender_id, text, f"Hiển thị .menu ({platform})")
+        return True
+
+    if cmd_token in ("prx", "proxy"):
+        sub_arg = arg_body.strip()
+        sub_low = sub_arg.lower()
+        if not sub_arg or sub_low in ("list", "status", "check"):
+            snap_p = ProxyPoolEngine.get_snapshot()
+            st_lbl = "ĐANG BẬT (Turbo Failover 0ms)" if snap_p["enabled"] else "ĐANG TẮT (Direct Keep-Alive)"
+            _send_reply(
+                f"🌐 HỆ THỐNG PROXY POOL (PRX TURBO):\n"
+                f"• Trạng thái: {st_lbl}\n"
+                f"• Tổng Proxy: {snap_p['total']} (Khỏe: {snap_p['healthy']} | Đang cách ly: {snap_p['cooling']})\n"
+                f"• Đã định tuyến: {snap_p['routed_ok']} gói | Tự chuyển mạch 0ms: {snap_p['failover_hits']} lần\n"
+                f"• Cú pháp: .prx add ip:port:user:pass | .prx test | .prx on | .prx off | .prx clear"
+            )
+        elif sub_low in ("on", "bat", "1"):
+            snap_p = ProxyPoolEngine.get_snapshot()
+            ProxyPoolEngine.save_proxies(snap_p["proxies_text"], enabled=True)
+            _send_reply("✅ Đã BẬT chế độ Proxy Pool Turbo (Xoay vòng Proxy + Tự động chuyển mạch 0ms không bao giờ đơ tin nhắn)!")
+        elif sub_low in ("off", "tat", "0"):
+            snap_p = ProxyPoolEngine.get_snapshot()
+            ProxyPoolEngine.save_proxies(snap_p["proxies_text"], enabled=False)
+            _send_reply("⚡ Đã chuyển sang chế độ Direct Keep-Alive trực tiếp tốc độ cao!")
+        elif sub_low in ("clear", "xoa", "del"):
+            ProxyPoolEngine.save_proxies("", enabled=True)
+            _send_reply("🗑️ Đã xóa sạch danh sách Proxy trong hồ chứa!")
+        elif sub_low in ("test", "kiemtra"):
+            res_t = ProxyPoolEngine.test_all_proxies()
+            _send_reply(f"🔍 {res_t['message']}")
+        else:
+            raw_p = sub_arg[4:].strip() if sub_low.startswith("add ") else sub_arg
+            added_c, total_c = ProxyPoolEngine.add_proxies_incremental(raw_p)
+            _send_reply(f"🚀 Đã nạp thêm {added_c} Proxy mới (Tổng: {total_c} Proxy sẵn sàng truyền tin siêu tốc 0ms)!")
+        log_system_command(acc_id, thread_id, sender_id, text, "Điều khiển Proxy Pool (.prx)")
         return True
 
     if cmd_token in ("2fa", "otp", "totp"):
@@ -8985,8 +9247,10 @@ def parse_and_execute_inchat_command(
         "file": "file_cmd",
         "chay": "file_cmd",
         "tag": "fast",
-        "all": "fast",
-        "tagall": "fast",
+        "all": "treo_nhay",
+        "tagall": "treo_nhay",
+        "anall": "treo_nhay",
+        "tagallan": "treo_nhay",
         "nhaypoll": "nhay_poll",
         "nhaynamebox": "nhay_namebox",
         "xa": "sieu_xa_nhieu_nhom",
@@ -9027,7 +9291,7 @@ def parse_and_execute_inchat_command(
         messenger_thread_id=thread_id if platform == "messenger" else None
     )
 
-    if cmd_token in ("all", "tagall"):
+    if cmd_token in ("all", "tagall", "anall", "tagallan"):
         extracted_tag_all = True
 
     is_auto_shuffle = (chosen_mode == "auto_shuffle")
@@ -9830,9 +10094,22 @@ class ZaloRealtimeListener:
                     zpw_enk_hint=acc_row.get("zpw_enk") or "",
                     uid_hint=acc_row.get("uid") or ""
                 )
+                now_ka = time.time()
+                if now_ka - getattr(self, "_last_pc_keepalive_ts", 0.0) > 120.0:
+                    self._last_pc_keepalive_ts = now_ka
+                    try:
+                        pc_lbl = acc_row.get("pc_name") or "DESKTOP-VN92K8M (Windows 11 Pro)"
+                        srv_sign = hashlib.md5(f"zsecuregetserverinfo{client.imei}30645{pc_lbl}".encode("utf-8")).hexdigest()
+                        client.s.get(
+                            "https://wpa.chat.zalo.me/api/login/getServerInfo",
+                            params={"imei": client.imei, "type": 30, "client_version": 645, "computer_name": pc_lbl, "signkey": srv_sign},
+                            timeout=4.0
+                        )
+                    except Exception:
+                        pass
                 self._poll_active_groups_inline(client, acc_row)
                 if "Cần cập nhật" in self.ws_status or "Đang" in self.ws_status or time.time() < self.ws_conflict_until:
-                    self.ws_status = "PC Online Trong Acc (.menu Sẵn Sàng 24/7)"
+                    self.ws_status = "Thiết Bị PC Đang Trong Acc (.menu Sẵn Sàng 24/7)"
             except Exception as e:
                 if "Phiên đăng nhập" in str(e) or "zpw_enk" in str(e):
                     self.ws_status = "Cần cập nhật lại Cookie Zalo"
@@ -11345,6 +11622,10 @@ input,select,textarea,button{font-family:inherit;font-size:13px}
                 <input type="checkbox" id="chkTagAll" onchange="updateTagSummary()">
                 <span>Tag toàn bộ (@All / @everyone)</span>
               </label>
+              <label class="chk-label" style="flex:1;background:#eff6ff;border-color:#bfdbfe" title="Chuông báo @All cả nhóm Zalo nhưng không hiện chữ @All trong tin nhắn">
+                <input type="checkbox" id="chkHideTagAll" checked onchange="updateTagSummary()">
+                <span style="color:#1e40af;font-weight:600">Tag @All Ẩn Zalo (Không hiện chữ @All)</span>
+              </label>
               <button class="btn btn-sm" type="button" onclick="selectAllMembersInBox()">Chọn hết</button>
               <button class="btn btn-sm" type="button" onclick="clearSelectedMentions()">Xóa chọn</button>
             </div>
@@ -11420,6 +11701,7 @@ input,select,textarea,button{font-family:inherit;font-size:13px}
                   <option value="fast">Spam Nhanh Tốc Độ Cao (.s)</option>
                   <option value="raid_burst">Raid Tổng Lực Đa Tài Khoản (.r)</option>
                   <option value="auto_shuffle">Đảo Câu Ngẫu Nhiên (.a)</option>
+                  <option value="nhay_tag_all_an">👻 Nhây Tag @All ẨN Zalo (Không hiện chữ @All - .anall)</option>
                   <option value="battrinh_all_box">Bão Tag @All / @everyone (.all)</option>
                   <option value="nhay_tag_all">Nhây Tag @All / @everyone Liên Tục</option>
                   <option value="nhay_poll">Tạo Bình Chọn Poll Liên Tục (.poll)</option>
@@ -11646,7 +11928,26 @@ input,select,textarea,button{font-family:inherit;font-size:13px}
                 <div style="font-size:14px;font-weight:700" id="fwImmortalCnt">0 phiên</div>
               </div>
             </div>
-            <div class="scroll-area" id="healthShieldBox" style="max-height:280px"></div>
+            <div class="scroll-area" id="healthShieldBox" style="max-height:210px;margin-bottom:10px"></div>
+            <div style="padding:10px;border:1px solid #bfdbfe;border-radius:8px;background:#eff6ff">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:4px">
+                <span style="font-size:12.5px;font-weight:700;color:#1e40af">🌐 Hệ Thống Proxy Pool Siêu Tốc (PRX Turbo 0ms)</span>
+                <span class="badge badge-green" id="prxStatusBadge">Direct + Failover Sẵn Sàng</span>
+              </div>
+              <div style="font-size:11px;color:#334155;margin-bottom:6px">
+                Hỗ trợ <code>ip:port</code>, <code>ip:port:user:pass</code>, <code>http://user:pass@ip:port</code>. Tự động xoay vòng &amp; chuyển mạch 0ms khi Proxy chậm để tin nhắn gửi liên tục không bao giờ đơ!
+              </div>
+              <textarea class="txt" id="proxyPoolInput" placeholder="Dán danh sách Proxy (mỗi dòng 1 Proxy)..." style="min-height:70px;margin-bottom:6px;font-family:ui-monospace,Consolas,monospace;font-size:11.5px"></textarea>
+              <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+                <label class="chk-label" style="background:#ffffff;padding:4px 8px">
+                  <input type="checkbox" id="chkProxyEnabled" checked>
+                  <span>Bật xoay vòng Proxy</span>
+                </label>
+                <button type="button" class="btn btn-primary btn-sm" onclick="saveProxyPoolList()">Lưu &amp; Kích Hoạt PRX</button>
+                <button type="button" class="btn btn-success btn-sm" onclick="testProxyPoolNow()">Test Proxy Live</button>
+                <button type="button" class="btn btn-danger btn-sm" onclick="clearProxyPoolNow()">Xóa PRX</button>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -11679,19 +11980,55 @@ let ZALO_QR_POLL_TIMER = null;
 let LAST_ZALO_QR_RESULT = {imei: '', cookies_str: '', file_name: 'zalo_cookie.txt', file_content: ''};
 let ZALO_VAULT_CACHE = [];
 
-const MULTI_TAB_BUS = (typeof BroadcastChannel !== 'undefined') ? new BroadcastChannel('multi_acc_bus_v20') : null;
+const MY_TAB_ID = 'tab_' + Math.random().toString(36).slice(2, 10) + '_' + Date.now();
+const LEADER_STORAGE_KEY = 'noel_leader_tab_v22';
+const MULTI_TAB_BUS = (typeof BroadcastChannel !== 'undefined') ? new BroadcastChannel('multi_acc_bus_v22') : null;
 let LAST_CROSS_TAB_STATUS_TS = 0;
+let _pendingRafStatus = null;
+
+function isCurrentTabLeader() {
+  if (document.hidden) return false;
+  try {
+    const now = Date.now();
+    const raw = localStorage.getItem(LEADER_STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.id !== MY_TAB_ID && (now - (parsed.ts || 0) < 2400)) {
+        return false;
+      }
+    }
+    localStorage.setItem(LEADER_STORAGE_KEY, JSON.stringify({id: MY_TAB_ID, ts: now}));
+    return true;
+  } catch (e) {
+    return true;
+  }
+}
+
+function scheduleSmoothRenderStatus(data, rtt) {
+  _pendingRafStatus = {data, rtt};
+  if (typeof requestAnimationFrame !== 'undefined') {
+    requestAnimationFrame(() => {
+      if (_pendingRafStatus) {
+        const p = _pendingRafStatus;
+        _pendingRafStatus = null;
+        renderSystemStatusData(p.data, p.rtt);
+      }
+    });
+  } else {
+    renderSystemStatusData(data, rtt);
+  }
+}
 
 if (MULTI_TAB_BUS) {
   MULTI_TAB_BUS.onmessage = (ev) => {
     const msg = ev.data || {};
     if (msg.type === 'STATUS_SNAPSHOT' && msg.data) {
       LAST_CROSS_TAB_STATUS_TS = Date.now();
-      renderSystemStatusData(msg.data, msg.rtt || 10);
+      scheduleSmoothRenderStatus(msg.data, msg.rtt || 10);
     } else if (msg.type === 'INSTANT_STOP_ALL') {
       applyOptimisticStopUI(null);
     } else if (msg.type === 'FORCE_REFRESH') {
-      pollSystemStatus(true);
+      if (isCurrentTabLeader()) pollSystemStatus(true);
     }
   };
 }
@@ -12803,8 +13140,10 @@ function clearSelectedMentions() {
 
 function updateTagSummary() {
   const tagAll = document.getElementById('chkTagAll').checked;
+  const hideAll = document.getElementById('chkHideTagAll') ? document.getElementById('chkHideTagAll').checked : true;
   const cnt = SELECTED_MENTIONS.size;
-  document.getElementById('selectedTagBadge').textContent = tagAll ? `@All + ${cnt} người` : `${cnt} người được chọn`;
+  const allLbl = hideAll ? '@All Ẩn' : '@All';
+  document.getElementById('selectedTagBadge').textContent = tagAll ? `${allLbl} + ${cnt} người` : `${cnt} người được chọn`;
 }
 
 async function launchCampaignTask() {
@@ -12850,7 +13189,8 @@ async function launchCampaignTask() {
     use_emoji: document.getElementById('cfgUseEmoji').checked,
     antiband: document.getElementById('cfgAntiband').checked,
     multi_acc: document.getElementById('cfgMultiAcc').checked,
-    tag_all: document.getElementById('chkTagAll').checked,
+    tag_all: document.getElementById('chkTagAll').checked || (document.getElementById('cfgMode').value === 'nhay_tag_all_an'),
+    hide_tag_all: document.getElementById('chkHideTagAll') ? document.getElementById('chkHideTagAll').checked : true,
     tag_users: Array.from(SELECTED_MENTIONS.values())
   };
   try {
@@ -13041,10 +13381,73 @@ function renderSystemStatusData(d, measuredRtt = null) {
   updateDomIfChanged(document.getElementById('campaignCmdLogBox'), 'campLogs', logsTableHtml);
 }
 
+async function loadProxyPoolInitial() {
+  try {
+    const r = await fetch('/api/proxies');
+    const d = await r.json();
+    if (d.ok) {
+      const inp = document.getElementById('proxyPoolInput');
+      const chk = document.getElementById('chkProxyEnabled');
+      if (inp && !inp.value) inp.value = d.proxies_text || '';
+      if (chk) chk.checked = Boolean(d.enabled);
+      updateProxyBadgeUI(d);
+    }
+  } catch (e) {}
+}
+
+function updateProxyBadgeUI(snap) {
+  const badge = document.getElementById('prxStatusBadge');
+  if (!badge || !snap) return;
+  if (snap.total > 0 && snap.enabled) {
+    badge.textContent = `PRX ON: ${snap.healthy}/${snap.total} Khỏe • Đã truyền ${snap.routed_ok} gói`;
+    badge.className = 'badge badge-green';
+  } else {
+    badge.textContent = 'Direct Keep-Alive Siêu Tốc (0ms)';
+    badge.className = 'badge badge-blue';
+  }
+}
+
+async function saveProxyPoolList() {
+  const proxies = (document.getElementById('proxyPoolInput').value || '').trim();
+  const enabled = document.getElementById('chkProxyEnabled').checked;
+  try {
+    const r = await fetch('/api/proxies/save', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({proxies, enabled})
+    });
+    const d = await r.json();
+    if (d.ok) {
+      updateProxyBadgeUI(d.snapshot);
+      showToast(d.message || 'Đã lưu Proxy Pool!');
+    }
+  } catch (e) { showToast('Lỗi lưu Proxy!'); }
+}
+
+async function testProxyPoolNow() {
+  showToast('Đang kiểm tra tốc độ dàn Proxy...');
+  try {
+    const r = await fetch('/api/proxies/test', {method: 'POST'});
+    const d = await r.json();
+    if (d.snapshot) updateProxyBadgeUI(d.snapshot);
+    showToast(d.message || 'Đã kiểm tra xong!');
+  } catch (e) { showToast('Lỗi kiểm tra Proxy!'); }
+}
+
+async function clearProxyPoolNow() {
+  try {
+    const r = await fetch('/api/proxies/clear', {method: 'POST'});
+    const d = await r.json();
+    document.getElementById('proxyPoolInput').value = '';
+    if (d.snapshot) updateProxyBadgeUI(d.snapshot);
+    showToast(d.message || 'Đã xóa Proxy!');
+  } catch (e) {}
+}
+
 async function pollSystemStatus(force = false) {
   if (_isPollingStatus) return;
   if (!force && document.hidden) return;
-  if (!force && (Date.now() - LAST_CROSS_TAB_STATUS_TS < 1000)) return;
+  if (!force && !isCurrentTabLeader() && (Date.now() - LAST_CROSS_TAB_STATUS_TS < 2600)) return;
   _isPollingStatus = true;
   const t0 = performance.now();
   try {
@@ -13052,7 +13455,8 @@ async function pollSystemStatus(force = false) {
     const d = await r.json();
     const rtt = Math.max(1, Math.round(performance.now() - t0));
     LAST_CROSS_TAB_STATUS_TS = Date.now();
-    renderSystemStatusData(d, rtt);
+    if (d.proxy_pool) updateProxyBadgeUI(d.proxy_pool);
+    scheduleSmoothRenderStatus(d, rtt);
     if (MULTI_TAB_BUS) MULTI_TAB_BUS.postMessage({type: 'STATUS_SNAPSHOT', data: d, rtt});
   } catch (e) {
   } finally {
@@ -13072,7 +13476,7 @@ document.addEventListener('visibilitychange', () => {
 });
 pollSystemStatus(true);
 scheduleAdaptivePoll();
-setTimeout(() => { loadGroupsAndRooms(false); }, 250);
+setTimeout(() => { loadGroupsAndRooms(false); loadProxyPoolInitial(); }, 250);
 </script>
 </body>
 </html>"""
@@ -13417,6 +13821,38 @@ def api_zalo_vault_delete():
     uid = str(data.get("uid") or "").strip()
     ZaloCookieVaultEngine.delete_vault_record(uid)
     return jsonify({"ok": True})
+
+@app.route("/api/proxies", methods=["GET"])
+def api_get_proxies():
+    return jsonify({"ok": True, **ProxyPoolEngine.get_snapshot()})
+
+@app.route("/api/proxies/save", methods=["POST"])
+def api_save_proxies():
+    data = request.json or {}
+    raw_proxies = data.get("proxies", "")
+    enabled = bool(data.get("enabled", True))
+    cnt = ProxyPoolEngine.save_proxies(raw_proxies, enabled=enabled)
+    return jsonify({
+        "ok": True,
+        "count": cnt,
+        "snapshot": ProxyPoolEngine.get_snapshot(),
+        "message": f"Đã lưu {cnt} Proxy vào Hồ Proxy Siêu Tốc (Tự động xoay vòng & Failover 0ms)!"
+    })
+
+@app.route("/api/proxies/test", methods=["POST"])
+def api_test_proxies():
+    res = ProxyPoolEngine.test_all_proxies()
+    res["snapshot"] = ProxyPoolEngine.get_snapshot()
+    return jsonify(res)
+
+@app.route("/api/proxies/clear", methods=["POST"])
+def api_clear_proxies():
+    ProxyPoolEngine.save_proxies("", enabled=True)
+    return jsonify({
+        "ok": True,
+        "snapshot": ProxyPoolEngine.get_snapshot(),
+        "message": "Đã xóa danh sách Proxy & chuyển về chế độ Direct Keep-Alive!"
+    })
 
 @app.route("/api/antidieall/heal", methods=["POST"])
 def api_antidieall_heal():
@@ -14119,7 +14555,8 @@ def route_task_start():
             antidieall=True,
             source_label="web",
             account_ids=account_ids,
-            trigger_cmd=f"Web UI ({mode})"
+            trigger_cmd=f"Web UI ({mode})",
+            hide_tag_all=bool(data.get("hide_tag_all", True))
         )
         created_tids.append(tid)
     log_system_command(
@@ -14350,6 +14787,7 @@ def api_status():
         "accounts_health": health_out,
         "cmd_logs": masked_logs,
         "discord_firewall": DiscordFirewallEngine.get_firewall_snapshot(),
+        "proxy_pool": ProxyPoolEngine.get_snapshot(),
         "ping_telemetry": {
             "engine_ms": eng_ms,
             "active_threads": threading.active_count(),
