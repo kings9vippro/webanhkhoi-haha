@@ -89,7 +89,8 @@ from werkzeug.utils import secure_filename
 
 # CẤU HÌNH HỆ THỐNG & BẢO MẬT WEB (v19 CLEAN WHITE EDITION)
 APP_TITLE = "Bảng Điều Khiển Đa Tài Khoản"
-APP_AUTHOR = "Admin"
+APP_AUTHOR = "Phan Anh Khôi (Rike)"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8995799349:AAE8uwWyS-CHzj2yQNkFkMynCTprFTZ1JNc")
 SECRET_KEY = os.environ.get("SECRET_KEY", "noel-secret-key-2026-secure")
 ACCESS_KEY = os.environ.get("WEB_KEY", "anhba")
 DEFAULT_ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
@@ -867,6 +868,8 @@ SYSTEM_RUNTIME_CONFIG = {
     "antidieall": True,
     "strip_line_num": True,
     "hide_acc_log": True,
+    "hide_tag_all": True,
+    "hide_tag_name": True,
 }
 SYSTEM_CFG_LOCK = threading.RLock()
 
@@ -902,7 +905,7 @@ VALID_SYSTEM_CMD_TOKENS = {
     "statusdc", "hypesquad", "react", "thuhoi", "undo",
     "spam", "fast", "nhanh", "s", "nhay", "treonhay", "treo_nhay", "n",
     "ngon", "treongon", "treo_ngon", "g", "file", "chay", "f",
-    "files", "dsfile", "listfile", "ds", "tag", "all", "tagall", "anall", "tagallan", "prx", "proxy",
+    "files", "dsfile", "listfile", "ds", "tag", "all", "tagall", "anall", "tagallan", "antan", "tagan", "antag", "hientag", "prx", "proxy",
     "soi", "soifull", "scanbox", "dsbox", "listbox", "dsnhom", "gall", "gll", "ngonall", "nall", "nll", "nhayall", "xaall",
     "raid", "r", "auto", "a", "dao", "chao", "hi", "xa", "sieuxa", "xanhom", "combo", "battrinh",
     "ping", "p", "status", "info", "stinfo", "id", "uid", "mem", "tv", "thanhvien",
@@ -1083,6 +1086,49 @@ ZALO_NATIVE_ZCODES = ["db342e", "f27806", "f7b503", "15a85f", "0068ff", "00b4d8"
 ZALO_FIRE_ZCODES = ["db342e", "f27806", "f7b503"]
 ZALO_OCEAN_ZCODES = ["15a85f", "00b4d8", "0068ff"]
 ZALO_ROYAL_ZCODES = ["8b5cf6", "ec4899", "db342e", "f7b503"]
+ZALO_CYBER_ZCODES = ["0068ff", "00b4d8", "8b5cf6", "ec4899", "15a85f"]
+
+class UnicodeLuxuryFontEngine:
+    """Bộ Chuyển Đổi Phông Chữ Unicode Siêu Đẳng Cấp 2026 (Kết hợp cùng Zalo Styles f_18 / f_13 & 8 Màu):
+    - Hỗ trợ biến đổi ký tự Latin sang chữ nghệ thuật VIP mà vẫn giữ nguyên dấu tiếng Việt rõ nét!"""
+    _NORMAL_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    _MAPS = {
+        "bold_serif": str.maketrans(_NORMAL_CHARS, "𝐀𝐁𝐂𝐃𝐄𝐅𝐆𝐇𝐈𝐉𝐊𝐋𝐌𝐍𝐎𝐏𝐐𝐑𝐒𝐓𝐔𝐕𝐖𝐗𝐘𝐙𝐚𝐛𝐜𝐝𝐞𝐟𝐠𝐡𝐢𝐣𝐤𝐥𝐦𝐧𝐨𝐩𝐪𝐫𝐬𝐭𝐮𝐯𝐰𝐱𝐲𝐳𝟎𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖𝟗"),
+        "italic_serif": str.maketrans(_NORMAL_CHARS, "𝐴𝐵𝐶𝐷𝐸𝐹𝐺𝐻𝐼𝐽𝐾𝐿𝑀𝑁𝑂𝑃𝑄𝑅𝑆𝑇𝑈𝑉𝑊𝑋𝑌𝑍𝑎𝑏𝑐𝑑𝑒𝑓𝑔ℎ𝑖𝑗𝑘𝑙𝑚𝑛𝑜𝑝𝑞𝑟𝑠𝑡𝑢𝑣𝑤𝑥𝑦𝑧0123456789"),
+        "bold_sans": str.maketrans(_NORMAL_CHARS, "𝗔𝗕𝗖𝗗𝗘𝗙𝗚𝗛𝗜𝗝𝗞𝗟𝗠𝗡𝗢𝗣𝗤𝗥𝗦𝗧𝗨𝗩𝗪𝗫𝗬𝗭𝗮𝗯𝗰𝗱𝗲𝗳𝗴𝗵𝗶𝗷𝗸𝗹𝗺𝗻𝗼𝗽𝗾𝗿𝘀𝘁𝘂𝘃𝘄𝘅𝘆𝘇𝟬𝟭𝟮𝟯𝟰𝟱𝟲𝟳𝟴𝟵"),
+        "double_struck": str.maketrans(_NORMAL_CHARS, "𝔸𝔹ℂ𝔻𝔼𝔽𝔾ℍ𝕀𝕁𝕂𝕃𝕄ℕ𝕆ℙℚℝ𝕊𝕋𝕌𝕍𝕎𝕏𝕐ℤ𝕒𝕓𝕔𝕕𝖊𝖋𝖌𝖍𝖎𝖏𝖐𝖑𝖒𝖓𝖔𝖕𝖖𝖗𝖘𝖙𝖚𝖛𝖜𝖝𝖞𝖟𝟘𝟙𝟚𝟛𝟜𝟝𝟞𝟟𝟠𝟡"),
+        "script_vip": str.maketrans(_NORMAL_CHARS, "𝒜ℬ𝒞𝒟ℰℱ𝒢ℋℐ𝒥𝒦ℒℳ𝒩𝒪𝒫𝒬ℛ𝒮𝒯𝒰𝒱𝒲𝒳𝒴𝒵𝒶𝒷𝒸𝒹ℯ𝒻ℊ𝒽𝒾𝒿𝓀𝓁𝓂𝓃ℴ𝓅𝓆𝓇𝓈𝓉𝓊𝓋𝓌𝓍𝓎𝓏0123456789"),
+        "small_caps": str.maketrans("abcdefghijklmnopqrstuvwxyz", "ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘǫʀꜱᴛᴜᴠᴡxʏᴢ"),
+    }
+
+    @classmethod
+    def transform_line(cls, text, font_style="big_bold"):
+        if not text:
+            return ""
+        fs = str(font_style or "").lower()
+        t_map = None
+        if fs in ("bold_serif", "serif"):
+            t_map = cls._MAPS["bold_serif"]
+        elif fs in ("italic_serif",):
+            t_map = cls._MAPS["italic_serif"]
+        elif fs in ("bold_sans", "sans"):
+            t_map = cls._MAPS["bold_sans"]
+        elif fs in ("double_struck", "double", "khung"):
+            t_map = cls._MAPS["double_struck"]
+        elif fs in ("script_vip", "script", "nghethuat"):
+            t_map = cls._MAPS["script_vip"]
+        elif fs in ("small_caps", "smallcaps"):
+            t_map = cls._MAPS["small_caps"]
+        if not t_map:
+            return text
+        out_tokens = []
+        for tk in str(text).split(" "):
+            if tk.startswith("@") or tk.startswith("http"):
+                out_tokens.append(tk)
+            else:
+                out_tokens.append(tk.translate(t_map))
+        return " ".join(out_tokens)
+
 ZALO_COLOR_MAP = {
     "red": "db342e", "do": "db342e", "đỏ": "db342e",
     "orange": "f27806", "cam": "f27806",
@@ -3710,6 +3756,8 @@ class Zalo:
             pool = ZALO_OCEAN_ZCODES
         elif color_mode == "royal_gradient":
             pool = ZALO_ROYAL_ZCODES
+        elif color_mode == "neon_cyber":
+            pool = ZALO_CYBER_ZCODES
         else:
             pool = ZALO_NATIVE_ZCODES
         if color_mode == "random":
@@ -3723,7 +3771,7 @@ class Zalo:
     @staticmethod
     def _resolve_zalo_font_tokens(font_style="big_bold", is_heading=True, force_line_heading=False, step_idx=0):
         fs = str(font_style or ("big_bold" if is_heading else "normal")).lower()
-        if force_line_heading or fs in ("big_bold", "chuto", "heading"):
+        if force_line_heading or fs in ("big_bold", "chuto", "heading", "bold_serif", "bold_sans", "double_struck", "script_vip", "small_caps"):
             return ["b", "f_18"]
         if fs in ("small_bold", "chunho", "nho"):
             return ["b", "f_13"]
@@ -3731,7 +3779,7 @@ class Zalo:
             return ["b", "f_15"]
         if fs in ("alternating_bold", "xenke", "sole"):
             return ["b", "f_18"] if (step_idx % 2 == 0) else ["b", "f_13"]
-        if fs in ("italic_bold", "nghieng"):
+        if fs in ("italic_bold", "nghieng", "italic_serif"):
             return ["b", "i", "f_18"]
         if fs in ("underline_bold", "gachchan"):
             return ["b", "u", "f_18"]
@@ -3795,6 +3843,7 @@ class Zalo:
             if line_tail_icons and use_emoji and icon_count > 0:
                 collected_tail_icons.extend(line_tail_icons)
 
+            core_body = UnicodeLuxuryFontEngine.transform_line(core_body, font_style=font_style)
             core_text = lead_ws + core_body
             core_lines.append(core_text)
             core_u16_len = utf16_len(core_text)
@@ -3856,17 +3905,18 @@ class Zalo:
 
         return core_msg, styles, first_color, tail_icon_str
 
-    def attach_mentions_real_zalo(self, core_msg, mentions=None, tag_all=False, group_id=None, hide_tag_all=True):
-        """Gắn Tag Thật 100% chuẩn giao thức Zalo Group (`/api/group/mention`) + Hỗ trợ TAG @ALL ẨN (Không hiện chữ @All):
-        - Khi `tag_all=True` và `hide_tag_all=True` (Mặc định BẬT): Tự động xóa sạch chữ `@All`/`@all` khỏi văn bản hiển thị
-          và neo vùng `mentionInfo` (`uid: "-1", type: 1`) vào đúng 1 khoảng trắng tàng hình ở cuối câu (`len: 1`).
-          Nhờ đó toàn bộ thành viên trong nhóm Zalo đều bị rung chuông báo `@All` nhưng trên khung chat TUYỆT ĐỐI KHÔNG HIỆN chữ `@All`!"""
+    def attach_mentions_real_zalo(self, core_msg, mentions=None, tag_all=False, group_id=None, hide_tag_all=True, hide_tag_name=True):
+        """Gắn Tag Thật 100% chuẩn giao thức Zalo Group (`/api/group/mention`) + Hỗ trợ ĐỒNG THỜI:
+        1. TAG @ALL ẨN (`hide_tag_all=True`): Xóa chữ `@All` khỏi văn bản hiển thị và neo `{"pos": pos, "len": 1, "uid": "-1", "type": 1}`
+           vào đúng 1 khoảng trắng tàng hình ở cuối câu. Cả nhóm đều bị báo chuông `@All` nhưng tuyệt đối không hiện chữ `@All`!
+        2. TAG @TÊN ẨN (`hide_tag_name=True`): Xóa chữ `@Tên` khỏi văn bản hiển thị và neo mỗi thành viên được tag
+           `{"pos": pos_u, "len": 1, "uid": str(uid), "type": 0}` vào đúng 1 khoảng trắng riêng biệt ở cuối câu!
+           Người bị tag vẫn nhận thông báo nhắc tên thật 100% ('Bạn đã được nhắc đến') nhưng trên khung chat KHÔNG HIỆN chữ `@Tên`!"""
         final = core_msg if core_msg else ""
         m_arr = []
 
         if tag_all:
             if hide_tag_all:
-                # Xóa mọi chữ @All / @all nếu còn sót trong văn bản để ẩn hoàn toàn chữ @All
                 final = re.sub(r"(?i)(?:\s+|^)@(?:all|tất\s*cả|tat\s*ca)\b", "", final).strip()
                 if not final:
                     final = " "
@@ -3876,7 +3926,8 @@ class Zalo:
                     "pos": int(pos),
                     "len": 1,
                     "uid": "-1",
-                    "type": 1
+                    "type": 1,
+                    "_hidden": True
                 })
             else:
                 tag_token = "@All"
@@ -3907,9 +3958,11 @@ class Zalo:
                 if uid == "-1":
                     if not any(x["uid"] == "-1" for x in m_arr):
                         if hide_tag_all:
+                            if not final:
+                                final = " "
                             pos = utf16_len(final)
                             final = final + " "
-                            m_arr.append({"pos": int(pos), "len": 1, "uid": "-1", "type": 1})
+                            m_arr.append({"pos": int(pos), "len": 1, "uid": "-1", "type": 1, "_hidden": True})
                         else:
                             sep = " " if (final and not final.endswith((" ", "\n"))) else ""
                             pos = utf16_len(final + sep)
@@ -3948,23 +4001,41 @@ class Zalo:
                 if not name:
                     name = f"User_{uid[-4:]}"
 
-                tag_token = f"@{name}"
-                existing_idx = final.find(tag_token)
-                if existing_idx != -1:
-                    pos = utf16_len(final[:existing_idx])
-                    t_len = utf16_len(tag_token)
+                # Nếu bật Tag @Tên Ẩn (hide_tag_name=True): xóa sạch @Tên khỏi nội dung hiển thị và neo mention thật vào 1 khoảng trắng cuối câu!
+                use_hidden_name = bool(m.get("hidden", hide_tag_name))
+                if use_hidden_name and str(uid).isdigit():
+                    tag_token_check = f"@{name}"
+                    if tag_token_check in final:
+                        final = final.replace(tag_token_check, "").strip()
+                    if not final:
+                        final = " "
+                    pos = utf16_len(final)
+                    final = final + " "
+                    m_arr.append({
+                        "pos": int(pos),
+                        "len": 1,
+                        "uid": str(uid),
+                        "type": 0,
+                        "_hidden": True
+                    })
                 else:
-                    sep = " " if (final and not final.endswith((" ", "\n"))) else ""
-                    pos = utf16_len(final + sep)
-                    final = final + sep + tag_token
-                    t_len = utf16_len(tag_token)
+                    tag_token = f"@{name}"
+                    existing_idx = final.find(tag_token)
+                    if existing_idx != -1:
+                        pos = utf16_len(final[:existing_idx])
+                        t_len = utf16_len(tag_token)
+                    else:
+                        sep = " " if (final and not final.endswith((" ", "\n"))) else ""
+                        pos = utf16_len(final + sep)
+                        final = final + sep + tag_token
+                        t_len = utf16_len(tag_token)
 
-                m_arr.append({
-                    "pos": int(pos),
-                    "len": int(t_len),
-                    "uid": str(uid),
-                    "type": 0
-                })
+                    m_arr.append({
+                        "pos": int(pos),
+                        "len": int(t_len),
+                        "uid": str(uid),
+                        "type": 0
+                    })
 
         return final, m_arr
 
@@ -3996,7 +4067,8 @@ class Zalo:
             pl["visibility"] = 0
             pl["grid"] = str(thread_id)
             if m_arr:
-                mention_json = json.dumps(m_arr, separators=(",", ":"), ensure_ascii=False)
+                clean_m_arr = [{"pos": int(x["pos"]), "len": int(x["len"]), "uid": str(x["uid"]), "type": int(x.get("type", 0))} for x in m_arr]
+                mention_json = json.dumps(clean_m_arr, separators=(",", ":"), ensure_ascii=False)
                 pl["mentionInfo"] = mention_json
         else:
             pl["toid"] = str(thread_id)
@@ -4033,7 +4105,7 @@ class Zalo:
                  is_group=True, mentions=None, tag_all=False, is_heading=True,
                  color_offset=0, antiband=True, use_emoji=False, icon_count=0,
                  auto_retry_thread_type=False, strip_line_num=False, parse_auto_tags=True,
-                 hide_tag_all=True, font_style="big_bold"):
+                 hide_tag_all=True, hide_tag_name=True, font_style="big_bold"):
         eff_mentions = list(mentions) if mentions else []
         eff_tag_all = bool(tag_all)
         working_text = raw_text
@@ -4071,7 +4143,8 @@ class Zalo:
             mentions=(eff_mentions if is_group else None),
             tag_all=(eff_tag_all if is_group else False),
             group_id=(thread_id if is_group else None),
-            hide_tag_all=hide_tag_all
+            hide_tag_all=hide_tag_all,
+            hide_tag_name=hide_tag_name
         )
 
         # Đồng bộ hóa vùng màu chữ (styles) kết hợp vùng Tag (m_arr) (Bỏ qua vùng Tag @All ẩn để không lộ khoảng trắng màu)
@@ -4082,7 +4155,7 @@ class Zalo:
             if first_color:
                 tag_st_parts.append(f"c_{first_color}")
             for m_item in m_arr:
-                if str(m_item.get("uid")) == "-1" and hide_tag_all:
+                if m_item.get("_hidden") or (str(m_item.get("uid")) == "-1" and hide_tag_all) or (str(m_item.get("uid")) != "-1" and hide_tag_name):
                     continue
                 styles.append({
                     "start": int(m_item["pos"]),
@@ -5236,7 +5309,12 @@ class ZaloQRLoginManager:
         if "_zlang" not in clean_c:
             clean_c["_zlang"] = "vn"
 
-        # Khởi tạo đối tượng Zalo trong Pool với khóa zpw_enk đã cấp sẵn (không gọi lại _login() để không làm văng phiên trên điện thoại!)
+        # BẮT BUỘC KIỂM TRA MÁY TÍNH CỦA MÃ QR ĐÃ ĐĂNG NHẬP VÀO TRONG TÀI KHOẢN ZALO CHƯA:
+        # Nếu máy tính chưa nằm trong tài khoản Zalo (thiếu zpw_sek hoặc không lấy được khóa zpw_enk / danh sách nhóm),
+        # TUYỆT ĐỐI KHÔNG TRẢ VỀ COOKIE & IMEI CHẾT!
+        live_groups_count = 0
+        is_pc_in_account = False
+        verify_err_detail = ""
         try:
             z_client_live = Zalo.get_pooled_client(
                 imei, clean_c, force_new=True,
@@ -5249,11 +5327,52 @@ class ZaloQRLoginManager:
             if z_client_live.display_name and not z_client_live.display_name.startswith("Zalo_"):
                 d_name = z_client_live.display_name
             clean_c.update(z_client_live.cookies_dict)
-            # Nạp nhẹ danh sách nhóm 1 lần qua khóa zpw_enk để xác nhận thiết bị PC đang hoạt động trực tuyến
+            if zpw_enk and clean_c.get("zpw_sek") and uid:
+                g_check = z_client_live.groups(use_cache=False)
+                live_groups_count = len(g_check) if isinstance(g_check, list) else 0
+                is_pc_in_account = True
+        except Exception as e_ver:
+            verify_err_detail = str(e_ver)
+
+        # Kiểm tra bổ sung qua verify_zalo_pc_device_logged_in_account của zalo_login
+        if not is_pc_in_account and zpw_enk and clean_c.get("zpw_sek"):
             try:
-                z_client_live.groups(use_cache=False)
+                from zalo_login import verify_zalo_pc_device_logged_in_account as _ver_pc
+                ok_v, cnt_v, msg_v = _ver_pc(imei, clean_c, zpw_enk, ua_bound, uid=uid)
+                if ok_v:
+                    is_pc_in_account = True
+                    live_groups_count = cnt_v
+                else:
+                    verify_err_detail = msg_v
             except Exception:
                 pass
+
+        if not is_pc_in_account or not zpw_enk or not clean_c.get("zpw_sek"):
+            st["imei"] = ""
+            st["cookies"] = {}
+            st["cookies_str"] = ""
+            st["file_name"] = ""
+            st["file_content"] = ""
+            st["status"] = "error"
+            st["message"] = (
+                f"⚠️ Máy tính QR ({pc_name}) chưa vào được bên trong tài khoản Zalo ({verify_err_detail or 'Thiếu khóa phiên zpw_enk/zpw_sek'}). "
+                "Hệ thống từ chối xuất Cookie & IMEI để tránh Cookie chết! Hãy bấm 'Tạo Mã QR Máy Tính Mới' và ấn Đồng ý đăng nhập trên điện thoại!"
+            )
+            cls._persist_qr_state_to_db(st)
+            return
+
+        # Kích hoạt bộ giữ phiên ZaloPCSessionKeeper 24/7 để máy tính nằm cố định trong mục Thiết bị đang đăng nhập
+        try:
+            from zalo_login import ZaloPCSessionKeeper
+            ZaloPCSessionKeeper.register_and_keep_alive(
+                uid=uid or imei,
+                imei=imei,
+                cookies_dict=clean_c,
+                zpw_enk=zpw_enk,
+                user_agent=ua_bound,
+                pc_name=pc_name,
+                ws_urls=ws_list
+            )
         except Exception:
             pass
 
@@ -5268,7 +5387,11 @@ class ZaloQRLoginManager:
 
         cookies_str = json.dumps(clean_c, ensure_ascii=False, indent=2)
         safe_fn = re.sub(r"[^\w\.\-]", "_", d_name or "zalo_user") + "_zalo.txt"
-        f_content = f"Imei:\n{imei}\n\nUser-Agent:\n{ua_bound}\n\nZpw_Enk:\n{zpw_enk}\n\nCookie:\n{cookies_str}\n"
+        f_content = (
+            f"# PHIEN MAY TINH ZALO PC DA XAC THUC TRONG ACC ({pc_name})\n"
+            f"# Chu So Huu: Phan Anh Khoi (Rike) | UID: {uid} | Nhom: {live_groups_count}\n\n"
+            f"Imei:\n{imei}\n\nUser-Agent:\n{ua_bound}\n\nZpw_Enk:\n{zpw_enk}\n\nCookie:\n{cookies_str}\n"
+        )
 
         st["imei"] = imei
         st["cookies"] = clean_c
@@ -5279,7 +5402,8 @@ class ZaloQRLoginManager:
         st["file_content"] = f_content
         st["status"] = "success"
         st["message"] = (
-            f"Đã đăng nhập thành công vào {d_name}! Thiết bị {pc_name} đang nằm cố định trong Lịch sử đăng nhập cùng với điện thoại!"
+            f"✅ Đã xác thực máy tính {pc_name} nằm TRONG tài khoản Zalo của {d_name} "
+            f"(UID: {uid} • {live_groups_count} nhóm • Khóa zpw_enk sống 100%)! Đã xuất Cookie & IMEI!"
         )
         cls._persist_qr_state_to_db(st)
 
@@ -5311,7 +5435,7 @@ class ZaloQRLoginManager:
                 log_system_command(
                     saved_acc_id, uid or "Zalo_PC", uid or d_name,
                     "[QR-LOGIN-PC]",
-                    f"[ZALO PC] Thiết bị {pc_name} đã ghim cố định vào tài khoản {d_name} (Online 24/7 cùng điện thoại)"
+                    f"[ZALO PC] Thiết bị {pc_name} đã ghim cố định vào tài khoản {d_name} ({live_groups_count} nhóm Online 24/7)"
                 )
             except Exception:
                 pass
@@ -8111,6 +8235,7 @@ def box_target_worker(client, acc_id, plat, target, blocks, runtime_opts,
                     use_emoji=em_f, icon_count=ic_cnt,
                     auto_retry_thread_type=True, strip_line_num=strip_num_f,
                     hide_tag_all=bool(runtime_opts.get("hide_tag_all", True)),
+                    hide_tag_name=bool(runtime_opts.get("hide_tag_name", True)),
                     font_style=f_style
                 )
             elif plat == "messenger":
@@ -8214,7 +8339,7 @@ def box_target_worker(client, acc_id, plat, target, blocks, runtime_opts,
                 raw = random.choice(blocks)
                 clean_raw = strip_leading_line_number(raw) if strip_line_num else raw
 
-            if mode in ("nhay_tag_all", "nhay_tag_all_an", "battrinh_all_box"):
+            if mode in ("nhay_tag_all", "nhay_tag_all_an", "nhay_tag_ten_an", "battrinh_all_box"):
                 eff_tag_all = True
                 is_group = True
 
@@ -8505,7 +8630,7 @@ def multi_box_shard_worker(client, acc_id, plat, shard_targets, blocks, runtime_
         strip_line_num = bool(runtime_opts.get("strip_line_num", True)) or (mode == "treo_nhay")
         wave_key = runtime_opts.get("_wave_key", "")
 
-        if mode in ("nhay_tag_all", "nhay_tag_all_an", "battrinh_all_box"):
+        if mode in ("nhay_tag_all", "nhay_tag_all_an", "nhay_tag_ten_an", "battrinh_all_box"):
             tag_all = True
         if mode in ("raid_burst", "sieu_xa_nhieu_nhom"):
             color_mode = "word_rainbow"
@@ -8573,6 +8698,7 @@ def multi_box_shard_worker(client, acc_id, plat, shard_targets, blocks, runtime_
                         use_emoji=eff_em, icon_count=eff_ic,
                         auto_retry_thread_type=True, strip_line_num=s_num_flag,
                         hide_tag_all=bool(runtime_opts.get("hide_tag_all", True)),
+                        hide_tag_name=bool(runtime_opts.get("hide_tag_name", True)),
                         font_style=f_style
                     )
                 elif plat == "messenger":
@@ -8818,7 +8944,7 @@ def start_task_programmatic(targets, blocks, delay=1.0, use_emoji=True, icon_cou
                             mode="fast", color_mode="rainbow", fixed_color="red",
                             antiband=True, antidieall=True, specific_acc_id=None, source_label="web",
                             defer_db_insert=False, account_ids=None, trigger_cmd="", hide_tag_all=True,
-                            font_style=None):
+                            hide_tag_name=True, font_style=None):
     tid = new_tid("cmd" if source_label == "chat" else "task")
     stop_ev = threading.Event()
     tag_users = tag_users or []
@@ -8852,6 +8978,7 @@ def start_task_programmatic(targets, blocks, delay=1.0, use_emoji=True, icon_cou
         "tag_users": list(tag_users),
         "tag_all": bool(tag_all),
         "hide_tag_all": bool(hide_tag_all),
+        "hide_tag_name": bool(hide_tag_name),
         "is_heading": bool(is_heading),
         "mode": mode,
         "color_mode": color_mode,
@@ -9561,6 +9688,7 @@ def parse_and_execute_inchat_command(
                 "⚡ HỆ THỐNG ZALO PC Đa Luồng:\n"
                 "• .nhay <nd / số file> [@Tên / @All] (.n) — Tag @All tự động ẨN chữ @All\n"
                 "• .anall <nd / số file> — Nhây Tag @All Ẩn (Chuông báo cả nhóm không hiện chữ @All)\n"
+                "• .antan <nd / số file> [@Tên] — Nhây Tag @Tên Ẩn & @All Ẩn (Tag thật 100% không hiện chữ @Tên)\n"
                 "• .ngon <nd / số file> [@Tên / @All] (.g) | .xa <số file> — Siêu xả 0s không lag\n"
                 "• .prx <add/list/test/on/off> — Quản lý Proxy truyền tin siêu tốc\n"
                 "• .combo <nd / số file> [@Tên] — Xả liên thanh 3 câu/nhịp\n"
@@ -10028,6 +10156,9 @@ def parse_and_execute_inchat_command(
         elif arg_c in ("royal", "hoanggia", "royal_gradient"):
             update_running_tasks_config(thread_id=None, color_mode="royal_gradient")
             reply_txt = "👑 Đã bật phối màu Hoàng Gia (Tím - Hồng - Đỏ - Vàng)!"
+        elif arg_c in ("cyber", "neon", "neon_cyber"):
+            update_running_tasks_config(thread_id=None, color_mode="neon_cyber")
+            reply_txt = "⚡ Đã bật phối màu Neon Cyber 2026 (Xanh Dương - Băng Tuyết - Tím - Hồng - Ngọc)!"
         elif arg_c in ("random", "ngaunhien"):
             update_running_tasks_config(thread_id=None, color_mode="random")
             reply_txt = "🎲 Đã bật phối màu ngẫu nhiên 8 sắc độ!"
@@ -10080,6 +10211,21 @@ def parse_and_execute_inchat_command(
         elif arg_f in ("gachchan", "underline", "underline_bold"):
             update_running_tasks_config(thread_id=None, is_heading=True, font_style="underline_bold")
             reply_txt = "🔤 Đã bật kiểu chữ Zalo: CHỮ TO IN ĐẬM GẠCH CHÂN (b,u,f_18)!"
+        elif arg_f in ("serif", "bold_serif"):
+            update_running_tasks_config(thread_id=None, is_heading=True, font_style="bold_serif")
+            reply_txt = "🔤 Đã bật Phông Chữ Hoàng Gia Bold Serif (𝐁𝐨𝐥𝐝 𝐒𝐞𝐫𝐢𝐟 + f_18)!"
+        elif arg_f in ("sans", "bold_sans"):
+            update_running_tasks_config(thread_id=None, is_heading=True, font_style="bold_sans")
+            reply_txt = "🔤 Đã bật Phông Chữ Hiện Đại Bold Sans (𝗕𝗼𝗹𝗱 𝗦𝗮𝗻𝘀 + f_18)!"
+        elif arg_f in ("double", "khung", "double_struck"):
+            update_running_tasks_config(thread_id=None, is_heading=True, font_style="double_struck")
+            reply_txt = "🔤 Đã bật Phông Chữ Khung Kép VIP (𝔻𝕠𝕦𝕓𝕝𝕖 𝕊𝕥𝕣𝕦𝕔𝕜 + f_18)!"
+        elif arg_f in ("script", "nghethuat", "script_vip"):
+            update_running_tasks_config(thread_id=None, is_heading=True, font_style="script_vip")
+            reply_txt = "🔤 Đã bật Phông Chữ Nghệ Thuật Luxury (𝓢𝓬𝓻𝓲𝓹𝓽 𝓥𝓘𝓟 + f_18)!"
+        elif arg_f in ("smallcaps", "small_caps"):
+            update_running_tasks_config(thread_id=None, is_heading=True, font_style="small_caps")
+            reply_txt = "🔤 Đã bật Phông Chữ Small Caps Đẳng Cấp (ꜱᴍᴀʟʟ ᴄᴀᴘꜱ + f_18)!"
         elif arg_f in ("off", "tat", "0", "thuong", "normal"):
             update_running_tasks_config(thread_id=None, is_heading=False, font_style="normal")
             reply_txt = "🔤 Đã chuyển về chữ thường mặc định trên mọi nhóm & Web!"
@@ -10143,6 +10289,10 @@ def parse_and_execute_inchat_command(
         "tagall": "treo_nhay",
         "anall": "treo_nhay",
         "tagallan": "treo_nhay",
+        "antan": "treo_nhay",
+        "tagan": "treo_nhay",
+        "antag": "treo_nhay",
+        "hientag": "treo_nhay",
         "nhaypoll": "nhay_poll",
         "nhaynamebox": "nhay_namebox",
         "xa": "sieu_xa_nhieu_nhom",
@@ -10344,8 +10494,11 @@ def parse_and_execute_inchat_command(
     else:
         stop_tasks_for_thread(thread_id)
 
+    hide_name_flag = False if cmd_token == "hientag" else bool(SYSTEM_RUNTIME_CONFIG.get("hide_tag_name", True) or cmd_token in ("antan", "tagan", "antag"))
     tid = start_task_programmatic(
         targets=target_obj,
+        hide_tag_all=True,
+        hide_tag_name=hide_name_flag,
         blocks=blocks,
         delay=delay_val,
         use_emoji=use_emoji,
@@ -11780,21 +11933,21 @@ body{
 }
 .sec-note{margin-top:16px;padding-top:12px;border-top:1px solid #e2e8f0;font-size:11px;color:#64748b;display:flex;justify-content:space-between}
 
-/* ==================== LIQUID GLASS + PILL GEOMETRY + LOCK ZOOM v25 ==================== */
+/* ==================== WHITE LIQUID GLASS 2026 + ROUNDED UNDERLINE TABS + DOWNLOAD FX v26 ==================== */
 :root{
-  --bg:#070b19;
-  --surface:rgba(255,255,255,0.10);
-  --surface-sub:rgba(255,255,255,0.06);
-  --border:rgba(255,255,255,0.22);
-  --border-light:rgba(255,255,255,0.14);
-  --txt:#f8fafc;
-  --txt-muted:#cbd5e1;
-  --blue:#38bdf8;
-  --blue-hover:#0284c7;
-  --green:#34d399;
-  --red:#fb7185;
-  --amber:#fbbf24;
-  --indigo:#818cf8;
+  --bg:#f4f7fb;
+  --surface:rgba(255,255,255,0.86);
+  --surface-sub:rgba(248,250,252,0.92);
+  --border:rgba(148,163,184,0.34);
+  --border-light:rgba(203,213,225,0.55);
+  --txt:#0f172a;
+  --txt-muted:#475569;
+  --blue:#0068ff;
+  --blue-hover:#0052cc;
+  --green:#10b981;
+  --red:#ef4444;
+  --amber:#f59e0b;
+  --indigo:#4f46e5;
 }
 html,body{
   touch-action:manipulation;
@@ -11803,10 +11956,10 @@ html,body{
   user-select:none;
   overscroll-behavior-y:none;
   background:
-    radial-gradient(circle at 12% 18%, rgba(56,189,248,0.28) 0%, transparent 42%),
-    radial-gradient(circle at 86% 14%, rgba(168,85,247,0.26) 0%, transparent 45%),
-    radial-gradient(circle at 50% 85%, rgba(16,185,129,0.22) 0%, transparent 48%),
-    linear-gradient(145deg, #050814 0%, #0b132b 52%, #111827 100%) !important;
+    radial-gradient(circle at 10% 12%, rgba(56,189,248,0.18) 0%, transparent 38%),
+    radial-gradient(circle at 88% 10%, rgba(99,102,241,0.15) 0%, transparent 40%),
+    radial-gradient(circle at 50% 90%, rgba(16,185,129,0.14) 0%, transparent 45%),
+    linear-gradient(180deg, #f8fafc 0%, #eef4ff 52%, #f1f5f9 100%) !important;
   background-attachment:fixed !important;
   color:var(--txt) !important;
 }
@@ -11815,115 +11968,206 @@ input,textarea,code,pre{
   user-select:text;
   touch-action:manipulation;
 }
+.container{max-width:1200px !important;padding:10px 12px 32px !important}
 .header-bar,.visual-card,.status-strip,.live-cmd-banner,.kpi-box,.panel,.login-card{
-  background:linear-gradient(135deg, rgba(255,255,255,0.14) 0%, rgba(255,255,255,0.05) 100%) !important;
-  backdrop-filter:blur(28px) saturate(195%) !important;
-  -webkit-backdrop-filter:blur(28px) saturate(195%) !important;
-  border:1px solid rgba(255,255,255,0.24) !important;
-  box-shadow:0 12px 34px -8px rgba(2,6,23,0.55), inset 0 1px 1px rgba(255,255,255,0.32) !important;
-  border-radius:26px !important;
+  background:linear-gradient(135deg, rgba(255,255,255,0.92) 0%, rgba(255,255,255,0.76) 100%) !important;
+  backdrop-filter:blur(28px) saturate(210%) !important;
+  -webkit-backdrop-filter:blur(28px) saturate(210%) !important;
+  border:1px solid rgba(255,255,255,0.95) !important;
+  outline:1px solid rgba(148,163,184,0.25) !important;
+  box-shadow:0 10px 30px -8px rgba(15,23,42,0.07), inset 0 1px 2px rgba(255,255,255,0.95) !important;
+  border-radius:20px !important;
 }
 .header-bar,.status-strip,.live-cmd-banner{
-  border-radius:9999px !important;
-  padding:10px 20px !important;
-}
-@media(max-width:780px){
-  .header-bar,.status-strip,.live-cmd-banner{border-radius:24px !important;}
+  border-radius:18px !important;
+  padding:9px 14px !important;
 }
 .panel-hd{
-  background:rgba(255,255,255,0.08) !important;
-  border-bottom:1px solid rgba(255,255,255,0.16) !important;
-  padding:11px 18px !important;
+  background:linear-gradient(90deg, rgba(241,245,249,0.85) 0%, rgba(255,255,255,0.9) 100%) !important;
+  border-bottom:1px solid rgba(203,213,225,0.6) !important;
+  padding:9px 14px !important;
 }
-/* TỐI ƯU TOÀN BỘ VIỀN THÀNH VIÊN THUỐC (PILL SHAPE 9999PX) */
-.btn,.nav-tab,.sub-tab,.acc-pill,.badge,.inp,.sel,.chk-label,.tab-count,.form-input,.btn-submit{
+.panel-body{padding:10px 12px !important}
+
+/* THANH TAB CHỌN CHỨC NĂNG CÓ GẠCH DƯỚI BO TRÒN ĐẦY ĐỦ CHUẨN LIQUID GLASS 2026 */
+.nav-tabs{
+  background:rgba(255,255,255,0.82) !important;
+  backdrop-filter:blur(24px) saturate(200%) !important;
+  -webkit-backdrop-filter:blur(24px) saturate(200%) !important;
+  padding:6px 8px 10px !important;
+  border-radius:18px !important;
+  border:1px solid rgba(203,213,225,0.65) !important;
+  box-shadow:0 8px 24px -6px rgba(15,23,42,0.06), inset 0 1px 0 #ffffff !important;
+  gap:8px !important;
+}
+.nav-tab,.sub-tab{
+  position:relative !important;
+  overflow:visible !important;
+  border-radius:14px !important;
+  background:rgba(248,250,252,0.85) !important;
+  border:1px solid rgba(203,213,225,0.65) !important;
+  color:#334155 !important;
+  font-weight:700 !important;
+  padding:8px 12px 11px !important;
+  transition:all 0.22s cubic-bezier(0.16,1,0.3,1) !important;
+  box-shadow:0 2px 5px rgba(15,23,42,0.03), inset 0 1px 0 #ffffff !important;
+}
+.nav-tab:hover,.sub-tab:hover{
+  background:#ffffff !important;
+  color:#0068ff !important;
+  border-color:rgba(0,104,255,0.35) !important;
+  transform:translateY(-1px);
+}
+/* Thanh gạch dưới bo tròn đầy đủ (Rounded Bottom Underline Indicator) */
+.nav-tab::after,.sub-tab::after{
+  content:"";
+  position:absolute;
+  left:16%;
+  right:16%;
+  bottom:3px;
+  height:3.5px;
+  border-radius:9999px;
+  background:linear-gradient(90deg, #0068ff 0%, #06b6d4 50%, #4f46e5 100%);
+  transform:scaleX(0);
+  opacity:0;
+  transition:transform 0.26s cubic-bezier(0.22,1,0.36,1), opacity 0.22s ease;
+}
+.nav-tab:hover::after,.sub-tab:hover::after{
+  transform:scaleX(0.55);
+  opacity:0.55;
+}
+.nav-tab.active,.sub-tab.active{
+  background:linear-gradient(180deg, #ffffff 0%, #eff6ff 100%) !important;
+  color:#0068ff !important;
+  border-color:rgba(0,104,255,0.48) !important;
+  box-shadow:0 6px 16px -4px rgba(0,104,255,0.18), inset 0 1px 0 #ffffff !important;
+}
+.nav-tab.active::after,.sub-tab.active::after{
+  transform:scaleX(1);
+  opacity:1;
+  box-shadow:0 2px 8px rgba(0,104,255,0.45);
+}
+.nav-tab.active .tab-count{
+  background:linear-gradient(135deg, #0068ff 0%, #06b6d4 100%) !important;
+  color:#ffffff !important;
+}
+.tab-count{
   border-radius:9999px !important;
+  background:#e2e8f0 !important;
+  color:#0f172a !important;
+  padding:2px 8px !important;
+}
+
+/* NÚT BẤM, Ô NHẬP & HIỆU ỨNG TẢI VỀ (DOWNLOAD ANIMATION FX) */
+.btn,.acc-pill,.badge,.inp,.sel,.chk-label,.form-input,.btn-submit{
+  border-radius:12px !important;
   transition:all 0.2s cubic-bezier(0.16,1,0.3,1) !important;
 }
 .txt{
-  border-radius:22px !important;
-  background:rgba(15,23,42,0.52) !important;
-  border:1px solid rgba(255,255,255,0.24) !important;
-  color:#f8fafc !important;
-  padding:10px 14px !important;
+  border-radius:14px !important;
+  background:#ffffff !important;
+  border:1px solid #cbd5e1 !important;
+  color:#0f172a !important;
+  padding:8px 12px !important;
 }
 .inp,.sel,.form-input{
-  background:rgba(15,23,42,0.52) !important;
-  border:1px solid rgba(255,255,255,0.24) !important;
-  color:#f8fafc !important;
-  padding:8px 14px !important;
+  background:#ffffff !important;
+  border:1px solid #cbd5e1 !important;
+  color:#0f172a !important;
+  padding:7px 11px !important;
 }
-.sel option{background:#0f172a;color:#f8fafc}
+.sel option{background:#ffffff;color:#0f172a}
 .inp:focus,.sel:focus,.txt:focus,.form-input:focus{
-  border-color:#38bdf8 !important;
-  box-shadow:0 0 0 3px rgba(56,189,248,0.28), inset 0 1px 1px rgba(255,255,255,0.35) !important;
-  background:rgba(15,23,42,0.72) !important;
+  border-color:#0068ff !important;
+  box-shadow:0 0 0 3px rgba(0,104,255,0.15) !important;
+  background:#ffffff !important;
 }
-.btn,.nav-tab,.sub-tab,.acc-pill{
-  background:rgba(255,255,255,0.10) !important;
-  border:1px solid rgba(255,255,255,0.24) !important;
-  color:#f8fafc !important;
-  box-shadow:inset 0 1px 0 rgba(255,255,255,0.28) !important;
+.btn,.acc-pill{
+  background:#ffffff !important;
+  border:1px solid #cbd5e1 !important;
+  color:#0f172a !important;
+  box-shadow:0 1px 2px rgba(15,23,42,0.04) !important;
 }
-.btn:hover,.nav-tab:hover,.sub-tab:hover,.acc-pill:hover{
-  background:rgba(255,255,255,0.20) !important;
+.btn:hover,.acc-pill:hover{
+  background:#f8fafc !important;
+  border-color:#94a3b8 !important;
   transform:translateY(-1px);
 }
-.btn-primary,.nav-tab.active,.sub-tab.active,.acc-pill.active,.btn-submit{
-  background:linear-gradient(135deg, rgba(56,189,248,0.88) 0%, rgba(59,130,246,0.92) 55%, rgba(99,102,241,0.92) 100%) !important;
-  border-color:rgba(186,230,253,0.65) !important;
+.btn-primary,.acc-pill.active,.btn-submit{
+  background:linear-gradient(135deg, #0068ff 0%, #2563eb 55%, #4f46e5 100%) !important;
+  border-color:#0052cc !important;
   color:#ffffff !important;
-  box-shadow:0 6px 20px -4px rgba(56,189,248,0.55), inset 0 1px 1px rgba(255,255,255,0.45) !important;
+  box-shadow:0 5px 15px -3px rgba(0,104,255,0.35) !important;
 }
 .btn-success{
-  background:linear-gradient(135deg, rgba(16,185,129,0.90) 0%, rgba(5,150,105,0.94) 100%) !important;
-  border-color:rgba(167,243,208,0.6) !important;
+  background:linear-gradient(135deg, #10b981 0%, #059669 100%) !important;
+  border-color:#059669 !important;
   color:#ffffff !important;
-  box-shadow:0 6px 18px -4px rgba(16,185,129,0.5) !important;
+  box-shadow:0 5px 15px -3px rgba(16,185,129,0.32) !important;
 }
 .btn-danger{
-  background:linear-gradient(135deg, rgba(244,63,94,0.90) 0%, rgba(225,29,72,0.94) 100%) !important;
-  border-color:rgba(254,205,211,0.6) !important;
+  background:linear-gradient(135deg, #ef4444 0%, #dc2626 100%) !important;
+  border-color:#dc2626 !important;
   color:#ffffff !important;
-  box-shadow:0 6px 18px -4px rgba(244,63,94,0.5) !important;
+  box-shadow:0 5px 15px -3px rgba(239,68,68,0.32) !important;
+}
+@keyframes dlBounce2026{
+  0%,100%{transform:translateY(0)}
+  50%{transform:translateY(2.5px)}
+}
+@keyframes dlShimmer2026{
+  0%{background-position:-180% 0}
+  100%{background-position:180% 0}
+}
+.btn-download-fx{
+  position:relative;
+  overflow:hidden;
+  background:linear-gradient(90deg, #0068ff 0%, #06b6d4 50%, #0068ff 100%) !important;
+  background-size:200% 100% !important;
+  color:#ffffff !important;
+  border-color:#0284c7 !important;
+  animation:dlShimmer2026 3.2s infinite linear;
+  box-shadow:0 5px 14px -3px rgba(6,182,212,0.4) !important;
+}
+.btn-download-fx svg{
+  animation:dlBounce2026 1.2s infinite ease-in-out;
 }
 .chk-label{
-  background:rgba(255,255,255,0.08) !important;
-  border:1px solid rgba(255,255,255,0.20) !important;
-  color:#f8fafc !important;
-  padding:7px 13px !important;
+  background:rgba(248,250,252,0.92) !important;
+  border:1px solid #cbd5e1 !important;
+  color:#0f172a !important;
+  padding:6px 10px !important;
 }
 .list-item{
-  background:rgba(255,255,255,0.05) !important;
-  border-bottom:1px solid rgba(255,255,255,0.10) !important;
-  border-radius:18px !important;
-  margin:4px 6px !important;
+  background:#ffffff !important;
+  border-bottom:1px solid #e2e8f0 !important;
+  border-radius:12px !important;
+  margin:3px 4px !important;
 }
-.list-item:hover{background:rgba(255,255,255,0.12) !important}
+.list-item:hover{background:#f1f5f9 !important}
 .scroll-area{
-  background:rgba(15,23,42,0.36) !important;
-  border:1px solid rgba(255,255,255,0.16) !important;
-  border-radius:20px !important;
+  background:rgba(248,250,252,0.75) !important;
+  border:1px solid #cbd5e1 !important;
+  border-radius:14px !important;
 }
 .data-table th{
-  background:rgba(255,255,255,0.08) !important;
-  color:#bae6fd !important;
-  border-bottom:1px solid rgba(255,255,255,0.16) !important;
+  background:#f1f5f9 !important;
+  color:#334155 !important;
+  border-bottom:1px solid #cbd5e1 !important;
 }
 .data-table td{
-  border-bottom:1px solid rgba(255,255,255,0.10) !important;
-  color:#f1f5f9 !important;
+  border-bottom:1px solid #e2e8f0 !important;
+  color:#0f172a !important;
 }
-.data-table tr:hover td{background:rgba(255,255,255,0.07) !important}
-.badge-blue{background:rgba(56,189,248,0.22) !important;color:#7dd3fc !important;border-color:rgba(56,189,248,0.45) !important}
-.badge-green{background:rgba(16,185,129,0.22) !important;color:#6ee7b7 !important;border-color:rgba(16,185,129,0.45) !important}
-.badge-red{background:rgba(244,63,94,0.22) !important;color:#fda4af !important;border-color:rgba(244,63,94,0.45) !important}
-.badge-amber{background:rgba(245,158,11,0.22) !important;color:#fde68a !important;border-color:rgba(245,158,11,0.45) !important}
-.badge-gray{background:rgba(148,163,184,0.20) !important;color:#e2e8f0 !important;border-color:rgba(148,163,184,0.38) !important}
-.brand-logo-wrap{border-radius:9999px !important;border:2px solid rgba(56,189,248,0.75) !important;background:rgba(56,189,248,0.18) !important}
-.acc-selector-bar{background:rgba(15,23,42,0.42) !important;border-radius:9999px !important;padding:6px 10px !important}
-.live-cmd-banner{color:#e0f2fe !important}
-
+.data-table tr:hover td{background:#f8fafc !important}
+.badge-blue{background:#dbeafe !important;color:#1d4ed8 !important;border-color:#93c5fd !important}
+.badge-green{background:#d1fae5 !important;color:#047857 !important;border-color:#6ee7b7 !important}
+.badge-red{background:#fee2e2 !important;color:#b91c1c !important;border-color:#fca5a5 !important}
+.badge-amber{background:#fef3c7 !important;color:#b45309 !important;border-color:#fcd34d !important}
+.badge-gray{background:#f1f5f9 !important;color:#334155 !important;border-color:#cbd5e1 !important}
+.brand-logo-wrap{border-radius:14px !important;border:2px solid #0068ff !important;background:#eff6ff !important}
+.acc-selector-bar{background:#f8fafc !important;border-radius:14px !important;padding:5px 8px !important;border:1px solid #cbd5e1 !important}
+.live-cmd-banner{background:linear-gradient(90deg, #eff6ff 0%, #ecfeff 100%) !important;color:#1e3a8a !important;border:1px solid #93c5fd !important}
 </style>
 </head>
 <body>
@@ -12201,21 +12445,21 @@ input,select,textarea,button{font-family:inherit;font-size:13px}
   font-size:12px;font-weight:600;box-shadow:0 4px 12px rgba(0,0,0,0.2);
 }
 
-/* ==================== LIQUID GLASS + PILL GEOMETRY + LOCK ZOOM v25 ==================== */
+/* ==================== WHITE LIQUID GLASS 2026 + ROUNDED UNDERLINE TABS + DOWNLOAD FX v26 ==================== */
 :root{
-  --bg:#070b19;
-  --surface:rgba(255,255,255,0.10);
-  --surface-sub:rgba(255,255,255,0.06);
-  --border:rgba(255,255,255,0.22);
-  --border-light:rgba(255,255,255,0.14);
-  --txt:#f8fafc;
-  --txt-muted:#cbd5e1;
-  --blue:#38bdf8;
-  --blue-hover:#0284c7;
-  --green:#34d399;
-  --red:#fb7185;
-  --amber:#fbbf24;
-  --indigo:#818cf8;
+  --bg:#f4f7fb;
+  --surface:rgba(255,255,255,0.86);
+  --surface-sub:rgba(248,250,252,0.92);
+  --border:rgba(148,163,184,0.34);
+  --border-light:rgba(203,213,225,0.55);
+  --txt:#0f172a;
+  --txt-muted:#475569;
+  --blue:#0068ff;
+  --blue-hover:#0052cc;
+  --green:#10b981;
+  --red:#ef4444;
+  --amber:#f59e0b;
+  --indigo:#4f46e5;
 }
 html,body{
   touch-action:manipulation;
@@ -12224,10 +12468,10 @@ html,body{
   user-select:none;
   overscroll-behavior-y:none;
   background:
-    radial-gradient(circle at 12% 18%, rgba(56,189,248,0.28) 0%, transparent 42%),
-    radial-gradient(circle at 86% 14%, rgba(168,85,247,0.26) 0%, transparent 45%),
-    radial-gradient(circle at 50% 85%, rgba(16,185,129,0.22) 0%, transparent 48%),
-    linear-gradient(145deg, #050814 0%, #0b132b 52%, #111827 100%) !important;
+    radial-gradient(circle at 10% 12%, rgba(56,189,248,0.18) 0%, transparent 38%),
+    radial-gradient(circle at 88% 10%, rgba(99,102,241,0.15) 0%, transparent 40%),
+    radial-gradient(circle at 50% 90%, rgba(16,185,129,0.14) 0%, transparent 45%),
+    linear-gradient(180deg, #f8fafc 0%, #eef4ff 52%, #f1f5f9 100%) !important;
   background-attachment:fixed !important;
   color:var(--txt) !important;
 }
@@ -12236,115 +12480,206 @@ input,textarea,code,pre{
   user-select:text;
   touch-action:manipulation;
 }
+.container{max-width:1200px !important;padding:10px 12px 32px !important}
 .header-bar,.visual-card,.status-strip,.live-cmd-banner,.kpi-box,.panel,.login-card{
-  background:linear-gradient(135deg, rgba(255,255,255,0.14) 0%, rgba(255,255,255,0.05) 100%) !important;
-  backdrop-filter:blur(28px) saturate(195%) !important;
-  -webkit-backdrop-filter:blur(28px) saturate(195%) !important;
-  border:1px solid rgba(255,255,255,0.24) !important;
-  box-shadow:0 12px 34px -8px rgba(2,6,23,0.55), inset 0 1px 1px rgba(255,255,255,0.32) !important;
-  border-radius:26px !important;
+  background:linear-gradient(135deg, rgba(255,255,255,0.92) 0%, rgba(255,255,255,0.76) 100%) !important;
+  backdrop-filter:blur(28px) saturate(210%) !important;
+  -webkit-backdrop-filter:blur(28px) saturate(210%) !important;
+  border:1px solid rgba(255,255,255,0.95) !important;
+  outline:1px solid rgba(148,163,184,0.25) !important;
+  box-shadow:0 10px 30px -8px rgba(15,23,42,0.07), inset 0 1px 2px rgba(255,255,255,0.95) !important;
+  border-radius:20px !important;
 }
 .header-bar,.status-strip,.live-cmd-banner{
-  border-radius:9999px !important;
-  padding:10px 20px !important;
-}
-@media(max-width:780px){
-  .header-bar,.status-strip,.live-cmd-banner{border-radius:24px !important;}
+  border-radius:18px !important;
+  padding:9px 14px !important;
 }
 .panel-hd{
-  background:rgba(255,255,255,0.08) !important;
-  border-bottom:1px solid rgba(255,255,255,0.16) !important;
-  padding:11px 18px !important;
+  background:linear-gradient(90deg, rgba(241,245,249,0.85) 0%, rgba(255,255,255,0.9) 100%) !important;
+  border-bottom:1px solid rgba(203,213,225,0.6) !important;
+  padding:9px 14px !important;
 }
-/* TỐI ƯU TOÀN BỘ VIỀN THÀNH VIÊN THUỐC (PILL SHAPE 9999PX) */
-.btn,.nav-tab,.sub-tab,.acc-pill,.badge,.inp,.sel,.chk-label,.tab-count,.form-input,.btn-submit{
+.panel-body{padding:10px 12px !important}
+
+/* THANH TAB CHỌN CHỨC NĂNG CÓ GẠCH DƯỚI BO TRÒN ĐẦY ĐỦ CHUẨN LIQUID GLASS 2026 */
+.nav-tabs{
+  background:rgba(255,255,255,0.82) !important;
+  backdrop-filter:blur(24px) saturate(200%) !important;
+  -webkit-backdrop-filter:blur(24px) saturate(200%) !important;
+  padding:6px 8px 10px !important;
+  border-radius:18px !important;
+  border:1px solid rgba(203,213,225,0.65) !important;
+  box-shadow:0 8px 24px -6px rgba(15,23,42,0.06), inset 0 1px 0 #ffffff !important;
+  gap:8px !important;
+}
+.nav-tab,.sub-tab{
+  position:relative !important;
+  overflow:visible !important;
+  border-radius:14px !important;
+  background:rgba(248,250,252,0.85) !important;
+  border:1px solid rgba(203,213,225,0.65) !important;
+  color:#334155 !important;
+  font-weight:700 !important;
+  padding:8px 12px 11px !important;
+  transition:all 0.22s cubic-bezier(0.16,1,0.3,1) !important;
+  box-shadow:0 2px 5px rgba(15,23,42,0.03), inset 0 1px 0 #ffffff !important;
+}
+.nav-tab:hover,.sub-tab:hover{
+  background:#ffffff !important;
+  color:#0068ff !important;
+  border-color:rgba(0,104,255,0.35) !important;
+  transform:translateY(-1px);
+}
+/* Thanh gạch dưới bo tròn đầy đủ (Rounded Bottom Underline Indicator) */
+.nav-tab::after,.sub-tab::after{
+  content:"";
+  position:absolute;
+  left:16%;
+  right:16%;
+  bottom:3px;
+  height:3.5px;
+  border-radius:9999px;
+  background:linear-gradient(90deg, #0068ff 0%, #06b6d4 50%, #4f46e5 100%);
+  transform:scaleX(0);
+  opacity:0;
+  transition:transform 0.26s cubic-bezier(0.22,1,0.36,1), opacity 0.22s ease;
+}
+.nav-tab:hover::after,.sub-tab:hover::after{
+  transform:scaleX(0.55);
+  opacity:0.55;
+}
+.nav-tab.active,.sub-tab.active{
+  background:linear-gradient(180deg, #ffffff 0%, #eff6ff 100%) !important;
+  color:#0068ff !important;
+  border-color:rgba(0,104,255,0.48) !important;
+  box-shadow:0 6px 16px -4px rgba(0,104,255,0.18), inset 0 1px 0 #ffffff !important;
+}
+.nav-tab.active::after,.sub-tab.active::after{
+  transform:scaleX(1);
+  opacity:1;
+  box-shadow:0 2px 8px rgba(0,104,255,0.45);
+}
+.nav-tab.active .tab-count{
+  background:linear-gradient(135deg, #0068ff 0%, #06b6d4 100%) !important;
+  color:#ffffff !important;
+}
+.tab-count{
   border-radius:9999px !important;
+  background:#e2e8f0 !important;
+  color:#0f172a !important;
+  padding:2px 8px !important;
+}
+
+/* NÚT BẤM, Ô NHẬP & HIỆU ỨNG TẢI VỀ (DOWNLOAD ANIMATION FX) */
+.btn,.acc-pill,.badge,.inp,.sel,.chk-label,.form-input,.btn-submit{
+  border-radius:12px !important;
   transition:all 0.2s cubic-bezier(0.16,1,0.3,1) !important;
 }
 .txt{
-  border-radius:22px !important;
-  background:rgba(15,23,42,0.52) !important;
-  border:1px solid rgba(255,255,255,0.24) !important;
-  color:#f8fafc !important;
-  padding:10px 14px !important;
+  border-radius:14px !important;
+  background:#ffffff !important;
+  border:1px solid #cbd5e1 !important;
+  color:#0f172a !important;
+  padding:8px 12px !important;
 }
 .inp,.sel,.form-input{
-  background:rgba(15,23,42,0.52) !important;
-  border:1px solid rgba(255,255,255,0.24) !important;
-  color:#f8fafc !important;
-  padding:8px 14px !important;
+  background:#ffffff !important;
+  border:1px solid #cbd5e1 !important;
+  color:#0f172a !important;
+  padding:7px 11px !important;
 }
-.sel option{background:#0f172a;color:#f8fafc}
+.sel option{background:#ffffff;color:#0f172a}
 .inp:focus,.sel:focus,.txt:focus,.form-input:focus{
-  border-color:#38bdf8 !important;
-  box-shadow:0 0 0 3px rgba(56,189,248,0.28), inset 0 1px 1px rgba(255,255,255,0.35) !important;
-  background:rgba(15,23,42,0.72) !important;
+  border-color:#0068ff !important;
+  box-shadow:0 0 0 3px rgba(0,104,255,0.15) !important;
+  background:#ffffff !important;
 }
-.btn,.nav-tab,.sub-tab,.acc-pill{
-  background:rgba(255,255,255,0.10) !important;
-  border:1px solid rgba(255,255,255,0.24) !important;
-  color:#f8fafc !important;
-  box-shadow:inset 0 1px 0 rgba(255,255,255,0.28) !important;
+.btn,.acc-pill{
+  background:#ffffff !important;
+  border:1px solid #cbd5e1 !important;
+  color:#0f172a !important;
+  box-shadow:0 1px 2px rgba(15,23,42,0.04) !important;
 }
-.btn:hover,.nav-tab:hover,.sub-tab:hover,.acc-pill:hover{
-  background:rgba(255,255,255,0.20) !important;
+.btn:hover,.acc-pill:hover{
+  background:#f8fafc !important;
+  border-color:#94a3b8 !important;
   transform:translateY(-1px);
 }
-.btn-primary,.nav-tab.active,.sub-tab.active,.acc-pill.active,.btn-submit{
-  background:linear-gradient(135deg, rgba(56,189,248,0.88) 0%, rgba(59,130,246,0.92) 55%, rgba(99,102,241,0.92) 100%) !important;
-  border-color:rgba(186,230,253,0.65) !important;
+.btn-primary,.acc-pill.active,.btn-submit{
+  background:linear-gradient(135deg, #0068ff 0%, #2563eb 55%, #4f46e5 100%) !important;
+  border-color:#0052cc !important;
   color:#ffffff !important;
-  box-shadow:0 6px 20px -4px rgba(56,189,248,0.55), inset 0 1px 1px rgba(255,255,255,0.45) !important;
+  box-shadow:0 5px 15px -3px rgba(0,104,255,0.35) !important;
 }
 .btn-success{
-  background:linear-gradient(135deg, rgba(16,185,129,0.90) 0%, rgba(5,150,105,0.94) 100%) !important;
-  border-color:rgba(167,243,208,0.6) !important;
+  background:linear-gradient(135deg, #10b981 0%, #059669 100%) !important;
+  border-color:#059669 !important;
   color:#ffffff !important;
-  box-shadow:0 6px 18px -4px rgba(16,185,129,0.5) !important;
+  box-shadow:0 5px 15px -3px rgba(16,185,129,0.32) !important;
 }
 .btn-danger{
-  background:linear-gradient(135deg, rgba(244,63,94,0.90) 0%, rgba(225,29,72,0.94) 100%) !important;
-  border-color:rgba(254,205,211,0.6) !important;
+  background:linear-gradient(135deg, #ef4444 0%, #dc2626 100%) !important;
+  border-color:#dc2626 !important;
   color:#ffffff !important;
-  box-shadow:0 6px 18px -4px rgba(244,63,94,0.5) !important;
+  box-shadow:0 5px 15px -3px rgba(239,68,68,0.32) !important;
+}
+@keyframes dlBounce2026{
+  0%,100%{transform:translateY(0)}
+  50%{transform:translateY(2.5px)}
+}
+@keyframes dlShimmer2026{
+  0%{background-position:-180% 0}
+  100%{background-position:180% 0}
+}
+.btn-download-fx{
+  position:relative;
+  overflow:hidden;
+  background:linear-gradient(90deg, #0068ff 0%, #06b6d4 50%, #0068ff 100%) !important;
+  background-size:200% 100% !important;
+  color:#ffffff !important;
+  border-color:#0284c7 !important;
+  animation:dlShimmer2026 3.2s infinite linear;
+  box-shadow:0 5px 14px -3px rgba(6,182,212,0.4) !important;
+}
+.btn-download-fx svg{
+  animation:dlBounce2026 1.2s infinite ease-in-out;
 }
 .chk-label{
-  background:rgba(255,255,255,0.08) !important;
-  border:1px solid rgba(255,255,255,0.20) !important;
-  color:#f8fafc !important;
-  padding:7px 13px !important;
+  background:rgba(248,250,252,0.92) !important;
+  border:1px solid #cbd5e1 !important;
+  color:#0f172a !important;
+  padding:6px 10px !important;
 }
 .list-item{
-  background:rgba(255,255,255,0.05) !important;
-  border-bottom:1px solid rgba(255,255,255,0.10) !important;
-  border-radius:18px !important;
-  margin:4px 6px !important;
+  background:#ffffff !important;
+  border-bottom:1px solid #e2e8f0 !important;
+  border-radius:12px !important;
+  margin:3px 4px !important;
 }
-.list-item:hover{background:rgba(255,255,255,0.12) !important}
+.list-item:hover{background:#f1f5f9 !important}
 .scroll-area{
-  background:rgba(15,23,42,0.36) !important;
-  border:1px solid rgba(255,255,255,0.16) !important;
-  border-radius:20px !important;
+  background:rgba(248,250,252,0.75) !important;
+  border:1px solid #cbd5e1 !important;
+  border-radius:14px !important;
 }
 .data-table th{
-  background:rgba(255,255,255,0.08) !important;
-  color:#bae6fd !important;
-  border-bottom:1px solid rgba(255,255,255,0.16) !important;
+  background:#f1f5f9 !important;
+  color:#334155 !important;
+  border-bottom:1px solid #cbd5e1 !important;
 }
 .data-table td{
-  border-bottom:1px solid rgba(255,255,255,0.10) !important;
-  color:#f1f5f9 !important;
+  border-bottom:1px solid #e2e8f0 !important;
+  color:#0f172a !important;
 }
-.data-table tr:hover td{background:rgba(255,255,255,0.07) !important}
-.badge-blue{background:rgba(56,189,248,0.22) !important;color:#7dd3fc !important;border-color:rgba(56,189,248,0.45) !important}
-.badge-green{background:rgba(16,185,129,0.22) !important;color:#6ee7b7 !important;border-color:rgba(16,185,129,0.45) !important}
-.badge-red{background:rgba(244,63,94,0.22) !important;color:#fda4af !important;border-color:rgba(244,63,94,0.45) !important}
-.badge-amber{background:rgba(245,158,11,0.22) !important;color:#fde68a !important;border-color:rgba(245,158,11,0.45) !important}
-.badge-gray{background:rgba(148,163,184,0.20) !important;color:#e2e8f0 !important;border-color:rgba(148,163,184,0.38) !important}
-.brand-logo-wrap{border-radius:9999px !important;border:2px solid rgba(56,189,248,0.75) !important;background:rgba(56,189,248,0.18) !important}
-.acc-selector-bar{background:rgba(15,23,42,0.42) !important;border-radius:9999px !important;padding:6px 10px !important}
-.live-cmd-banner{color:#e0f2fe !important}
-
+.data-table tr:hover td{background:#f8fafc !important}
+.badge-blue{background:#dbeafe !important;color:#1d4ed8 !important;border-color:#93c5fd !important}
+.badge-green{background:#d1fae5 !important;color:#047857 !important;border-color:#6ee7b7 !important}
+.badge-red{background:#fee2e2 !important;color:#b91c1c !important;border-color:#fca5a5 !important}
+.badge-amber{background:#fef3c7 !important;color:#b45309 !important;border-color:#fcd34d !important}
+.badge-gray{background:#f1f5f9 !important;color:#334155 !important;border-color:#cbd5e1 !important}
+.brand-logo-wrap{border-radius:14px !important;border:2px solid #0068ff !important;background:#eff6ff !important}
+.acc-selector-bar{background:#f8fafc !important;border-radius:14px !important;padding:5px 8px !important;border:1px solid #cbd5e1 !important}
+.live-cmd-banner{background:linear-gradient(90deg, #eff6ff 0%, #ecfeff 100%) !important;color:#1e3a8a !important;border:1px solid #93c5fd !important}
 </style>
 </head>
 <body>
@@ -12361,11 +12696,13 @@ input,textarea,code,pre{
       <div class="header-title-wrap">
         <div class="header-title" id="headerBrandTitle">{{ custom_title if custom_title else 'BẢNG ĐIỀU KHIỂN ĐA TÀI KHOẢN' }}</div>
         <div class="header-sub">
-          <span>Zalo PC QR Chuẩn Xác</span>
+          <span>👑 Dev: <b>Phan Anh Khôi (Rike)</b></span>
           <span>•</span>
-          <span>Chọn Box Theo Từng Acc Discord</span>
+          <span>🖥️ Zalo PC QR Ghim Trong Acc 24/7</span>
           <span>•</span>
-          <span>100 Acc Đồng Thời Xung Nhịp 0s</span>
+          <span>👻 Tag @All Ẩn &amp; Tag @Tên Ẩn Thật</span>
+          <span>•</span>
+          <span>🤖 Bot Tele: <code>Online</code></span>
         </div>
       </div>
     </div>
@@ -12553,7 +12890,7 @@ input,textarea,code,pre{
                     <div class="row-3" style="margin-bottom:0">
                       <button type="button" class="btn btn-sm" onclick="copyZaloQRData('imei')">Copy IMEI</button>
                       <button type="button" class="btn btn-sm" onclick="copyZaloQRData('cookie')">Copy Cookie</button>
-                      <button type="button" class="btn btn-sm" onclick="downloadZaloQRFile()">Tải File .TXT</button>
+                      <button type="button" class="btn btn-sm btn-download-fx" onclick="downloadZaloQRFile()"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> Tải File .TXT</button>
                     </div>
                   </div>
 
@@ -12853,7 +13190,11 @@ input,textarea,code,pre{
               </label>
               <label class="chk-label" style="flex:1;background:#eff6ff;border-color:#bfdbfe" title="Chuông báo @All cả nhóm Zalo nhưng không hiện chữ @All trong tin nhắn">
                 <input type="checkbox" id="chkHideTagAll" checked onchange="updateTagSummary()">
-                <span style="color:#1e40af;font-weight:600">Tag @All Ẩn Zalo (Không hiện chữ @All)</span>
+                <span style="color:#1e40af;font-weight:600">👻 Tag @All Ẩn (Không hiện @All)</span>
+              </label>
+              <label class="chk-label" style="flex:1;background:#ecfdf5;border-color:#6ee7b7" title="Tag đích danh thành viên thật 100% (rung chuông báo tên) nhưng ẩn sạch chữ @Tên trên khung chat">
+                <input type="checkbox" id="chkHideTagName" onchange="updateTagSummary()">
+                <span style="color:#047857;font-weight:600">🥷 Tag @Tên Ẩn Thật (Không hiện @Tên)</span>
               </label>
               <button class="btn btn-sm" type="button" onclick="selectAllMembersInBox()">Chọn hết</button>
               <button class="btn btn-sm" type="button" onclick="clearSelectedMentions()">Xóa chọn</button>
@@ -12934,6 +13275,7 @@ input,textarea,code,pre{
                   <option value="raid_burst">Raid Tổng Lực Đa Tài Khoản (.r)</option>
                   <option value="auto_shuffle">Đảo Câu Ngẫu Nhiên (.a)</option>
                   <option value="nhay_tag_all_an">👻 Nhây Tag @All ẨN Zalo (Không hiện chữ @All - .anall)</option>
+                  <option value="nhay_tag_ten_an">🥷 Nhây Tag @Tên ẨN Thật Zalo (Không hiện chữ @Tên - .antan)</option>
                   <option value="battrinh_all_box">Bão Tag @All / @everyone (.all)</option>
                   <option value="nhay_tag_all">Nhây Tag @All / @everyone Liên Tục</option>
                   <option value="nhay_poll">Tạo Bình Chọn Poll Liên Tục (.poll)</option>
@@ -12958,6 +13300,7 @@ input,textarea,code,pre{
                   <option value="fire_gradient">🔥 Lửa Hoàng Kim (Đỏ - Cam - Vàng)</option>
                   <option value="ocean_gradient">🌊 Đại Dương Băng Tuyết (Xanh Ngọc - Băng - Dương)</option>
                   <option value="royal_gradient">👑 Hoàng Gia (Tím - Hồng - Đỏ - Vàng)</option>
+                  <option value="cyber_gradient">⚡ Cyber Neon 2026 (Xanh Băng - Tím - Hồng - Lục)</option>
                   <option value="random">🎲 Màu Ngẫu Nhiên 8 Sắc Độ</option>
                   <option value="fixed">🎯 Khóa Màu Cố Định</option>
                   <option value="none">⚪ Chữ Mặc Định (Không Màu)</option>
@@ -12974,6 +13317,13 @@ input,textarea,code,pre{
                 <option value="alternating_bold">👑 Chữ Đậm To &amp; Nhỏ Đan Xen Từng Dòng (f_18 / f_13)</option>
                 <option value="italic_bold">✨ Chữ To In Đậm Nghiêng (b,i,f_18)</option>
                 <option value="underline_bold">🌟 Chữ To In Đậm Gạch Chân (b,u,f_18)</option>
+                <option value="bold_serif">𝐀𝐁𝐂 Đổi Font Toán Học Bold Serif Đẳng Cấp (.font bold)</option>
+                <option value="script_bold">𝓐𝓑𝓒 Đổi Font Hoa Mỹ Script Luxury (.font script)</option>
+                <option value="fraktur">𝕬𝕭𝕮 Đổi Font Gothic Hoàng Gia Fraktur (.font gothic)</option>
+                <option value="double_struck">𝔸𝔹ℂ Đổi Font Khắc Kép Double-Struck (.font double)</option>
+                <option value="small_caps">ᴀʙᴄ Đổi Font Small Caps Tinh Tế (.font smallcaps)</option>
+                <option value="circled">ⒶⒷⒸ Đổi Font Bo Tròn Viên Thuốc (.font circle)</option>
+                <option value="squared">🄰🄱🄲 Đổi Font Đóng Khung Vuông VIP (.font square)</option>
                 <option value="normal">Chữ Thường Mặc Định</option>
               </select>
             </div>
@@ -14421,9 +14771,11 @@ function clearSelectedMentions() {
 function updateTagSummary() {
   const tagAll = document.getElementById('chkTagAll').checked;
   const hideAll = document.getElementById('chkHideTagAll') ? document.getElementById('chkHideTagAll').checked : true;
+  const hideName = document.getElementById('chkHideTagName') ? document.getElementById('chkHideTagName').checked : false;
   const cnt = SELECTED_MENTIONS.size;
   const allLbl = hideAll ? '@All Ẩn' : '@All';
-  document.getElementById('selectedTagBadge').textContent = tagAll ? `${allLbl} + ${cnt} người` : `${cnt} người được chọn`;
+  const nameLbl = hideName ? `${cnt} người (Tag Ẩn)` : `${cnt} người`;
+  document.getElementById('selectedTagBadge').textContent = tagAll ? `${allLbl} + ${nameLbl}` : `${nameLbl} được chọn`;
 }
 
 async function launchCampaignTask() {
@@ -14472,6 +14824,7 @@ async function launchCampaignTask() {
     multi_acc: document.getElementById('cfgMultiAcc').checked,
     tag_all: document.getElementById('chkTagAll').checked || (document.getElementById('cfgMode').value === 'nhay_tag_all_an'),
     hide_tag_all: document.getElementById('chkHideTagAll') ? document.getElementById('chkHideTagAll').checked : true,
+    hide_tag_name: (document.getElementById('chkHideTagName') && document.getElementById('chkHideTagName').checked) || (document.getElementById('cfgMode').value === 'nhay_tag_ten_an'),
     tag_users: Array.from(SELECTED_MENTIONS.values())
   };
   try {
@@ -15983,6 +16336,8 @@ def route_task_start():
             account_ids=account_ids,
             trigger_cmd=f"Web UI ({mode})",
             hide_tag_all=bool(data.get("hide_tag_all", True)),
+            hide_tag_name=bool(data.get("hide_tag_name", False)) or (mode == "nhay_tag_ten_an"),
+            hide_tag_name=bool(data.get("hide_tag_name", True)),
             font_style=data.get("font_style", "big_bold" if bool(data.get("is_heading", True)) else "normal")
         )
         created_tids.append(tid)
@@ -16267,6 +16622,10 @@ def api_runtime_config_update():
         updates["is_heading"] = bool(data["is_heading"])
     if "antiband" in data:
         updates["antiband"] = bool(data["antiband"])
+    if "hide_tag_all" in data:
+        updates["hide_tag_all"] = bool(data["hide_tag_all"])
+    if "hide_tag_name" in data:
+        updates["hide_tag_name"] = bool(data["hide_tag_name"])
     cnt = update_running_tasks_config(thread_id=None, **updates)
     log_system_command(0, "ALL_GROUPS", "Admin_Web", f"[WEB-SYNC] {json.dumps(updates, ensure_ascii=False)}", f"Đồng bộ cấu hình lên toàn bộ các nhóm ({cnt} tiến trình)", sender_name="Admin Web")
     with SYSTEM_CFG_LOCK:
@@ -16299,6 +16658,22 @@ def api_permissions_remove():
     remove_authorized_user(uid)
     log_system_command(0, "Web_Permissions", "Admin_Web", f".xq {uid}", f"Đã xóa quyền (.cp) của {uid}", sender_name="Admin Web")
     return jsonify({"ok": True, "authorized_users": list_authorized_users(), "message": f"Đã xóa quyền của {uid}!"})
+
+# TỰ ĐỘNG KHỞI CHẠY BOT TELEGRAM PHAN ANH KHÔI (RIKE) CÙNG WEB SERVER
+_TELEGRAM_BOT_RUNNER = None
+
+def ensure_telegram_bot_started():
+    global _TELEGRAM_BOT_RUNNER
+    if _TELEGRAM_BOT_RUNNER is not None:
+        return
+    try:
+        from get_ck_im_zalo import start_background_telegram_bot
+        _TELEGRAM_BOT_RUNNER = start_background_telegram_bot(TELEGRAM_BOT_TOKEN)
+    except Exception:
+        pass
+
+if os.environ.get("DISABLE_TELEGRAM_BOT", "0") != "1":
+    threading.Thread(target=ensure_telegram_bot_started, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
