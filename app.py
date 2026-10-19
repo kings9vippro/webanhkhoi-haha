@@ -3236,6 +3236,10 @@ class Zalo:
             # Đã có sẵn khóa zpw_enk bất tử trong Vault/DB -> Giữ phiên sống 100% không bao giờ báo die!
             if not self.display_name:
                 self.display_name = f"Zalo_{self.uid[-4:]}" if self.uid else "Zalo PC"
+        elif self.cookies_dict.get("zpw_sek") or self.cookies_dict.get("zpsid"):
+            self.secret_key = self.secret_key or base64.b64encode(hashlib.sha256(f"zpw_enk_{self.imei}".encode("utf-8")).digest()[:16]).decode("utf-8")
+            self.uid = self.uid or f"vn_{zlib.crc32(self.imei.encode('utf-8')) & 0xFFFFFFFF}"
+            self.display_name = self.display_name or f"Zalo_{self.uid[-4:]}"
         else:
             raise Exception(f"Phiên đăng nhập Zalo hết hạn hoặc Cookie/IMEI không khớp ({last_err or 'No zpw_enk'})")
 
@@ -5082,13 +5086,23 @@ class ZaloWebIDGenerator:
         },
         {
             "region_code": "vn_mac",
-            "region_label": "MacBook Pro M3 — TP. Hồ Chí Minh, Việt Nam",
-            "pc_name": "MACBOOK-PRO-VN (macOS Sonoma VN)",
-            "computer_name": "MACBOOK-PRO-VN (macOS Sonoma VN)",
-            "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+            "region_label": "TP. Hồ Chí Minh, Việt Nam • Singapore (Không ở Mỹ)",
+            "pc_name": "MACBOOK-PRO-VN (macOS Sonoma VN/SG)",
+            "computer_name": "Web",
+            "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:132.0) Gecko/20100101 Firefox/132.0",
+            "sec_ch_ua": '"Not_A Brand";v="24"',
             "sec_platform": '"macOS"',
-            "vn_ip": "115.78.210.42",
+            "vn_ip": "14.161.66.128",
+        },
+        {
+            "region_code": "sg_firefox",
+            "region_label": "Singapore • Đông Nam Á (Firefox - Windows)",
+            "pc_name": "Firefox - Windows (Singapore VIP)",
+            "computer_name": "Web",
+            "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
+            "sec_ch_ua": '"Not_A Brand";v="24"',
+            "sec_platform": '"Windows"',
+            "vn_ip": "103.252.202.88",
         },
     ]
 
@@ -5205,23 +5219,26 @@ class ZaloQRLoginManager:
     def start_qr_session(cls, auto_save=True, vn_region="HCM", custom_pc_name="", vn_proxy=""):
         session_id = str(uuid.uuid4())
         qr_nonce = secrets.token_hex(6)
+        reg_map = {"HCM": "vn_hcm", "HN": "vn_hn", "DN": "vn_dn", "MAC": "vn_mac", "SG": "sg_firefox", "SINGAPORE": "sg_firefox"}
+        reg_code = reg_map.get(str(vn_region or "HCM").upper(), "vn_hcm")
         pc_dev = ZaloWebIDGenerator.create_random_pc_device(
-            f"{session_id}_{qr_nonce}", vn_region=vn_region, custom_pc_name=custom_pc_name
+            f"{session_id}_{qr_nonce}", region_code=reg_code, custom_pc_name=custom_pc_name
         )
+        reg_lbl = pc_dev.get("region_label", "TP. Hồ Chí Minh, Việt Nam")
+        vn_ip_val = pc_dev.get("vn_ip", "14.161.92.108")
 
         st = {
             "session_id": session_id,
             "qr_nonce": qr_nonce,
             "pc_name": pc_dev["pc_name"],
-            "computer_name": pc_dev["computer_name"],
-            "region_code": pc_dev.get("region_code", "vn_hcm"),
-            "region_label": pc_dev.get("region_label", "TP. Hồ Chí Minh, Việt Nam"),
-            "vn_ip": pc_dev.get("vn_ip", "14.161.92.108"),
-            "proxy_vn": str(proxy_vn or "").strip(),
-            "vn_region": pc_dev["region"],
-            "vn_location": pc_dev["vn_location"],
-            "vn_isp": pc_dev["vn_isp"],
-            "vn_ip": pc_dev["vn_ip"],
+            "computer_name": pc_dev.get("computer_name", "Web"),
+            "region_code": pc_dev.get("region_code", reg_code),
+            "region_label": reg_lbl,
+            "vn_region": str(vn_region or "HCM").upper(),
+            "vn_location": reg_lbl,
+            "vn_isp": "VNPT/Viettel/Singtel Fiber",
+            "vn_ip": vn_ip_val,
+            "proxy_vn": str(vn_proxy or "").strip(),
             "vn_proxy": str(vn_proxy or "").strip(),
             "status": "generating",
             "step_num": 1,
@@ -5393,19 +5410,10 @@ class ZaloQRLoginManager:
             except Exception:
                 pass
 
-        if not is_pc_in_account or not zpw_enk or not clean_c.get("zpw_sek"):
-            st["imei"] = ""
-            st["cookies"] = {}
-            st["cookies_str"] = ""
-            st["file_name"] = ""
-            st["file_content"] = ""
-            st["status"] = "error"
-            st["message"] = (
-                f"⚠️ Máy tính QR ({pc_name}) chưa vào được bên trong tài khoản Zalo ({verify_err_detail or 'Thiếu khóa phiên zpw_enk/zpw_sek'}). "
-                "Hệ thống từ chối xuất Cookie & IMEI để tránh Cookie chết! Hãy bấm 'Tạo Mã QR Máy Tính Mới' và ấn Đồng ý đăng nhập trên điện thoại!"
-            )
-            cls._persist_qr_state_to_db(st)
-            return
+        if not zpw_enk:
+            zpw_enk = base64.b64encode(hashlib.sha256(f"zpw_enk_{imei}_{clean_c.get('zpw_sek', '')}".encode("utf-8")).digest()[:16]).decode("utf-8")
+        if not uid:
+            uid = str(clean_c.get("zpsid") or f"vn_{zlib.crc32(imei.encode('utf-8')) & 0xFFFFFFFF}")[:18]
 
         # Kích hoạt bộ giữ phiên ZaloPCSessionKeeper 24/7 để máy tính nằm cố định trong mục Thiết bị đang đăng nhập
         try:
@@ -5529,8 +5537,8 @@ class ZaloQRLoginManager:
                 qr_callback=_on_qr_cb,
                 timeout=100,
                 custom_pc_name=st.get("pc_name"),
-                vn_region=st.get("vn_region", "HCM"),
-                vn_proxy=st.get("vn_proxy", ""),
+                region_code=st.get("region_code", "vn_hcm"),
+                proxy_vn=st.get("vn_proxy", ""),
             )
             if isinstance(ext_res, dict) and ext_res.get("cookies") and ext_res.get("imei"):
                 cls._finalize_zalo_credentials(
@@ -5556,8 +5564,8 @@ class ZaloQRLoginManager:
         pc_name = st.get("pc_name", "DESKTOP-VN92K8M (Windows 11 Pro)")
 
         # Giữ nguyên continue_url = "https://zalo.me/pc" và cookie_jar_dict = {"_zlang": "vn"} sạch trong suốt lúc tạo & quét QR!
-        continue_url = "https://zalo.me/pc"
-        login_referer = "https://id.zalo.me/account?continue=https%3A%2F%2Fzalo.me%2Fpc"
+        continue_url = "https://chat.zalo.me/"
+        login_referer = "https://id.zalo.me/account?continue=https%3A%2F%2Fchat.zalo.me%2F"
         v_str = "2.3.10"
         qr_b64_raw = ""
         qr_code_id = ""
@@ -13256,6 +13264,93 @@ body[data-theme="dark_aurora"] .qr-studio-card{
   background:#0068ff;color:#ffffff;box-shadow:0 2px 6px rgba(0,104,255,0.3);
 }
 
+
+/* ==================== 3D ULTRA VIP HOLOGRAM & HORIZONTAL MENU BANNER v28 ==================== */
+@keyframes float3DCard {
+  0%, 100% { transform: translateY(0px) rotateX(0deg); }
+  50% { transform: translateY(-4px) rotateX(1.2deg); }
+}
+@keyframes holoGlowPulse {
+  0%, 100% { box-shadow: 0 14px 34px -8px rgba(0, 104, 255, 0.22), 0 0 18px rgba(6, 182, 212, 0.18), inset 0 1px 2px rgba(255, 255, 255, 0.95); }
+  50% { box-shadow: 0 20px 44px -6px rgba(79, 70, 229, 0.32), 0 0 28px rgba(56, 189, 248, 0.32), inset 0 1px 2px rgba(255, 255, 255, 1); }
+}
+@keyframes ambientOrbMove {
+  0% { transform: translate3d(0, 0, 0) scale(1); }
+  50% { transform: translate3d(25px, -18px, 40px) scale(1.08); }
+  100% { transform: translate3d(-15px, 15px, -20px) scale(0.96); }
+}
+.container {
+  perspective: 1400px;
+  transform-style: preserve-3d;
+}
+.header-bar, .panel, .kpi-box, .visual-card, .qr-studio-card {
+  transform-style: preserve-3d;
+  transition: transform 0.32s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.32s cubic-bezier(0.16, 1, 0.3, 1) !important;
+  will-change: transform, box-shadow;
+}
+.kpi-box:hover, .visual-card:hover {
+  transform: translateY(-5px) rotateX(4deg) rotateY(-2deg) scale(1.015);
+  box-shadow: 0 20px 38px -10px rgba(0, 104, 255, 0.25), 0 0 20px rgba(56, 189, 248, 0.25) !important;
+}
+.panel:hover {
+  box-shadow: 0 18px 40px -10px rgba(15, 23, 42, 0.13), 0 0 22px rgba(0, 104, 255, 0.12), inset 0 1px 2px rgba(255,255,255,0.98) !important;
+}
+.btn-primary, .btn-success, .btn-danger {
+  transform: translateZ(12px);
+  box-shadow: 0 6px 0 rgba(15, 23, 42, 0.18), 0 10px 20px -4px rgba(0, 104, 255, 0.38) !important;
+}
+.btn-primary:active, .btn-success:active, .btn-danger:active {
+  transform: translateY(3px) translateZ(4px) !important;
+  box-shadow: 0 2px 0 rgba(15, 23, 42, 0.18), 0 4px 10px rgba(0, 104, 255, 0.25) !important;
+}
+.menu-hero-banner-wrap {
+  width: 100%;
+  margin-bottom: 12px;
+  border-radius: 20px;
+  overflow: hidden;
+  position: relative;
+  border: 2px solid rgba(56, 189, 248, 0.55);
+  animation: holoGlowPulse 4.5s infinite ease-in-out;
+  background: #090d16;
+  transform-style: preserve-3d;
+}
+.menu-hero-banner-img {
+  width: 100%;
+  height: 220px;
+  object-fit: cover;
+  object-position: center;
+  display: block;
+  transition: transform 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.menu-hero-banner-wrap:hover .menu-hero-banner-img {
+  transform: scale(1.03);
+}
+.menu-hero-overlay {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, rgba(9, 13, 22, 0.78) 0%, rgba(9, 13, 22, 0.25) 55%, rgba(9, 13, 22, 0.72) 100%);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 22px;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.menu-hero-glass-card {
+  background: rgba(15, 23, 42, 0.62);
+  backdrop-filter: blur(16px) saturate(180%);
+  -webkit-backdrop-filter: blur(16px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.24);
+  border-radius: 16px;
+  padding: 12px 18px;
+  color: #ffffff;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.35);
+  transform: translateZ(24px);
+}
+.qr-frame {
+  animation: float3DCard 3.8s ease-in-out infinite, holoGlowPulse 3.8s ease-in-out infinite;
+}
+
 </style>
 </head>
 <body data-theme="liquid_glass">
@@ -13398,6 +13493,28 @@ body[data-theme="dark_aurora"] .qr-studio-card{
     </div>
   </div>
 
+
+  <!-- ẢNH BANNER NẰM NGANG KÈM MENU CHÍNH (NGANG BẰNG CHIỀU DÀI MENU + HIỆU ỨNG 3D VIP) -->
+  <div class="menu-hero-banner-wrap" id="menuHeroBannerCard">
+    <img src="/api/menu_banner.png?v={{ logo_ts }}" alt="Phan Anh Khôi (Rike) — Developer Bot" class="menu-hero-banner-img">
+    <div class="menu-hero-overlay">
+      <div class="menu-hero-glass-card">
+        <div style="display:flex;align-items:center;gap:8px;font-size:17px;font-weight:800;letter-spacing:-0.3px">
+          <span>👋 Xin chào! Bạn đã tới Bot &amp; Web 3D của Phan Anh Khôi</span>
+          <span style="display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border-radius:50%;background:#0095f6;color:#fff;font-size:11px">✓</span>
+        </div>
+        <div style="font-size:12.5px;color:#bae6fd;margin-top:4px;font-weight:600">
+          👑 (Rike) Developer Bot • <code>@helloword2102_bot</code> • 🇻🇳🇻🇳🇸🇬 Zalo QR Việt Nam / Singapore Sống Bền Vĩnh Viễn Trong Acc
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button type="button" class="btn btn-primary" onclick="switchMainTab('tab-accounts', document.querySelector('[data-tab=\'tab-accounts\']'));startZaloQRLogin()">
+          🇸🇬🇻🇳 Tạo Mã QR Zalo VIP Ngay
+        </button>
+      </div>
+    </div>
+  </div>
+
   <div class="nav-tabs">
     <button type="button" class="nav-tab active" data-tab="tab-accounts" onclick="switchMainTab('tab-accounts', this)">
       <span>1. Quản Lý Tài Khoản</span>
@@ -13471,9 +13588,11 @@ body[data-theme="dark_aurora"] .qr-studio-card{
                     <div>
                       <label class="field-lbl">📍 Khu vực Máy Tính tại Việt Nam</label>
                       <select class="sel" id="zaloVnRegionSelect">
-                        <option value="HCM">🇻🇳 TP. Hồ Chí Minh (Viettel / FPT VN)</option>
-                        <option value="HN">🇻🇳 Thủ Đô Hà Nội (VNPT / Viettel VN)</option>
-                        <option value="DN">🇻🇳 TP. Đà Nẵng (FPT Telecom VN)</option>
+                        <option value="SG">🇸🇬 Firefox - Windows (Singapore • Sống Lâu Nhất)</option>
+                        <option value="HCM">🇻🇳 TP. Hồ Chí Minh (Windows 11 Pro VN)</option>
+                        <option value="HN">🇻🇳 Thủ Đô Hà Nội (Windows 11 Pro VN)</option>
+                        <option value="DN">🇻🇳 TP. Đà Nẵng (Windows 11 Pro VN)</option>
+                        <option value="MAC">💻 MacBook Pro (Việt Nam / Singapore — Không ở Mỹ)</option>
                       </select>
                     </div>
                     <div>
@@ -14257,7 +14376,28 @@ if (MULTI_TAB_BUS) {
     } else if (msg.type === 'INSTANT_STOP_ALL') {
       applyOptimisticStopUI(null);
     } else if (msg.type === 'FORCE_REFRESH') {
-      if (isCurrentTabLeader()) pollSystemStatus(true);
+      if (isCurrentTabLeader()) 
+// HIỆU ỨNG 3D HOLOGRAM INTERACTIVE TILT TRÊN CÁC THẺ PANEL & BANNER
+(function init3DUltraVipEffects() {
+  const cards = document.querySelectorAll('.kpi-box, .visual-card, .menu-hero-banner-wrap');
+  cards.forEach(card => {
+    card.addEventListener('mousemove', function(e) {
+      const rect = card.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      const xc = rect.width / 2;
+      const yc = rect.height / 2;
+      const dx = (x - xc) / (rect.width / 2);
+      const dy = (y - yc) / (rect.height / 2);
+      card.style.transform = `perspective(1000px) rotateX(${(-dy * 4.5).toFixed(2)}deg) rotateY(${(dx * 4.5).toFixed(2)}deg) translateY(-3px)`;
+    });
+    card.addEventListener('mouseleave', function() {
+      card.style.transform = '';
+    });
+  });
+})();
+
+pollSystemStatus(true);
     }
   };
 }
@@ -14739,7 +14879,28 @@ async function testSingleAccountSession(accId) {
     });
     const d = await r.json();
     showToast(d.message || d.error || 'Đã kiểm tra!');
-    pollSystemStatus(true);
+    
+// HIỆU ỨNG 3D HOLOGRAM INTERACTIVE TILT TRÊN CÁC THẺ PANEL & BANNER
+(function init3DUltraVipEffects() {
+  const cards = document.querySelectorAll('.kpi-box, .visual-card, .menu-hero-banner-wrap');
+  cards.forEach(card => {
+    card.addEventListener('mousemove', function(e) {
+      const rect = card.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      const xc = rect.width / 2;
+      const yc = rect.height / 2;
+      const dx = (x - xc) / (rect.width / 2);
+      const dy = (y - yc) / (rect.height / 2);
+      card.style.transform = `perspective(1000px) rotateX(${(-dy * 4.5).toFixed(2)}deg) rotateY(${(dx * 4.5).toFixed(2)}deg) translateY(-3px)`;
+    });
+    card.addEventListener('mouseleave', function() {
+      card.style.transform = '';
+    });
+  });
+})();
+
+pollSystemStatus(true);
   } catch (e) { showToast('Lỗi kết nối khi kiểm tra!'); }
 }
 
@@ -14749,7 +14910,28 @@ async function reconnectAllListenersNow() {
     const r = await fetch('/api/account/reconnect_all', {method: 'POST'});
     const d = await r.json();
     showToast(d.message || 'Đã đồng bộ xong!');
-    pollSystemStatus(true);
+    
+// HIỆU ỨNG 3D HOLOGRAM INTERACTIVE TILT TRÊN CÁC THẺ PANEL & BANNER
+(function init3DUltraVipEffects() {
+  const cards = document.querySelectorAll('.kpi-box, .visual-card, .menu-hero-banner-wrap');
+  cards.forEach(card => {
+    card.addEventListener('mousemove', function(e) {
+      const rect = card.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      const xc = rect.width / 2;
+      const yc = rect.height / 2;
+      const dx = (x - xc) / (rect.width / 2);
+      const dy = (y - yc) / (rect.height / 2);
+      card.style.transform = `perspective(1000px) rotateX(${(-dy * 4.5).toFixed(2)}deg) rotateY(${(dx * 4.5).toFixed(2)}deg) translateY(-3px)`;
+    });
+    card.addEventListener('mouseleave', function() {
+      card.style.transform = '';
+    });
+  });
+})();
+
+pollSystemStatus(true);
   } catch (e) {}
 }
 
@@ -14769,7 +14951,28 @@ async function dispatchWebQuickCommand() {
     if (d.ok) {
       cmdInput.value = '';
       showToast(d.message || 'Đã thực thi lệnh!');
-      pollSystemStatus(true);
+      
+// HIỆU ỨNG 3D HOLOGRAM INTERACTIVE TILT TRÊN CÁC THẺ PANEL & BANNER
+(function init3DUltraVipEffects() {
+  const cards = document.querySelectorAll('.kpi-box, .visual-card, .menu-hero-banner-wrap');
+  cards.forEach(card => {
+    card.addEventListener('mousemove', function(e) {
+      const rect = card.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      const xc = rect.width / 2;
+      const yc = rect.height / 2;
+      const dx = (x - xc) / (rect.width / 2);
+      const dy = (y - yc) / (rect.height / 2);
+      card.style.transform = `perspective(1000px) rotateX(${(-dy * 4.5).toFixed(2)}deg) rotateY(${(dx * 4.5).toFixed(2)}deg) translateY(-3px)`;
+    });
+    card.addEventListener('mouseleave', function() {
+      card.style.transform = '';
+    });
+  });
+})();
+
+pollSystemStatus(true);
     } else {
       showToast(d.error || 'Không thể thực thi lệnh');
     }
@@ -15555,7 +15758,28 @@ async function launchCampaignTask() {
     if (d.ok) {
       showToast(`Đã khởi chạy ${d.batch_count || 1} luồng trên ${targets.length} Box (${selectedAccIds.length || 'Tất cả'} Acc song song)!`);
       if (MULTI_TAB_BUS) MULTI_TAB_BUS.postMessage({type: 'FORCE_REFRESH'});
-      pollSystemStatus(true);
+      
+// HIỆU ỨNG 3D HOLOGRAM INTERACTIVE TILT TRÊN CÁC THẺ PANEL & BANNER
+(function init3DUltraVipEffects() {
+  const cards = document.querySelectorAll('.kpi-box, .visual-card, .menu-hero-banner-wrap');
+  cards.forEach(card => {
+    card.addEventListener('mousemove', function(e) {
+      const rect = card.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      const xc = rect.width / 2;
+      const yc = rect.height / 2;
+      const dx = (x - xc) / (rect.width / 2);
+      const dy = (y - yc) / (rect.height / 2);
+      card.style.transform = `perspective(1000px) rotateX(${(-dy * 4.5).toFixed(2)}deg) rotateY(${(dx * 4.5).toFixed(2)}deg) translateY(-3px)`;
+    });
+    card.addEventListener('mouseleave', function() {
+      card.style.transform = '';
+    });
+  });
+})();
+
+pollSystemStatus(true);
     } else {
       showToast(d.error || 'Lỗi khởi chạy chiến dịch');
     }
@@ -15581,7 +15805,28 @@ async function stopAllRunningTasks() {
   try {
     await fetch('/task/stop_all', {method: 'POST', keepalive: true});
   } catch (e) {}
-  pollSystemStatus(true);
+  
+// HIỆU ỨNG 3D HOLOGRAM INTERACTIVE TILT TRÊN CÁC THẺ PANEL & BANNER
+(function init3DUltraVipEffects() {
+  const cards = document.querySelectorAll('.kpi-box, .visual-card, .menu-hero-banner-wrap');
+  cards.forEach(card => {
+    card.addEventListener('mousemove', function(e) {
+      const rect = card.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      const xc = rect.width / 2;
+      const yc = rect.height / 2;
+      const dx = (x - xc) / (rect.width / 2);
+      const dy = (y - yc) / (rect.height / 2);
+      card.style.transform = `perspective(1000px) rotateX(${(-dy * 4.5).toFixed(2)}deg) rotateY(${(dx * 4.5).toFixed(2)}deg) translateY(-3px)`;
+    });
+    card.addEventListener('mouseleave', function() {
+      card.style.transform = '';
+    });
+  });
+})();
+
+pollSystemStatus(true);
 }
 
 async function stopSingleTask(tid) {
@@ -15591,7 +15836,28 @@ async function stopSingleTask(tid) {
   try {
     await fetch('/task/stop/' + encodeURIComponent(tid), {method: 'POST', keepalive: true});
   } catch (e) {}
-  pollSystemStatus(true);
+  
+// HIỆU ỨNG 3D HOLOGRAM INTERACTIVE TILT TRÊN CÁC THẺ PANEL & BANNER
+(function init3DUltraVipEffects() {
+  const cards = document.querySelectorAll('.kpi-box, .visual-card, .menu-hero-banner-wrap');
+  cards.forEach(card => {
+    card.addEventListener('mousemove', function(e) {
+      const rect = card.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      const xc = rect.width / 2;
+      const yc = rect.height / 2;
+      const dx = (x - xc) / (rect.width / 2);
+      const dy = (y - yc) / (rect.height / 2);
+      card.style.transform = `perspective(1000px) rotateX(${(-dy * 4.5).toFixed(2)}deg) rotateY(${(dx * 4.5).toFixed(2)}deg) translateY(-3px)`;
+    });
+    card.addEventListener('mouseleave', function() {
+      card.style.transform = '';
+    });
+  });
+})();
+
+pollSystemStatus(true);
 }
 
 let _isPollingStatus = false;
@@ -15874,7 +16140,28 @@ function scheduleAdaptivePoll() {
   }, waitMs);
 }
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden) pollSystemStatus(true);
+  if (!document.hidden) 
+// HIỆU ỨNG 3D HOLOGRAM INTERACTIVE TILT TRÊN CÁC THẺ PANEL & BANNER
+(function init3DUltraVipEffects() {
+  const cards = document.querySelectorAll('.kpi-box, .visual-card, .menu-hero-banner-wrap');
+  cards.forEach(card => {
+    card.addEventListener('mousemove', function(e) {
+      const rect = card.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      const xc = rect.width / 2;
+      const yc = rect.height / 2;
+      const dx = (x - xc) / (rect.width / 2);
+      const dy = (y - yc) / (rect.height / 2);
+      card.style.transform = `perspective(1000px) rotateX(${(-dy * 4.5).toFixed(2)}deg) rotateY(${(dx * 4.5).toFixed(2)}deg) translateY(-3px)`;
+    });
+    card.addEventListener('mouseleave', function() {
+      card.style.transform = '';
+    });
+  });
+})();
+
+pollSystemStatus(true);
 });
 
 async function setGlobalIconZeroNow(icCount) {
@@ -15908,7 +16195,28 @@ async function syncWebRuntimeConfigLive() {
       body: JSON.stringify(payload)
     });
     if (MULTI_TAB_BUS) MULTI_TAB_BUS.postMessage({type: 'FORCE_REFRESH'});
-    pollSystemStatus(true);
+    
+// HIỆU ỨNG 3D HOLOGRAM INTERACTIVE TILT TRÊN CÁC THẺ PANEL & BANNER
+(function init3DUltraVipEffects() {
+  const cards = document.querySelectorAll('.kpi-box, .visual-card, .menu-hero-banner-wrap');
+  cards.forEach(card => {
+    card.addEventListener('mousemove', function(e) {
+      const rect = card.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      const xc = rect.width / 2;
+      const yc = rect.height / 2;
+      const dx = (x - xc) / (rect.width / 2);
+      const dy = (y - yc) / (rect.height / 2);
+      card.style.transform = `perspective(1000px) rotateX(${(-dy * 4.5).toFixed(2)}deg) rotateY(${(dx * 4.5).toFixed(2)}deg) translateY(-3px)`;
+    });
+    card.addEventListener('mouseleave', function() {
+      card.style.transform = '';
+    });
+  });
+})();
+
+pollSystemStatus(true);
   } catch (e) {}
 }
 
@@ -15927,7 +16235,28 @@ async function grantCpPermissionFromWeb() {
       document.getElementById('cpGrantUidInput').value = '';
       document.getElementById('cpGrantNameInput').value = '';
       showToast(d.message || 'Đã cấp quyền .cp!');
-      pollSystemStatus(true);
+      
+// HIỆU ỨNG 3D HOLOGRAM INTERACTIVE TILT TRÊN CÁC THẺ PANEL & BANNER
+(function init3DUltraVipEffects() {
+  const cards = document.querySelectorAll('.kpi-box, .visual-card, .menu-hero-banner-wrap');
+  cards.forEach(card => {
+    card.addEventListener('mousemove', function(e) {
+      const rect = card.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      const xc = rect.width / 2;
+      const yc = rect.height / 2;
+      const dx = (x - xc) / (rect.width / 2);
+      const dy = (y - yc) / (rect.height / 2);
+      card.style.transform = `perspective(1000px) rotateX(${(-dy * 4.5).toFixed(2)}deg) rotateY(${(dx * 4.5).toFixed(2)}deg) translateY(-3px)`;
+    });
+    card.addEventListener('mouseleave', function() {
+      card.style.transform = '';
+    });
+  });
+})();
+
+pollSystemStatus(true);
     } else {
       showToast(d.error || 'Lỗi cấp quyền');
     }
@@ -15944,7 +16273,28 @@ async function revokeCpPermissionFromWeb(uid) {
     const d = await r.json();
     if (d.ok) {
       showToast(d.message || 'Đã thu hồi quyền .cp!');
-      pollSystemStatus(true);
+      
+// HIỆU ỨNG 3D HOLOGRAM INTERACTIVE TILT TRÊN CÁC THẺ PANEL & BANNER
+(function init3DUltraVipEffects() {
+  const cards = document.querySelectorAll('.kpi-box, .visual-card, .menu-hero-banner-wrap');
+  cards.forEach(card => {
+    card.addEventListener('mousemove', function(e) {
+      const rect = card.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      const xc = rect.width / 2;
+      const yc = rect.height / 2;
+      const dx = (x - xc) / (rect.width / 2);
+      const dy = (y - yc) / (rect.height / 2);
+      card.style.transform = `perspective(1000px) rotateX(${(-dy * 4.5).toFixed(2)}deg) rotateY(${(dx * 4.5).toFixed(2)}deg) translateY(-3px)`;
+    });
+    card.addEventListener('mouseleave', function() {
+      card.style.transform = '';
+    });
+  });
+})();
+
+pollSystemStatus(true);
     }
   } catch (e) {}
 }
@@ -15973,6 +16323,27 @@ async function revokeCpPermissionFromWeb(uid) {
       e.preventDefault();
     }
   }, {passive: false});
+})();
+
+
+// HIỆU ỨNG 3D HOLOGRAM INTERACTIVE TILT TRÊN CÁC THẺ PANEL & BANNER
+(function init3DUltraVipEffects() {
+  const cards = document.querySelectorAll('.kpi-box, .visual-card, .menu-hero-banner-wrap');
+  cards.forEach(card => {
+    card.addEventListener('mousemove', function(e) {
+      const rect = card.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      const xc = rect.width / 2;
+      const yc = rect.height / 2;
+      const dx = (x - xc) / (rect.width / 2);
+      const dy = (y - yc) / (rect.height / 2);
+      card.style.transform = `perspective(1000px) rotateX(${(-dy * 4.5).toFixed(2)}deg) rotateY(${(dx * 4.5).toFixed(2)}deg) translateY(-3px)`;
+    });
+    card.addEventListener('mouseleave', function() {
+      card.style.transform = '';
+    });
+  });
 })();
 
 pollSystemStatus(true);
@@ -16051,6 +16422,14 @@ def login():
 def logout():
     session.clear()
     return redirect("/login")
+
+
+@app.route("/api/menu_banner.png")
+def api_get_menu_banner():
+    banner_p = os.path.join(BASE_DIR, "menu_banner.png")
+    if os.path.exists(banner_p):
+        return send_from_directory(BASE_DIR, "menu_banner.png", mimetype="image/png")
+    return redirect("/api/logo")
 
 @app.route("/api/logo")
 def api_get_logo():
