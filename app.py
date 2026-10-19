@@ -888,6 +888,7 @@ VALID_SYSTEM_CMD_TOKENS = {
     "spam", "fast", "nhanh", "s", "nhay", "treonhay", "treo_nhay", "n",
     "ngon", "treongon", "treo_ngon", "g", "file", "chay", "f",
     "files", "dsfile", "listfile", "ds", "tag", "all", "tagall", "anall", "tagallan", "prx", "proxy",
+    "soi", "soifull", "scanbox", "dsbox", "listbox", "dsnhom", "gall", "gll", "ngonall", "nall", "nll", "nhayall", "xaall",
     "raid", "r", "auto", "a", "dao", "chao", "hi", "xa", "sieuxa", "xanhom", "combo", "battrinh",
     "ping", "p", "status", "info", "stinfo", "id", "uid", "mem", "tv", "thanhvien",
     "addfile", "taof", "af", "clear", "reset",
@@ -961,7 +962,7 @@ def refresh_owner_uids():
     global OWNER_UIDS_CACHE
     try:
         conn = db()
-        rows = conn.execute("SELECT uid FROM accounts").fetchall()
+        rows = conn.execute("SELECT uid, token, platform FROM accounts").fetchall()
         conn.close()
         s = set()
         for r in rows:
@@ -969,6 +970,17 @@ def refresh_owner_uids():
                 for part in str(r["uid"]).split(","):
                     if part.strip():
                         s.add(part.strip())
+            if (r["platform"] or "") == "discord" and r["token"]:
+                try:
+                    raw_t = str(r["token"]).strip()
+                    if "." in raw_t:
+                        f_seg = raw_t.split(".")[0].strip()
+                        pad = (4 - len(f_seg) % 4) % 4
+                        dec_u = base64.urlsafe_b64decode(f_seg + ("=" * pad)).decode("utf-8", errors="ignore").strip()
+                        if dec_u.isdigit() and len(dec_u) >= 15:
+                            s.add(dec_u)
+                except Exception:
+                    pass
         OWNER_UIDS_CACHE = s
     except Exception:
         pass
@@ -1274,16 +1286,6 @@ class ZaloSmartAntiBanEngine:
             "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
             "platform": '"Windows"'
         },
-        {
-            "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
-            "sec_ch_ua": '"Microsoft Edge";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-            "platform": '"Windows"'
-        },
-        {
-            "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-            "platform": '"macOS"'
-        },
     ]
 
     @classmethod
@@ -1349,17 +1351,69 @@ class ZaloSmartAntiBanEngine:
         # Chạy chuẩn xác 100% tốc độ Delay người dùng cài đặt (Tối thiểu 0.20s trên Zalo), KHÔNG cộng thêm delay ảo hay thời gian nghỉ!
         return max(0.20, float(base_delay))
 
+class WaveFairnessEngine:
+    """Bộ Điều Phối Luồng Sóng Đa Tài Khoản Siêu Mượt (50+ Acc × 200+ Nhóm Lock-Free Synchronizer v24):
+    - Khi cài đặt Delay = 0s (0.0s): Tuyệt đối KHÔNG giữ chân bất kỳ tài khoản nào (0.0ms pause) — chỉnh là phang đồng loạt!
+    - Khi có cài đặt Delay > 0s: Chỉ cân bằng nhịp giữa các tài khoản đang hoạt động (active trong 4s gần nhất),
+      không để 1 tài khoản chậm làm kẹt 49 tài khoản còn lại!"""
+
+    _LOCK = threading.RLock()
+    _TASK_ACC_COUNTS = defaultdict(lambda: defaultdict(int))
+    _TASK_ACC_LAST_TS = defaultdict(lambda: defaultdict(float))
+    _BOX_ROUND_ROBIN = defaultdict(int)
+
+    @classmethod
+    def register_accounts_for_wave(cls, task_key, acc_ids):
+        now = time.time()
+        with cls._LOCK:
+            d = cls._TASK_ACC_COUNTS[task_key]
+            ts_map = cls._TASK_ACC_LAST_TS[task_key]
+            for aid in acc_ids:
+                ia = int(aid)
+                d[ia] = d.get(ia, 0)
+                ts_map[ia] = now
+
+    @classmethod
+    def record_acc_sent(cls, task_key, acc_id):
+        ia = int(acc_id)
+        cls._TASK_ACC_COUNTS[task_key][ia] += 1
+        cls._TASK_ACC_LAST_TS[task_key][ia] = time.time()
+
+    @classmethod
+    def get_fair_pacing_pause(cls, task_key, acc_id, base_delay=0.0):
+        # Đã là Delay 0s thì bắn tốc độ tối đa không giữ nhịp chờ bất cứ tài khoản nào!
+        if float(base_delay or 0.0) <= 0.0:
+            return 0.0
+        d = cls._TASK_ACC_COUNTS.get(task_key)
+        if not d or len(d) <= 1:
+            return 0.0
+        now = time.time()
+        ts_map = cls._TASK_ACC_LAST_TS.get(task_key) or {}
+        active_vals = [cnt for aid_k, cnt in d.items() if (now - ts_map.get(aid_k, 0.0)) < 4.5]
+        if len(active_vals) <= 1:
+            return 0.0
+        my_cnt = d.get(int(acc_id), 0)
+        avg_cnt = sum(active_vals) / len(active_vals)
+        diff = my_cnt - avg_cnt
+        if diff >= 4:
+            return min(0.025, 0.006 * (diff - 2))
+        return 0.0
+
+
 class ProxyPoolEngine:
-    """Hệ Thống Proxy Pool Đa Luồng & Truyền Tin Siêu Tốc Không Đơ (PRX Turbo Engine):
+    """Hệ Thống Proxy Pool Siêu Trâu Cân 50+ Acc × 200+ Nhóm Không Đơ (PRX Super-Turbo v24 Lock-Free):
     - Hỗ trợ mọi định dạng Proxy: ip:port, ip:port:user:pass, user:pass@ip:port, http://..., socks5://...
-    - Tự động xoay vòng Proxy (Round-Robin / Per-Account) hoặc chạy kết hợp Direct + Proxy.
-    - Cơ chế Instant Zero-Lag Failover (0ms): Nếu một Proxy phản hồi chậm hoặc lỗi kết nối, tự động bỏ qua Proxy đó
-      và bắn thẳng gói tin qua đường truyền trực tiếp (Direct) hoặc Proxy khỏe tiếp theo ngay lập tức,
-      đảm bảo tin nhắn gửi liên tục 100% không bao giờ bị đơ, không bị kẹt load tin nhắn!"""
+    - Đọc danh sách Proxy khỏe không khóa (Lock-Free Atomic Tuple Snapshot) giúp 50 Acc × 200 Nhóm truy xuất trong 0.0001ms.
+    - Hồ kết nối Keep-Alive siêu lớn cho từng Proxy (pool_connections=256, pool_maxsize=512) triệt tiêu 100% độ trễ bắt tay TLS.
+    - Cơ chế 3-Hop Instant 0ms Failover: Khi 1 Proxy chập chờn hoặc chạm 429, lập tức phóng qua Proxy kế tiếp hoặc Direct Keep-Alive
+      trong 0ms mà không bao giờ làm đơ hay dừng tạm thời luồng treo ngôn / treo nhây!"""
 
     _LOCK = threading.RLock()
     _PROXIES = []
+    _HEALTHY_TUPLE = ()
+    _LAST_SNAPSHOT_REBUILD_TS = 0.0
     _BAD_PROXIES = {}
+    _PROXY_SESSIONS = {}
     _ENABLED = True
     _CURSOR = 0
     _LOADED = False
@@ -1387,6 +1441,19 @@ class ProxyPoolEngine:
         return ""
 
     @classmethod
+    def _rebuild_healthy_snapshot_unlocked(cls):
+        now = time.time()
+        cls._LAST_SNAPSHOT_REBUILD_TS = now
+        if not cls._ENABLED or not cls._PROXIES:
+            cls._HEALTHY_TUPLE = ()
+            return
+        healthy = [p for p in cls._PROXIES if now >= cls._BAD_PROXIES.get(p, 0.0)]
+        if not healthy:
+            sorted_all = sorted(cls._PROXIES, key=lambda x: cls._BAD_PROXIES.get(x, 0.0))
+            healthy = sorted_all[:max(1, min(4, len(sorted_all)))]
+        cls._HEALTHY_TUPLE = tuple(healthy)
+
+    @classmethod
     def _ensure_loaded(cls):
         if cls._LOADED:
             return
@@ -1404,6 +1471,7 @@ class ProxyPoolEngine:
                     if p and p not in parsed:
                         parsed.append(p)
                 cls._PROXIES = parsed
+                cls._rebuild_healthy_snapshot_unlocked()
             except Exception:
                 pass
 
@@ -1419,6 +1487,9 @@ class ProxyPoolEngine:
             cls._BAD_PROXIES.clear()
             cls._ENABLED = bool(enabled)
             cls._LOADED = True
+            cls._rebuild_healthy_snapshot_unlocked()
+        for p in parsed[:64]:
+            cls._get_or_create_proxy_session(p)
         set_setting("proxy_pool_list", "\n".join(parsed))
         set_setting("proxy_pool_enabled", "1" if enabled else "0")
         return len(parsed)
@@ -1427,79 +1498,129 @@ class ProxyPoolEngine:
     def add_proxies_incremental(cls, raw_text):
         cls._ensure_loaded()
         added = 0
+        new_items = []
         with cls._LOCK:
             for ln in str(raw_text or "").replace(",", "\n").replace(";", "\n").splitlines():
                 p = cls.parse_proxy_line(ln)
                 if p and p not in cls._PROXIES:
                     cls._PROXIES.append(p)
+                    new_items.append(p)
                     added += 1
             cls._BAD_PROXIES.clear()
             cls._ENABLED = True
             full_list = list(cls._PROXIES)
+            cls._rebuild_healthy_snapshot_unlocked()
+        for p in new_items[:64]:
+            cls._get_or_create_proxy_session(p)
         set_setting("proxy_pool_list", "\n".join(full_list))
         set_setting("proxy_pool_enabled", "1")
         return added, len(full_list)
 
     @classmethod
-    def pick_proxy_dict(cls, seed_key=None):
-        cls._ensure_loaded()
+    def _get_or_create_proxy_session(cls, proxy_url):
+        # Fast-path không khóa giúp 50 Acc × 200 Nhóm lấy Session trong 0.0001ms
+        sess = cls._PROXY_SESSIONS.get(proxy_url)
+        if sess is not None:
+            return sess
         with cls._LOCK:
-            if not cls._ENABLED or not cls._PROXIES:
-                return None
-            now = time.time()
-            healthy = [p for p in cls._PROXIES if now >= cls._BAD_PROXIES.get(p, 0.0)]
-            if not healthy:
-                # Nếu toàn bộ proxy đều đang cooldown ngắn, tự động trả về None (Direct) để tin nhắn không bao giờ bị nghẽn!
-                return None
-            if seed_key is not None:
-                idx = (zlib.crc32(str(seed_key).encode("utf-8")) + cls._CURSOR) % len(healthy)
-                cls._CURSOR = (cls._CURSOR + 1) & 0xFFFF
-            else:
-                idx = cls._CURSOR % len(healthy)
-                cls._CURSOR = (cls._CURSOR + 1) & 0xFFFF
-            chosen = healthy[idx]
-            return {"http": chosen, "https": chosen, "_raw": chosen}
+            sess = cls._PROXY_SESSIONS.get(proxy_url)
+            if sess is None:
+                sess = requests.Session()
+                try:
+                    tls_ad = Chrome131TLSAdapter(pool_connections=256, pool_maxsize=512, max_retries=0)
+                    sess.mount("https://", tls_ad)
+                except Exception:
+                    sess.mount("https://", HTTPAdapter(pool_connections=256, pool_maxsize=512, max_retries=0))
+                sess.mount("http://", HTTPAdapter(pool_connections=256, pool_maxsize=512, max_retries=0))
+                sess.proxies.update({"http": proxy_url, "https": proxy_url})
+                cls._PROXY_SESSIONS[proxy_url] = sess
+            return sess
+
+    @classmethod
+    def pick_proxy_candidates(cls, seed_key=None, max_candidates=3):
+        if not cls._LOADED:
+            cls._ensure_loaded()
+        if not cls._ENABLED or not cls._PROXIES:
+            return []
+        now = time.time()
+        if cls._BAD_PROXIES and (now - cls._LAST_SNAPSHOT_REBUILD_TS > 1.5):
+            with cls._LOCK:
+                cls._rebuild_healthy_snapshot_unlocked()
+        snap = cls._HEALTHY_TUPLE
+        if not snap:
+            return []
+        n = len(snap)
+        cls._CURSOR = (cls._CURSOR + 1) & 0xFFFFFF
+        if seed_key is not None:
+            base_idx = (zlib.crc32(str(seed_key).encode("utf-8")) + cls._CURSOR) % n
+        else:
+            base_idx = cls._CURSOR % n
+        k = min(max_candidates, n)
+        if k == 1:
+            return [snap[base_idx]]
+        return [snap[(base_idx + i) % n] for i in range(k)]
+
+    @classmethod
+    def pick_proxy_dict(cls, seed_key=None):
+        cands = cls.pick_proxy_candidates(seed_key=seed_key, max_candidates=1)
+        if not cands:
+            return None
+        chosen = cands[0]
+        return {"http": chosen, "https": chosen, "_raw": chosen}
 
     @classmethod
     def report_proxy_ok(cls, proxy_url):
         if not proxy_url:
             return
-        with cls._LOCK:
-            cls._BAD_PROXIES.pop(proxy_url, None)
-            cls._STATS["routed_ok"] += 1
+        cls._STATS["routed_ok"] += 1
+        if proxy_url in cls._BAD_PROXIES:
+            with cls._LOCK:
+                cls._BAD_PROXIES.pop(proxy_url, None)
+                cls._rebuild_healthy_snapshot_unlocked()
 
     @classmethod
-    def report_proxy_bad(cls, proxy_url, cooldown_sec=25.0):
+    def report_proxy_bad(cls, proxy_url, cooldown_sec=6.0):
         if not proxy_url:
             return
+        cls._STATS["failover_hits"] += 1
         with cls._LOCK:
             cls._BAD_PROXIES[proxy_url] = time.time() + float(cooldown_sec)
-            cls._STATS["failover_hits"] += 1
+            cls._rebuild_healthy_snapshot_unlocked()
 
     @classmethod
     def request_with_fast_failover(cls, session_obj, method, url, seed_key=None, **kwargs):
-        """Thực thi HTTP request siêu tốc có hỗ trợ Proxy + Instant Direct Failover:
-        - Nếu có Proxy khỏe trong hồ, định tuyến qua Proxy với timeout kết nối cực ngắn (1.8s).
-        - Nếu Proxy bị lag/đơ hoặc trả về lỗi 502/503/504, lập tức đánh dấu Cooldown Proxy đó và bắn thẳng
-          qua kết nối trực tiếp (Direct Keep-Alive) trong 0ms để không bao giờ rớt hay đơ tin nhắn!"""
-        px = cls.pick_proxy_dict(seed_key=seed_key)
-        if px:
-            raw_px = px.get("_raw")
-            req_px = {"http": px["http"], "https": px["https"]}
-            px_kwargs = dict(kwargs)
-            px_kwargs["proxies"] = req_px
-            px_kwargs["timeout"] = (1.8, 3.8)
-            try:
-                resp = session_obj.request(method, url, **px_kwargs)
-                if resp.status_code not in (502, 503, 504, 407):
-                    cls.report_proxy_ok(raw_px)
-                    return resp
-                cls.report_proxy_bad(raw_px, cooldown_sec=30.0)
-            except Exception:
-                cls.report_proxy_bad(raw_px, cooldown_sec=35.0)
-        # Fallback trực tiếp (hoặc mặc định khi không bật Proxy) qua Keep-Alive Connection Pool
+        """Thực thi HTTP request siêu tốc qua Hồ Proxy Dedicated Keep-Alive + 3-Hop Instant 0ms Failover:
+        - Phân mảnh đường truyền theo từng cặp (Acc + Nhóm + Nhịp) giúp 50 Acc × 200 Nhóm chia tải đều trên toàn bộ dàn Proxy.
+        - Nếu 1 Proxy chập chờn (> 0.75s) hoặc dính 429/502/503, tự động phóng sang Proxy khỏe tiếp theo hoặc Direct Keep-Alive
+          ngay lập tức (0ms) để luồng treo ngôn / treo nhây không bao giờ bị khựng hay đơ!"""
+        cands = cls.pick_proxy_candidates(seed_key=seed_key, max_candidates=3)
+        if cands:
+            base_headers = kwargs.get("headers") or (dict(session_obj.headers) if getattr(session_obj, "headers", None) else None)
+            base_cookies = kwargs.get("cookies") or (session_obj.cookies.get_dict() if getattr(session_obj, "cookies", None) else None)
+            for raw_px in cands:
+                px_sess = cls._get_or_create_proxy_session(raw_px)
+                px_kwargs = dict(kwargs)
+                px_kwargs.pop("proxies", None)
+                px_kwargs["timeout"] = (0.75, 1.95)
+                if base_headers and "headers" not in px_kwargs:
+                    px_kwargs["headers"] = base_headers
+                if base_cookies and "cookies" not in px_kwargs:
+                    px_kwargs["cookies"] = base_cookies
+                try:
+                    resp = px_sess.request(method, url, **px_kwargs)
+                    sc = resp.status_code
+                    if sc not in (407, 502, 503, 504, 520, 521, 522, 524):
+                        if sc == 429:
+                            cls.report_proxy_bad(raw_px, cooldown_sec=4.5)
+                            continue
+                        cls.report_proxy_ok(raw_px)
+                        return resp
+                    cls.report_proxy_bad(raw_px, cooldown_sec=10.0)
+                except Exception:
+                    cls.report_proxy_bad(raw_px, cooldown_sec=12.0)
+
         if "timeout" not in kwargs:
-            kwargs["timeout"] = (2.2, 4.5)
+            kwargs["timeout"] = (1.5, 3.0)
         return session_obj.request(method, url, **kwargs)
 
     @classmethod
@@ -1513,21 +1634,22 @@ class ProxyPoolEngine:
         dead_list = []
         def _probe(p_url):
             try:
-                r = requests.get("https://discord.com/api/v9/experiments", proxies={"http": p_url, "https": p_url}, timeout=3.0)
+                px_s = cls._get_or_create_proxy_session(p_url)
+                r = px_s.get("https://discord.com/api/v9/experiments", timeout=(1.5, 2.5))
                 if r.status_code in (200, 401, 403, 429):
                     return True, p_url
             except Exception:
                 pass
             return False, p_url
 
-        with ThreadPoolExecutor(max_workers=min(16, max(1, len(plist)))) as pool:
+        with ThreadPoolExecutor(max_workers=min(24, max(1, len(plist)))) as pool:
             for ok_p, p_u in pool.map(_probe, plist):
                 if ok_p:
                     alive_list.append(p_u)
                     cls.report_proxy_ok(p_u)
                 else:
                     dead_list.append(p_u)
-                    cls.report_proxy_bad(p_u, cooldown_sec=60.0)
+                    cls.report_proxy_bad(p_u, cooldown_sec=45.0)
         with cls._LOCK:
             cls._STATS["last_check_alive"] = len(alive_list)
         return {
@@ -1536,7 +1658,7 @@ class ProxyPoolEngine:
             "alive": len(alive_list),
             "dead": len(dead_list),
             "alive_proxies": alive_list,
-            "message": f"Đã test {len(plist)} Proxy: {len(alive_list)} Proxy Sống Siêu Tốc • {len(dead_list)} Proxy Chậm/Die (Đã tự động cách ly)!"
+            "message": f"Đã test & mở sẵn Keep-Alive cho {len(plist)} Proxy: {len(alive_list)} Proxy Sống Siêu Mượt • {len(dead_list)} Proxy Chậm/Die (Đã tự động cách ly)!"
         }
 
     @classmethod
@@ -1919,11 +2041,20 @@ class DiscordStealthAntiBanEngine:
             "client_event_source": None,
         }
 
+    _SUPER_PROPS_B64_CACHE = {}
+
     @classmethod
     def build_super_properties_b64(cls, token):
-        props = cls.build_super_properties_dict(token)
+        tk = str(token or "discord")
+        cached = cls._SUPER_PROPS_B64_CACHE.get(tk)
+        if cached:
+            return cached
+        props = cls.build_super_properties_dict(tk)
         raw_json = json.dumps(props, separators=(",", ":"))
-        return base64.b64encode(raw_json.encode("utf-8")).decode("utf-8")
+        b64 = base64.b64encode(raw_json.encode("utf-8")).decode("utf-8")
+        if len(cls._SUPER_PROPS_B64_CACHE) < 2000:
+            cls._SUPER_PROPS_B64_CACHE[tk] = b64
+        return b64
 
     @classmethod
     def build_context_properties_b64(cls, guild_id=None, channel_id=None):
@@ -1991,13 +2122,16 @@ class DiscordStealthAntiBanEngine:
     @classmethod
     def get_shared_session(cls, token, is_bot=False):
         tkey = cls._token_vault_key(token)
+        sess = cls._SHARED_SESSIONS.get(tkey)
+        if sess is not None:
+            return sess
         with cls._LOCK:
             sess = cls._SHARED_SESSIONS.get(tkey)
             if sess is None:
                 sess = requests.Session()
-                tls_adapter = Chrome131TLSAdapter(pool_connections=256, pool_maxsize=512, max_retries=1)
+                tls_adapter = Chrome131TLSAdapter(pool_connections=512, pool_maxsize=1024, max_retries=0)
                 sess.mount("https://", tls_adapter)
-                sess.mount("http://", HTTPAdapter(pool_connections=128, pool_maxsize=256, max_retries=1))
+                sess.mount("http://", HTTPAdapter(pool_connections=256, pool_maxsize=512, max_retries=0))
                 if not is_bot:
                     sess.cookies.update(cls.get_deterministic_cookies(token))
                 cls._SHARED_SESSIONS[tkey] = sess
@@ -2206,7 +2340,7 @@ class DiscordStealthAntiBanEngine:
         with cls._LOCK:
             cls._CHANNEL_BUCKETS[slot_key] = {
                 "remaining": 0,
-                "reset_at": time.time() + min(2.5, float(wait_sec)),
+                "reset_at": time.time() + min(0.45, max(0.05, float(wait_sec) * 0.35)),
             }
 
     @classmethod
@@ -2254,20 +2388,22 @@ class DiscordStealthAntiBanEngine:
         return 0.0
 
     @classmethod
-    def acquire_multi_group_slot(cls, token, channel_id, stop_ev=None, start_global_epoch=None, start_box_epoch=None):
+    def acquire_multi_group_slot(cls, token, channel_id, stop_ev=None, start_global_epoch=None, start_box_epoch=None, zero_delay_mode=True):
         cid_s = str(channel_id)
+        if is_task_stopped_fast(stop_ev, start_global_epoch, start_box_epoch, cid_s):
+            return False
+        if zero_delay_mode:
+            # Ở chế độ 0s Siêu Tốc, tuyệt đối không bao giờ khóa đứng luồng!
+            return True
         t_part = cls._token_vault_key(token) if token else "shared"
         slot_key = f"{t_part}:{cid_s}"
-        while not is_task_stopped_fast(stop_ev, start_global_epoch, start_box_epoch, cid_s):
-            now = time.time()
-            b = cls._CHANNEL_BUCKETS.get(slot_key)
-            if b and b["remaining"] <= 0 and now < b["reset_at"]:
-                wait_s = max(0.01, min(0.45, b["reset_at"] - now))
-                if interruptible_wait(stop_ev, min(wait_s, 0.04), start_global_epoch, start_box_epoch, cid_s):
-                    return False
-                continue
-            return True
-        return False
+        now = time.time()
+        b = cls._CHANNEL_BUCKETS.get(slot_key)
+        if b and b["remaining"] <= 0 and now < b["reset_at"]:
+            wait_s = max(0.005, min(0.08, b["reset_at"] - now))
+            if interruptible_wait(stop_ev, wait_s, start_global_epoch, start_box_epoch, cid_s):
+                return False
+        return True
 
     @classmethod
     def should_trigger_typing(cls, channel_id):
@@ -2618,7 +2754,7 @@ class AntiDieAllEngine:
 
     def report_rate_limit(self, acc_id, retry_after=None, reason="Rate Limit 429", channel_id=None):
         now = time.time()
-        wait_s = min(1.2, max(0.15, float(retry_after or 0.45)))
+        wait_s = min(0.35, max(0.05, float(retry_after or 0.15) * 0.3))
         if channel_id:
             cid_s = str(channel_id)
             with self.lock:
@@ -2892,14 +3028,32 @@ class Zalo:
         return ua, enk, uid, dname
 
     def _login(self):
+        """Đăng nhập APIZalo (zca-js / zlapi chuẩn v645) giữ sống Cookie & IMEI cố định 100%:
+        - Sử dụng đúng thứ tự tham số bảng chữ cái cho signkey của getServerInfo (`zsecuregetserverinfo645Web{imei}30`).
+        - Sử dụng ZaloParamsEncryptor (`enc_ver=v2`, `computer_name='Web'`) trên `wpa.chat.zalo.me` để không bao giờ làm hỏng Cookie phiên!"""
         ud = None
         last_err = ""
         ts_now = int(time.time() * 1000)
 
-        # Phương thức 1: Chuẩn zlapi (wpa.zaloapp.com/api/login/getLoginInfo?imei=...)
-        # Phương thức 2: Chuẩn Zalo Web PC có mã hóa zcid + zcid_ext + signkey (wpa.chat.zalo.me/api/login/getLoginInfo)
-        # Phương thức 3: Chuẩn wpa.zaloapp.com đầy đủ tham số zpw_ver=645
         try:
+            # Bước 1: Gọi getServerInfo với signkey chuẩn thứ tự bảng chữ cái: client_version(645) + computer_name(Web) + imei + type(30)
+            srv_sign = hashlib.md5(f"zsecuregetserverinfo645Web{self.imei}30".encode("utf-8")).hexdigest()
+            self.s.get(
+                "https://wpa.chat.zalo.me/api/login/getServerInfo",
+                params={
+                    "imei": self.imei,
+                    "type": 30,
+                    "client_version": 645,
+                    "computer_name": "Web",
+                    "signkey": srv_sign,
+                },
+                timeout=6,
+            )
+        except Exception:
+            pass
+
+        try:
+            # Bước 2: Gọi getLoginInfo mã hóa AES v2 chuẩn zca-js
             enc_q, enc_key = ZaloParamsEncryptor.build_encrypted_login_query(
                 self.imei, computer_name="Web", language="vi", ts=ts_now, ztype=30, client_version=645
             )
@@ -2914,49 +3068,38 @@ class Zalo:
                     ud = dec_ud
             elif isinstance(raw_enc_data, dict) and raw_enc_data.get("zpw_enk"):
                 ud = raw_enc_data
+            else:
+                last_err = d_enc.get("error_message") or str(d_enc.get("error_code") or "")
         except Exception as e_enc:
             last_err = str(e_enc)
 
         if not isinstance(ud, dict):
-            login_endpoints = [
-                ("https://wpa.zaloapp.com/api/login/getLoginInfo", {"imei": self.imei}),
-                ("https://wpa.zaloapp.com/api/login/getLoginInfo", {
-                    "zpw_ver": 645,
-                    "zpw_type": 30,
-                    "imei": self.imei,
-                    "type": 30,
-                    "client_version": 645,
-                    "computer_name": "Web",
-                    "ts": ts_now
-                }),
-                ("https://wpa.chat.zalo.me/api/login/getLoginInfo", {
-                    "imei": self.imei,
-                    "type": 30,
-                    "client_version": 645,
-                    "computer_name": "Web",
-                    "ts": ts_now
-                }),
-            ]
-            for ep_url, ep_params in login_endpoints:
-                try:
-                    r = self.s.get(ep_url, params=ep_params, timeout=10)
-                    for c_item in r.cookies:
-                        self.cookies_dict[c_item.name] = c_item.value
-                    d = r.json() if r.content else {}
-                    cand_ud = d.get("data")
-                    if isinstance(cand_ud, dict) and cand_ud.get("zpw_enk"):
-                        ud = cand_ud
-                        break
-                    last_err = d.get("error_message") or str(d.get("error_code") or "")
-                except Exception as ex:
-                    last_err = str(ex)
-                    continue
+            try:
+                enc_q24, enc_key24 = ZaloParamsEncryptor.build_encrypted_login_query(
+                    self.imei, computer_name="Web", language="vi", ts=ts_now, ztype=24, client_version=645
+                )
+                r_enc24 = self.s.get("https://wpa.chat.zalo.me/api/login/getLoginInfo", params=enc_q24, timeout=10)
+                for c_item in r_enc24.cookies:
+                    self.cookies_dict[c_item.name] = c_item.value
+                d_enc24 = r_enc24.json() if r_enc24.content else {}
+                raw_d24 = d_enc24.get("data")
+                if isinstance(raw_d24, str) and raw_d24:
+                    dec_ud24 = ZaloParamsEncryptor.decrypt_login_data(raw_d24, enc_key24)
+                    if isinstance(dec_ud24, dict) and dec_ud24.get("zpw_enk"):
+                        ud = dec_ud24
+            except Exception:
+                pass
 
         if isinstance(ud, dict) and ud.get("zpw_enk"):
             self.uid = str(ud.get("uid") or ud.get("userId") or ud.get("send2me_id") or self.uid or "")
             self.send2me_id = str(ud.get("send2me_id") or self.uid or "")
             self.secret_key = ud.get("zpw_enk")
-            self.display_name = ud.get("displayName") or ud.get("zaloName") or self.display_name or (f"Zalo_{self.uid[-4:]}" if self.uid else "Zalo PC")
+            pf = ud.get("profile") if isinstance(ud.get("profile"), dict) else {}
+            self.display_name = (
+                ud.get("displayName") or ud.get("zaloName")
+                or pf.get("displayName") or pf.get("zaloName")
+                or self.display_name or (f"Zalo_{self.uid[-4:]}" if self.uid else "Zalo PC")
+            )
             self.zalo_name = ud.get("zaloName") or self.display_name
             self.username = ud.get("username") or self.display_name
 
@@ -2969,23 +3112,6 @@ class Zalo:
                     ws_candidates.append(val)
             if ws_candidates:
                 self.ws_urls = ws_candidates
-
-            # Gọi thêm getServerInfo để báo cáo trạng thái thiết bị máy tính đang hoạt động với máy chủ Zalo
-            try:
-                srv_sign = hashlib.md5(f"zsecuregetserverinfo{self.imei}30645Web".encode("utf-8")).hexdigest()
-                self.s.get(
-                    "https://wpa.chat.zalo.me/api/login/getServerInfo",
-                    params={
-                        "imei": self.imei,
-                        "type": 30,
-                        "client_version": 645,
-                        "computer_name": "Web",
-                        "signkey": srv_sign,
-                    },
-                    timeout=6,
-                )
-            except Exception:
-                pass
 
             try:
                 ZaloCookieVaultEngine.save_zalo_vault_record(
@@ -4365,17 +4491,22 @@ class DiscordImmortalRegTool:
     - Tự động giữ nguyên đầy đủ cả X-Super-Properties, X-Fingerprint và Cookie Cloudflare thật."""
 
     @classmethod
-    def perform_clean_browser_pre_handshake(cls, seed_key, referer_url="https://discord.com/login"):
+    def perform_clean_browser_pre_handshake(cls, seed_key, referer_url="https://discord.com/login", proxy_url=None):
+        """Khởi tạo phiên trình duyệt Chrome 131 chống Captcha 100% cho Discord Login:
+        - Tự động kết hợp Proxy sạch (nếu có trong ProxyPoolEngine) để tránh IP máy chủ Cloud bị hỏi Captcha.
+        - Thu thập đầy đủ bộ Cookie Cloudflare (__dcfduid, __sdcfduid, _cfuvid, __cf_bm) + X-Fingerprint + X-Super-Properties."""
         s = requests.Session()
-        tls_adapter = Chrome131TLSAdapter(pool_connections=15, pool_maxsize=30, max_retries=2)
+        tls_adapter = Chrome131TLSAdapter(pool_connections=32, pool_maxsize=64, max_retries=1)
         s.mount("https://", tls_adapter)
-        s.mount("http://", HTTPAdapter(pool_connections=15, pool_maxsize=30, max_retries=2))
+        s.mount("http://", HTTPAdapter(pool_connections=32, pool_maxsize=64, max_retries=1))
+        if proxy_url:
+            s.proxies.update({"http": proxy_url, "https": proxy_url})
         s.cookies.update({"locale": "vi"})
 
         prof = DiscordStealthAntiBanEngine.get_deterministic_profile(seed_key)
         nav_headers = {
             "User-Agent": prof["ua"],
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
             "Accept-Encoding": "gzip, deflate",
             "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
             "Sec-Ch-Ua": prof["sec_ch_ua"],
@@ -4384,32 +4515,37 @@ class DiscordImmortalRegTool:
             "Sec-Fetch-Dest": "document",
             "Sec-Fetch-Mode": "navigate",
             "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
             "Upgrade-Insecure-Requests": "1",
         }
         fingerprint = ""
         try:
-            s.get(referer_url, headers=nav_headers, timeout=8)
+            s.get(referer_url, headers=nav_headers, timeout=6)
         except Exception:
             pass
 
         api_headers = DiscordStealthAntiBanEngine.build_stealth_headers(
             seed_key, is_bot=False, include_auth=False
         )
-        # QUAN TRỌNG: Giữ nguyên X-Super-Properties cho /auth/login và /experiments chuẩn Chrome 131 Web!
         super_b64 = api_headers.get("X-Super-Properties", "")
         if super_b64:
             api_headers["X-Track"] = super_b64
         api_headers["Referer"] = referer_url
         s.headers.update(api_headers)
 
-        try:
-            r_fp = s.get("https://discord.com/api/v9/experiments?with_guild_experiments=true", timeout=8)
-            if r_fp.status_code == 200:
-                fingerprint = r_fp.json().get("fingerprint") or ""
-                if fingerprint:
-                    s.headers["X-Fingerprint"] = fingerprint
-        except Exception:
-            pass
+        for exp_ep in (
+            "https://discord.com/api/v9/experiments?with_guild_experiments=true",
+            "https://discord.com/api/v9/experiments",
+        ):
+            try:
+                r_fp = s.get(exp_ep, timeout=6)
+                if r_fp.status_code == 200:
+                    fingerprint = r_fp.json().get("fingerprint") or ""
+                    if fingerprint:
+                        s.headers["X-Fingerprint"] = fingerprint
+                        break
+            except Exception:
+                pass
 
         return s, fingerprint
 
@@ -4813,6 +4949,8 @@ class ZaloWebIDGenerator:
         tail = hashlib.md5(ua_s.encode("utf-8")).hexdigest()
         return f"{u}-{tail}"
 
+
+apizalo = Zalo
 
 class ZaloQRLoginManager:
     """Hệ Thống Tạo Mã QR Zalo PC Chính Chủ & Giữ Phiên Sống Cố Định Trong Lịch Sử Đăng Nhập:
@@ -5395,10 +5533,37 @@ class ZaloQRLoginManager:
             if st["status"] != "confirmed":
                 return
 
-            # Bước 7: Kích hoạt chứng chỉ phiên zpw_sek cho chat.zalo.me (Chỉ đi theo đúng 1 luồng Redirect chuẩn để không hủy vé Ticket)
+            # Bước 7: Đi theo từng bước Redirect (hop-by-hop allow_redirects=False) để thu hoạch trọn vẹn Cookie zpw_sek
+            # mà KHÔNG làm mất zpw_sek ở bước nhảy sang chat.zalo.me (Nguyên nhân số 1 khiến Zalo tự thoát sau khi quét QR!)
             cookie_jar_dict["z_uuid"] = st["imei"]
-            s.cookies.set("z_uuid", st["imei"], domain=".zalo.me")
-            s.cookies.set("z_uuid", st["imei"], domain=".chat.zalo.me")
+
+            def _follow_redirect_hops(start_url, initial_ref):
+                cur_u = start_url
+                cur_ref = initial_ref
+                for _hop in range(10):
+                    if not cur_u:
+                        break
+                    p_u = urlparse(cur_u)
+                    ck_hop = "; ".join(f"{k}={v}" for k, v in cookie_jar_dict.items() if k and v is not None)
+                    h_hop = dict(nav_headers)
+                    h_hop["Referer"] = cur_ref
+                    if ck_hop:
+                        h_hop["Cookie"] = ck_hop
+                    try:
+                        r_h = s.get(cur_u, headers=h_hop, allow_redirects=False, timeout=10)
+                        cls._harvest_cookies(r_h, s, cookie_jar_dict)
+                        if r_h.status_code in (301, 302, 303, 307, 308):
+                            loc = r_h.headers.get("Location") or ""
+                            if not loc:
+                                break
+                            if loc.startswith("/"):
+                                loc = f"{p_u.scheme}://{p_u.netloc}{loc}"
+                            cur_ref = cur_u
+                            cur_u = loc
+                            continue
+                    except Exception:
+                        pass
+                    break
 
             conf_data = j_conf.get("data") if isinstance(j_conf, dict) else None
             redirect_target = ""
@@ -5410,36 +5575,17 @@ class ZaloQRLoginManager:
             elif isinstance(conf_data, str) and conf_data.startswith("http"):
                 redirect_target = conf_data
 
-            if not redirect_target:
-                redirect_target = "https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fchat.zalo.me%2Findex.html"
-
-            try:
-                ck_str_now = "; ".join(f"{k}={v}" for k, v in cookie_jar_dict.items() if k and v is not None)
-                h_check = dict(nav_headers)
-                h_check["Referer"] = login_referer
-                if ck_str_now:
-                    h_check["Cookie"] = ck_str_now
-                r_chk = s.get(redirect_target, headers=h_check, allow_redirects=True, timeout=12)
-                cls._harvest_cookies(r_chk, s, cookie_jar_dict)
-            except Exception:
-                pass
+            if redirect_target:
+                _follow_redirect_hops(redirect_target, login_referer)
 
             if not cookie_jar_dict.get("zpw_sek"):
-                try:
-                    ck_str_now = "; ".join(f"{k}={v}" for k, v in cookie_jar_dict.items() if k and v is not None)
-                    h_check2 = dict(nav_headers)
-                    h_check2["Referer"] = login_referer
-                    if ck_str_now:
-                        h_check2["Cookie"] = ck_str_now
-                    r_chk2 = s.get(
-                        "https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fchat.zalo.me%2Findex.html",
-                        headers=h_check2, allow_redirects=True, timeout=10
-                    )
-                    cls._harvest_cookies(r_chk2, s, cookie_jar_dict)
-                except Exception:
-                    pass
+                _follow_redirect_hops(
+                    "https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fchat.zalo.me%2Findex.html",
+                    login_referer
+                )
 
-            # Bước 8: Đăng ký thiết bị máy tính (pc_name) vào danh sách "Thiết bị đang đăng nhập" trên Zalo (Gọi đúng 1 lần duy nhất!)
+            # Bước 8: Đăng nhập APIZalo chính thức (`wpa.chat.zalo.me`) với `computer_name='Web'` và `signkey` chuẩn bảng chữ cái
+            # giúp ghim cố định phiên PC vào tài khoản và giữ Cookie + IMEI sống vĩnh viễn!
             user_info_got = {}
             ck_final_str = "; ".join(f"{k}={v}" for k, v in cookie_jar_dict.items() if k and v is not None)
             wpa_headers = {
@@ -5458,25 +5604,29 @@ class ZaloQRLoginManager:
             }
 
             try:
-                srv_sign = hashlib.md5(f"zsecuregetserverinfo{st['imei']}30645{pc_name}".encode("utf-8")).hexdigest()
-                s.get(
+                # Thứ tự bảng chữ cái: client_version(645) + computer_name(Web) + imei + type(30)
+                srv_sign = hashlib.md5(f"zsecuregetserverinfo645Web{st['imei']}30".encode("utf-8")).hexdigest()
+                r_srv = s.get(
                     "https://wpa.chat.zalo.me/api/login/getServerInfo",
                     params={
                         "imei": st["imei"],
                         "type": 30,
                         "client_version": 645,
-                        "computer_name": pc_name,
+                        "computer_name": "Web",
                         "signkey": srv_sign,
                     },
                     headers=wpa_headers,
                     timeout=8,
                 )
+                cls._harvest_cookies(r_srv, s, cookie_jar_dict)
             except Exception:
                 pass
 
             try:
+                ck_final_str = "; ".join(f"{k}={v}" for k, v in cookie_jar_dict.items() if k and v is not None)
+                wpa_headers["Cookie"] = ck_final_str
                 enc_q, enc_key = ZaloParamsEncryptor.build_encrypted_login_query(
-                    st["imei"], computer_name=pc_name, language="vi", ztype=30, client_version=645
+                    st["imei"], computer_name="Web", language="vi", ztype=30, client_version=645
                 )
                 r_enc_login = s.get(
                     "https://wpa.chat.zalo.me/api/login/getLoginInfo",
@@ -5495,30 +5645,6 @@ class ZaloQRLoginManager:
                     user_info_got = raw_d
             except Exception:
                 pass
-
-            if not user_info_got.get("zpw_enk"):
-                try:
-                    r_info = s.get(
-                        "https://wpa.zaloapp.com/api/login/getLoginInfo",
-                        params={
-                            "imei": st["imei"],
-                            "zpw_ver": 645,
-                            "zpw_type": 30,
-                            "type": 30,
-                            "client_version": 645,
-                            "computer_name": pc_name,
-                            "language": "vi",
-                            "ts": int(time.time() * 1000),
-                        },
-                        headers=wpa_headers,
-                        timeout=10,
-                    )
-                    cls._harvest_cookies(r_info, s, cookie_jar_dict)
-                    j_info = r_info.json() if r_info.content else {}
-                    if isinstance(j_info.get("data"), dict) and j_info["data"].get("zpw_enk"):
-                        user_info_got = j_info["data"]
-                except Exception:
-                    pass
 
             cls._finalize_zalo_credentials(
                 st, st["imei"], cookie_jar_dict,
@@ -5707,11 +5833,6 @@ def login_discord_reg_session(login_email, password, two_fa_code="", twofa_type=
             except Exception:
                 continue
 
-    s, fingerprint = DiscordImmortalRegTool.perform_clean_browser_pre_handshake(
-        seed_key, referer_url="https://discord.com/login"
-    )
-    s.headers["X-Context-Properties"] = "eyJsb2NhdGlvbiI6IkxvZ2luIn0="
-
     pl = {
         "login": email_clean,
         "password": password,
@@ -5719,11 +5840,38 @@ def login_discord_reg_session(login_email, password, two_fa_code="", twofa_type=
         "login_source": None,
         "gift_code_sku_id": None,
     }
-    try:
-        r = s.post("https://discord.com/api/v9/auth/login", json=pl, timeout=15)
-        d = r.json() if r.content else {}
-    except Exception as e:
-        return {"ok": False, "error": f"Lỗi kết nối tới máy chủ Discord: {e}"}
+
+    # Tự động xoay qua dàn Proxy sạch (nếu có trong PRX) + Direct với vân tay trình duyệt Chrome 131 thật để vượt Captcha 100%!
+    proxy_candidates = ProxyPoolEngine.pick_proxy_candidates(seed_key=seed_key, max_candidates=3)
+    route_attempts = proxy_candidates + [None]
+    r = None
+    d = {}
+    s = None
+    fingerprint = ""
+    last_conn_err = ""
+
+    for px_try in route_attempts:
+        try:
+            s, fingerprint = DiscordImmortalRegTool.perform_clean_browser_pre_handshake(
+                f"{seed_key}:{px_try or 'direct'}", referer_url="https://discord.com/login", proxy_url=px_try
+            )
+            s.headers["X-Context-Properties"] = "eyJsb2NhdGlvbiI6IkxvZ2luIn0="
+            time.sleep(0.15)
+            r = s.post("https://discord.com/api/v9/auth/login", json=pl, timeout=10)
+            d = r.json() if r.content else {}
+            raw_d_str = json.dumps(d, ensure_ascii=False).lower()
+            if (d.get("captcha_key") or "captcha" in raw_d_str) and px_try is not None:
+                ProxyPoolEngine.report_proxy_bad(px_try, cooldown_sec=30.0)
+                continue
+            break
+        except Exception as e:
+            last_conn_err = str(e)
+            if px_try:
+                ProxyPoolEngine.report_proxy_bad(px_try, cooldown_sec=30.0)
+            continue
+
+    if r is None:
+        return {"ok": False, "error": f"Lỗi kết nối tới máy chủ Discord: {last_conn_err}"}
 
     if r.status_code == 200 and d.get("token"):
         tk = d["token"]
@@ -5928,45 +6076,60 @@ class DiscordClient:
     def get_channels(self, guild_id, guild_name=""):
         try:
             ep = DiscordStealthAntiBanEngine.pick_stealth_endpoint(self.token, f"/guilds/{guild_id}/channels", 0)
-            r = self.s.get(ep, timeout=12)
+            r = ProxyPoolEngine.request_with_fast_failover(self.s, "GET", ep, seed_key=f"{self.token[:12]}_{guild_id}", timeout=(2.0, 4.5))
             if r.status_code == 200:
                 channels = r.json()
                 prefix = f"[{guild_name}] " if guild_name else ""
                 out_ch = []
-                for c in channels:
-                    if c.get("type") in (0, 5):
-                        cid_s = str(c["id"])
-                        DiscordStealthAntiBanEngine.register_channel_guild(cid_s, guild_id)
-                        out_ch.append({
-                            "id": cid_s,
-                            "name": f"{prefix}# {c.get('name', 'channel')}",
-                            "type": "discord_channel",
-                            "sub_type": "guild_channel",
-                            "guild_id": str(guild_id)
-                        })
+                if isinstance(channels, list):
+                    for c in channels:
+                        if not isinstance(c, dict):
+                            continue
+                        if c.get("type") in (0, 2, 5, 10, 11, 12):
+                            cid_s = str(c.get("id") or "")
+                            if not cid_s:
+                                continue
+                            DiscordStealthAntiBanEngine.register_channel_guild(cid_s, guild_id)
+                            out_ch.append({
+                                "id": cid_s,
+                                "name": f"{prefix}# {c.get('name', 'channel')}",
+                                "type": "discord_channel",
+                                "sub_type": "guild_channel",
+                                "guild_id": str(guild_id)
+                            })
                 return out_ch
         except Exception:
             pass
         return []
 
     def get_all_boxes(self, force_refresh=False):
-        """Lấy toàn bộ danh sách Box Nhóm, Chat Riêng và Kênh Server của tài khoản Discord trong 0ms (Không chặn luồng!):"""
+        """Soi tự động FULL 100% cuộc trò chuyện Discord (Mọi Box Nhóm DM, Chat Riêng, toàn bộ Server & Kênh Chat tớI 200-500+ Nhóm):"""
         tkey = DiscordStealthAntiBanEngine._token_vault_key(self.token)
         DiscordStealthAntiBanEngine._ensure_vault_record(self.token)
 
         if not force_refresh:
             with DiscordStealthAntiBanEngine._LOCK:
-                passive = DiscordStealthAntiBanEngine._PASSIVE_READY_BOXES.get(tkey)
-                if passive and passive.get("boxes"):
-                    return list(passive["boxes"])
                 cached = DiscordStealthAntiBanEngine._BOXES_CACHE.get(tkey)
                 if cached and cached.get("boxes") and (time.time() - cached.get("ts", 0) < 600.0):
                     return list(cached["boxes"])
+                passive = DiscordStealthAntiBanEngine._PASSIVE_READY_BOXES.get(tkey)
+                if passive and passive.get("boxes"):
+                    return list(passive["boxes"])
 
         all_boxes = []
         seen_ids = set()
 
-        # Quét song song cả Box DM/Nhóm và Kênh Server để tài khoản Discord nào cũng hiện đầy đủ mọi Box!
+        # Ưu tiên nạp ngay các cuộc trò chuyện thu hoạch thụ động từ gói READY (nếu có)
+        with DiscordStealthAntiBanEngine._LOCK:
+            passive = DiscordStealthAntiBanEngine._PASSIVE_READY_BOXES.get(tkey)
+            if passive and passive.get("boxes"):
+                for pb in passive["boxes"]:
+                    cid = str(pb.get("id") or "")
+                    if cid and cid not in seen_ids:
+                        seen_ids.add(cid)
+                        all_boxes.append(dict(pb))
+
+        # Quét song song toàn bộ Box DM/Nhóm và toàn bộ Server (không giới hạn 12 server!) để lấy trọn vẹn 200+ nhóm
         if not self.is_bot:
             for b in self.get_dm_and_group_boxes():
                 cid = str(b.get("id") or "")
@@ -5978,8 +6141,8 @@ class DiscordClient:
         if guilds:
             def _fetch_g(g_obj):
                 return self.get_channels(g_obj["id"], g_obj.get("name", ""))
-            with ThreadPoolExecutor(max_workers=min(8, len(guilds))) as g_pool:
-                for ch_list in g_pool.map(_fetch_g, guilds[:12]):
+            with ThreadPoolExecutor(max_workers=min(16, max(1, len(guilds)))) as g_pool:
+                for ch_list in g_pool.map(_fetch_g, guilds[:120]):
                     for ch in (ch_list or []):
                         cid = str(ch.get("id") or "")
                         if cid and cid not in seen_ids:
@@ -5989,6 +6152,7 @@ class DiscordClient:
         if all_boxes:
             with DiscordStealthAntiBanEngine._LOCK:
                 DiscordStealthAntiBanEngine._BOXES_CACHE[tkey] = {"ts": time.time(), "boxes": list(all_boxes)}
+                DiscordStealthAntiBanEngine._PASSIVE_READY_BOXES[tkey] = {"ts": time.time(), "boxes": list(all_boxes)}
             try:
                 conn = db()
                 conn.execute(
@@ -6109,6 +6273,8 @@ class DiscordClient:
                 out_lines.append(clean_ln)
         return "\n".join(out_lines)
 
+    _DISCORD_MSG_FORMAT_CACHE = {}
+
     def send_message(self, channel_id, content, color_mode="rainbow", fixed_color=None,
                      antiband=True, mentions=None, tag_all=False, strip_line_num=False,
                      is_heading=True, stop_ev=None, start_global_epoch=None, start_box_epoch=None,
@@ -6120,57 +6286,58 @@ class DiscordClient:
             self.token, is_bot=self.is_bot, channel_id=channel_id
         )
 
-        if not priority_bypass:
-            if not DiscordStealthAntiBanEngine.acquire_multi_group_slot(
-                self.token, channel_id, stop_ev=stop_ev,
-                start_global_epoch=start_global_epoch, start_box_epoch=start_box_epoch
-            ):
-                return None
+        m_sig = tuple((str(m.get("uid") or m.get("id") or ""), bool(m.get("is_role"))) for m in (mentions or []))
+        cache_k = (content, color_mode, bool(is_heading), bool(strip_line_num), bool(tag_all), m_sig)
+        cached_pair = self._DISCORD_MSG_FORMAT_CACHE.get(cache_k)
+        if cached_pair is not None:
+            raw, base_formatted = cached_pair
+        else:
+            raw = clean_corrupted_shortcuts(content)
+            if strip_line_num:
+                raw = "\n".join(strip_leading_line_number(ln) for ln in raw.split("\n"))
 
-        raw = clean_corrupted_shortcuts(content)
-        if strip_line_num:
-            raw = "\n".join(strip_leading_line_number(ln) for ln in raw.split("\n"))
-
-        tag_tokens = []
-        if tag_all:
-            tag_tokens.append("@everyone")
-        if mentions:
-            seen_u = set()
-            for m in mentions:
-                uid = str(m.get("uid") or m.get("id") or "").strip()
-                if uid and uid not in ("0", "-1") and uid not in seen_u:
-                    seen_u.add(uid)
-                    if uid.isdigit():
-                        if m.get("is_role"):
-                            tag_tokens.append(f"<@&{uid}>")
+            tag_tokens = []
+            if tag_all:
+                tag_tokens.append("@everyone")
+            if mentions:
+                seen_u = set()
+                for m in mentions:
+                    uid = str(m.get("uid") or m.get("id") or "").strip()
+                    if uid and uid not in ("0", "-1") and uid not in seen_u:
+                        seen_u.add(uid)
+                        if uid.isdigit():
+                            if m.get("is_role"):
+                                tag_tokens.append(f"<@&{uid}>")
+                            else:
+                                tag_tokens.append(f"<@{uid}>")
                         else:
-                            tag_tokens.append(f"<@{uid}>")
-                    else:
-                        clean_mname = str(m.get("name") or uid).lstrip("@").strip()
-                        tag_tokens.append(f"@{clean_mname}")
-        tag_suffix = (" " + " ".join(tag_tokens)) if tag_tokens else ""
+                            clean_mname = str(m.get("name") or uid).lstrip("@").strip()
+                            tag_tokens.append(f"@{clean_mname}")
+            tag_suffix = (" " + " ".join(tag_tokens)) if tag_tokens else ""
 
-        # Nếu raw vô tình chỉ chứa thẻ <@...> hoặc rỗng sau khi tách tag, tự động bù nội dung chuẩn để không bao giờ chỉ gửi mỗi tên Tag!
-        raw_stripped_check = re.sub(r"<@(?:!|&)?\d+>", "", str(raw or "")).strip()
-        if not raw_stripped_check:
-            raw = "Hệ thống Hệ Thống Đa Luồng điểm danh siêu tốc!"
+            raw_stripped_check = re.sub(r"<@(?:!|&)?\d+>", "", str(raw or "")).strip()
+            if not raw_stripped_check:
+                raw = "Hệ thống Hệ Thống Đa Luồng điểm danh siêu tốc!"
 
-        unframed_body = self.format_unframed_discord_text(
-            raw, is_heading=is_heading, style_mode=color_mode
-        )
-        if len(unframed_body) + len(tag_suffix) > 1940:
-            max_body_len = max(100, 1940 - len(tag_suffix))
-            unframed_body = unframed_body[:max_body_len].rstrip()
-            if unframed_body.count("**") % 2 == 1:
-                unframed_body += "**"
-        formatted_content = f"{unframed_body}{tag_suffix}".strip()
+            unframed_body = self.format_unframed_discord_text(
+                raw, is_heading=is_heading, style_mode=color_mode
+            )
+            if len(unframed_body) + len(tag_suffix) > 1940:
+                max_body_len = max(100, 1940 - len(tag_suffix))
+                unframed_body = unframed_body[:max_body_len].rstrip()
+                if unframed_body.count("**") % 2 == 1:
+                    unframed_body += "**"
+            base_formatted = f"{unframed_body}{tag_suffix}".strip()
+            if len(self._DISCORD_MSG_FORMAT_CACHE) > 4000:
+                self._DISCORD_MSG_FORMAT_CACHE.clear()
+            self._DISCORD_MSG_FORMAT_CACHE[cache_k] = (raw, base_formatted)
 
         if antiband:
             formatted_content = DiscordStealthAntiBanEngine.append_stealth_tail(
-                formatted_content, channel_id=str(channel_id)
+                base_formatted, channel_id=str(channel_id)
             )
         else:
-            formatted_content = DiscordFirewallEngine.sanitize_outbound_text(formatted_content)
+            formatted_content = DiscordFirewallEngine.sanitize_outbound_text(base_formatted)
 
         register_system_sent_message(text=formatted_content)
         register_system_sent_message(text=raw)
@@ -6188,22 +6355,44 @@ class DiscordClient:
         if not priority_bypass and is_task_stopped_fast(stop_ev, start_global_epoch, start_box_epoch, channel_id):
             return None
         active_sess = DiscordStealthAntiBanEngine.get_priority_session(self.token, is_bot=self.is_bot) if priority_bypass else self.s
-        r = ProxyPoolEngine.request_with_fast_failover(
-            active_sess, "POST", url,
-            seed_key=f"{self.token[:16]}_{channel_id}",
-            json=pl, headers=req_headers, timeout=(1.8, 3.8)
-        )
-        if r.cookies:
-            DiscordStealthAntiBanEngine.persist_real_cloudflare_cookies(self.token, self.s.cookies)
-        DiscordStealthAntiBanEngine.record_bucket_headers(channel_id, r.headers, token=self.token)
+        r = None
+        for _send_try in range(2):
+            if not priority_bypass and is_task_stopped_fast(stop_ev, start_global_epoch, start_box_epoch, channel_id):
+                return None
+            r = ProxyPoolEngine.request_with_fast_failover(
+                active_sess, "POST", url,
+                seed_key=f"{self.token[:16]}_{channel_id}_{self.route_step}_{_send_try}",
+                json=pl, headers=req_headers, timeout=(1.2, 2.5)
+            )
+            if r.cookies:
+                DiscordStealthAntiBanEngine.persist_real_cloudflare_cookies(self.token, self.s.cookies)
+            DiscordStealthAntiBanEngine.record_bucket_headers(channel_id, r.headers, token=self.token)
+            if r.status_code in (200, 201):
+                break
+            if r.status_code == 429 and _send_try == 0:
+                try:
+                    rj = r.json()
+                    retry_after = float(rj.get("retry_after", 0.25))
+                except Exception:
+                    retry_after = 0.25
+                # Nếu retry_after nhỏ (<= 0.28s), nhích 0.02s rồi đổi PRX bắn tiếp ngay; nếu lớn hơn thì thoát ngay trong 0ms để luồng nhảy sang nhóm kế tiếp không bao giờ đơ!
+                if retry_after <= 0.28:
+                    if interruptible_wait(stop_ev, 0.02, start_global_epoch, start_box_epoch, channel_id):
+                        return None
+                    pl["nonce"] = DiscordStealthAntiBanEngine.generate_snowflake_nonce()
+                    continue
+            break
+
+        if r is None:
+            return None
 
         if r.status_code == 429:
             try:
                 rj = r.json()
-                retry_after = float(rj.get("retry_after", 5.0))
+                retry_after = float(rj.get("retry_after", 0.5))
                 err_code = int(rj.get("code", 0))
             except Exception:
-                retry_after = 5.0
+                retry_after = 0.5
                 err_code = 0
             DiscordStealthAntiBanEngine.set_channel_cooldown(channel_id, retry_after, token=self.token)
             raise Exception(f"429:RateLimit:{retry_after}:DiscordCode_{err_code}")
@@ -7884,10 +8073,10 @@ def box_target_worker(client, acc_id, plat, target, blocks, runtime_opts,
         strip_line_num = bool(runtime_opts.get("strip_line_num", True)) or (mode == "treo_nhay")
 
         tok_for_check = getattr(client, "token", None) if plat == "discord" else None
-        if antidieall:
+        if antidieall and delay > 0.0:
             ok_send, wait_sec = HEALTH_MGR.can_send(acc_id, channel_id=target_id, platform=plat, token=tok_for_check)
             if not ok_send:
-                if interruptible_wait(stop_ev, min(0.5, max(0.04, wait_sec)), start_global_epoch, start_box_epoch, target_id):
+                if interruptible_wait(stop_ev, min(0.15, max(0.02, wait_sec)), start_global_epoch, start_box_epoch, target_id):
                     break
                 continue
 
@@ -8065,6 +8254,9 @@ def box_target_worker(client, acc_id, plat, target, blocks, runtime_opts,
                     text, eff_mentions, eff_tag_all, color_mode, fixed_color,
                     is_heading, antiband, use_emoji, icon_count, False, color_counter
                 )
+                wave_key = runtime_opts.get("_wave_key", "")
+                if wave_key:
+                    WaveFairnessEngine.record_acc_sent(wave_key, acc_id)
                 color_counter += 1
 
             elif mode == "treo_nhay":
@@ -8087,17 +8279,26 @@ def box_target_worker(client, acc_id, plat, target, blocks, runtime_opts,
                     is_heading = bool(runtime_opts.get("is_heading", is_heading))
                     antiband = bool(runtime_opts.get("antiband", antiband))
 
-                    if antidieall:
+                    if antidieall and delay > 0.0:
                         ok_s, w_s = HEALTH_MGR.can_send(acc_id, channel_id=target_id, platform=plat, token=tok_for_check)
                         if not ok_s:
-                            if interruptible_wait(stop_ev, min(0.5, max(0.04, w_s)), start_global_epoch, start_box_epoch, target_id):
+                            if interruptible_wait(stop_ev, min(0.15, max(0.02, w_s)), start_global_epoch, start_box_epoch, target_id):
                                 break
                             continue
+
+                    wave_key = runtime_opts.get("_wave_key", "")
+                    if wave_key:
+                        fair_w = WaveFairnessEngine.get_fair_pacing_pause(wave_key, acc_id, delay)
+                        if fair_w > 0.0:
+                            if interruptible_wait(stop_ev, fair_w, start_global_epoch, start_box_epoch, target_id):
+                                break
 
                     _fire_single_packet(
                         ln, eff_mentions, eff_tag_all, color_mode, fixed_color,
                         is_heading, antiband, use_emoji, icon_count, True, color_counter
                     )
+                    if wave_key:
+                        WaveFairnessEngine.record_acc_sent(wave_key, acc_id)
                     color_counter += 1
                     step_d = HEALTH_MGR.get_adaptive_delay(
                         acc_id, delay, antiband=antiband, platform=plat, text_len=len(ln), active_box_count=active_box_count
@@ -8105,17 +8306,22 @@ def box_target_worker(client, acc_id, plat, target, blocks, runtime_opts,
                     if step_d > 0.0:
                         if interruptible_wait(stop_ev, step_d, start_global_epoch, start_box_epoch, target_id):
                             break
-                    else:
-                        if interruptible_wait(stop_ev, 0.02, start_global_epoch, start_box_epoch, target_id):
-                            break
                 continue
 
             else:
+                wave_key = runtime_opts.get("_wave_key", "")
+                if wave_key:
+                    fair_w = WaveFairnessEngine.get_fair_pacing_pause(wave_key, acc_id, delay)
+                    if fair_w > 0.0:
+                        if interruptible_wait(stop_ev, fair_w, start_global_epoch, start_box_epoch, target_id):
+                            break
                 text = strip_leading_line_number(clean_raw) if strip_line_num else clean_raw
                 _fire_single_packet(
                     text, eff_mentions, eff_tag_all, color_mode, fixed_color,
                     is_heading, antiband, use_emoji, icon_count, strip_line_num, color_counter
                 )
+                if wave_key:
+                    WaveFairnessEngine.record_acc_sent(wave_key, acc_id)
                 color_counter += 1
 
         except Exception as e:
@@ -8127,7 +8333,7 @@ def box_target_worker(client, acc_id, plat, target, blocks, runtime_opts,
                 try:
                     retry_after = float(parts[2])
                 except Exception:
-                    retry_after = 1.5
+                    retry_after = 0.4
                 HEALTH_MGR.report_rate_limit(acc_id, retry_after, reason=err_str, channel_id=target_id)
             elif "AuthError" in err_str:
                 HEALTH_MGR.report_error(acc_id, err_str, is_auth_error=True)
@@ -8140,9 +8346,179 @@ def box_target_worker(client, acc_id, plat, target, blocks, runtime_opts,
         if actual_delay > 0.0:
             if interruptible_wait(stop_ev, actual_delay, start_global_epoch, start_box_epoch, target_id):
                 break
-        else:
-            if interruptible_wait(stop_ev, 0.02, start_global_epoch, start_box_epoch, target_id):
+
+def multi_box_shard_worker(client, acc_id, plat, shard_targets, blocks, runtime_opts,
+                           stop_ev, counter, lock, stagger_sec=0.0, active_box_count=1):
+    """Động Cơ Phân Mảnh Vòng Tròn Siêu Tốc (High-Velocity Non-Blocking Ring Shard Worker v24):
+    - Chuyên trị bài toán 50+ Acc × 200+ Nhóm cùng lúc ở chế độ Delay = 0s (Treo ngôn .g, Treo nhây .n, Siêu xả .xa).
+    - Thay vì tạo 10.000 luồng OS gây nghẽn GIL hoặc để 1 nhóm dính 429 làm dừng tạm thời cả luồng,
+      mỗi Shard Worker xoay vòng liên hoàn qua các nhóm được giao trong 0ms:
+      + Nhóm nào sẵn sàng là phang ngay lập tức!
+      + Nhóm nào vừa vướng cooldown ngắn (0.15s) thì tự động lướt qua (0ms, không sleep!) để bắn nhóm kế tiếp ngay,
+        nhờ đó tốc độ gửi tổng thể luôn đạt cực đại và treo ngôn / treo nhây cực mượt không bao giờ khựng hay đơ!"""
+    if not shard_targets or not blocks:
+        return
+    if len(shard_targets) == 1:
+        return box_target_worker(
+            client, acc_id, plat, shard_targets[0], blocks, runtime_opts,
+            stop_ev, counter, lock, stagger_sec=stagger_sec, active_box_count=active_box_count
+        )
+
+    start_global_epoch, _ = get_current_epochs(None)
+    if stagger_sec > 0:
+        if interruptible_wait(stop_ev, stagger_sec, start_global_epoch, None, None):
+            return
+
+    valid_targets = []
+    box_epochs = {}
+    for t in shard_targets:
+        t_type = t.get("type", "group")
+        t_id = str(t.get("id") or "").strip()
+        if not t_id:
+            continue
+        is_discord_t = (t_type == "discord_channel")
+        is_mess_t = (t_type in ("messenger_thread", "messenger_group", "messenger_user"))
+        is_zalo_t = not is_discord_t and not is_mess_t
+        if (plat == "zalo" and not is_zalo_t) or (plat == "discord" and not is_discord_t) or (plat == "messenger" and not is_mess_t):
+            continue
+        valid_targets.append(t)
+        _, b_ep = get_current_epochs(t_id)
+        box_epochs[t_id] = b_ep
+
+    if not valid_targets:
+        return
+
+    dead_targets = set()
+    target_skip_until = defaultdict(float)
+    target_b_idx = defaultdict(int)
+    color_counter = random.randint(0, 3)
+
+    while not is_task_stopped_fast(stop_ev, start_global_epoch, None, None):
+        if len(dead_targets) >= len(valid_targets):
+            break
+
+        antiband = bool(runtime_opts.get("antiband", True))
+        delay = float(runtime_opts.get("delay", 0.0))
+        use_emoji = bool(runtime_opts.get("use_emoji", True))
+        icon_count = int(runtime_opts.get("icon_count", 3))
+        is_heading = bool(runtime_opts.get("is_heading", True))
+        mode = runtime_opts.get("mode", "fast")
+        color_mode = runtime_opts.get("color_mode", "rainbow")
+        fixed_color = runtime_opts.get("fixed_color", "red")
+        tag_users = runtime_opts.get("tag_users") or []
+        tag_all = bool(runtime_opts.get("tag_all", False))
+        strip_line_num = bool(runtime_opts.get("strip_line_num", True)) or (mode == "treo_nhay")
+        wave_key = runtime_opts.get("_wave_key", "")
+
+        if mode in ("nhay_tag_all", "nhay_tag_all_an", "battrinh_all_box"):
+            tag_all = True
+        if mode in ("raid_burst", "sieu_xa_nhieu_nhom"):
+            color_mode = "word_rainbow"
+            is_heading = True
+            use_emoji = True
+            icon_count = max(icon_count, 4)
+
+        fired_in_pass = 0
+        for t in valid_targets:
+            t_id = str(t["id"])
+            if t_id in dead_targets:
+                continue
+            if is_task_stopped_fast(stop_ev, start_global_epoch, box_epochs.get(t_id), t_id):
+                dead_targets.add(t_id)
+                continue
+
+            now_t = time.time()
+            if now_t < target_skip_until[t_id]:
+                continue
+
+            cur_idx = target_b_idx[t_id]
+            target_b_idx[t_id] = cur_idx + 1
+            raw = blocks[cur_idx % len(blocks)]
+
+            if mode == "auto_shuffle" and len(blocks) > 1:
+                raw = random.choice(blocks)
+            elif mode == "combo_lien_thanh" and len(blocks) >= 2:
+                c1 = strip_leading_line_number(blocks[cur_idx % len(blocks)])
+                c2 = strip_leading_line_number(blocks[(cur_idx + 1) % len(blocks)])
+                c3 = strip_leading_line_number(blocks[(cur_idx + 2) % len(blocks)])
+                raw = f"{c1}\n{c2}\n{c3}"
+                target_b_idx[t_id] += 2
+
+            if mode == "treo_ngon":
+                pkt_text = raw.replace("\r\n", "\n").replace("\r", "\n")
+                s_num_flag = False
+            else:
+                pkt_text = strip_leading_line_number(raw) if strip_line_num else raw
+                s_num_flag = strip_line_num
+
+            is_grp = (t.get("type", "group") == "group") or bool(tag_users) or bool(tag_all)
+            t0_s = time.perf_counter()
+            try:
+                if plat == "zalo":
+                    client.send_adv(
+                        pkt_text, t_id, color_mode=color_mode, fixed_color=fixed_color,
+                        is_group=is_grp, mentions=(tag_users if is_grp else None),
+                        tag_all=(tag_all if is_grp else False), is_heading=is_heading,
+                        color_offset=color_counter, antiband=antiband,
+                        use_emoji=use_emoji, icon_count=icon_count,
+                        auto_retry_thread_type=True, strip_line_num=s_num_flag,
+                        hide_tag_all=bool(runtime_opts.get("hide_tag_all", True))
+                    )
+                elif plat == "messenger":
+                    client.send_message(
+                        t_id, pkt_text, is_group=True, mentions=tag_users,
+                        tag_all=tag_all, antiband=antiband,
+                        use_emoji=use_emoji, icon_count=icon_count,
+                        is_heading=is_heading, strip_line_num=s_num_flag,
+                        stop_ev=stop_ev, start_global_epoch=start_global_epoch, start_box_epoch=box_epochs.get(t_id)
+                    )
+                else:
+                    msg_ln = (pkt_text + " " + build_unique_zalo_icons(icon_count)) if (use_emoji and icon_count > 0) else pkt_text
+                    sent_res = client.send_message(
+                        t_id, msg_ln, color_mode=color_mode,
+                        fixed_color=fixed_color, antiband=antiband,
+                        mentions=tag_users, tag_all=tag_all,
+                        strip_line_num=s_num_flag, is_heading=is_heading,
+                        stop_ev=stop_ev, start_global_epoch=start_global_epoch, start_box_epoch=box_epochs.get(t_id)
+                    )
+                    if sent_res is None:
+                        continue
+                lat_ms = (time.perf_counter() - t0_s) * 1000.0
+                with lock:
+                    counter["sent"] += 1
+                if wave_key:
+                    WaveFairnessEngine.record_acc_sent(wave_key, acc_id)
+                HEALTH_MGR.report_success(acc_id, latency_ms=lat_ms, channel_id=t_id)
+                color_counter += 1
+                fired_in_pass += 1
+            except Exception as ex_s:
+                err_s = str(ex_s)
+                if "ChannelForbidden:" in err_s:
+                    dead_targets.add(t_id)
+                elif "429:RateLimit:" in err_s:
+                    parts = err_s.split(":")
+                    try:
+                        ra = float(parts[2])
+                    except Exception:
+                        ra = 0.3
+                    # Đánh dấu lướt nhẹ riêng nhóm này để luồng bắn ngay sang nhóm kế tiếp trong 0ms (không dừng!)
+                    target_skip_until[t_id] = time.time() + min(0.28, max(0.04, ra * 0.25))
+                    HEALTH_MGR.report_rate_limit(acc_id, ra, reason=err_s, channel_id=t_id)
+                elif "AuthError" in err_s:
+                    HEALTH_MGR.report_error(acc_id, err_s, is_auth_error=True)
+                    target_skip_until[t_id] = time.time() + 1.0
+                else:
+                    target_skip_until[t_id] = time.time() + 0.15
+                    HEALTH_MGR.report_error(acc_id, err_s, is_auth_error=False, channel_id=t_id)
+
+        if delay > 0.0:
+            if interruptible_wait(stop_ev, delay, start_global_epoch, None, None):
                 break
+        elif fired_in_pass == 0:
+            # Nếu toàn bộ nhóm trong shard đang chờ vi nhịp hết 0.04s thì nhường CPU 0.015s rồi bắn tiếp ngay
+            if interruptible_wait(stop_ev, 0.015, start_global_epoch, None, None):
+                break
+
 
 def single_acc_multi_box_dispatcher(acc_dict, targets, blocks, runtime_opts, stop_ev, counter, lock, acc_idx=0):
     acc_id = acc_dict["id"]
@@ -8220,11 +8596,27 @@ def single_acc_multi_box_dispatcher(acc_dict, targets, blocks, runtime_opts, sto
     proxy_counter = _AccCounterProxy()
     box_threads = []
     total_boxes = max(1, len(my_targets))
-    stagger_base = min(0.15, acc_idx * 0.04)
-    for idx, target in enumerate(my_targets):
+    cur_d_cfg = float(runtime_opts.get("delay", 0.0) or 0.0)
+    stagger_base = 0.0 if cur_d_cfg <= 0.05 else min(0.06, acc_idx * 0.01)
+
+    # Phân mảnh thông minh khi chạy tới 200+ nhóm trên 50+ Acc:
+    # Tối đa 16 luồng Shard/Acc (50 Acc × 16 = 800 luồng sạch), xoay vòng lệch pha giữa các Acc để 200 nhóm nổ tin nhắn đồng loạt!
+    max_shards_per_acc = 16 if total_boxes > 16 else total_boxes
+    rotated_targets = list(my_targets)
+    if len(rotated_targets) > 1 and acc_idx > 0:
+        rot_offset = (acc_idx * 3) % len(rotated_targets)
+        rotated_targets = rotated_targets[rot_offset:] + rotated_targets[:rot_offset]
+
+    shards = [[] for _ in range(max_shards_per_acc)]
+    for idx_t, t_item in enumerate(rotated_targets):
+        shards[idx_t % max_shards_per_acc].append(t_item)
+
+    for shard_list in shards:
+        if not shard_list:
+            continue
         bt = threading.Thread(
-            target=box_target_worker,
-            args=(client, acc_id, plat, target, blocks, runtime_opts, stop_ev, proxy_counter, lock, stagger_base, total_boxes),
+            target=multi_box_shard_worker,
+            args=(client, acc_id, plat, shard_list, blocks, runtime_opts, stop_ev, proxy_counter, lock, stagger_base, total_boxes),
             daemon=True
         )
         box_threads.append(bt)
@@ -8264,8 +8656,10 @@ def task_supervisor(tid, targets, blocks, runtime_opts, multi_acc, stop_ev, spec
         ACTIVE_TASKS.pop(tid, None)
         return
 
-    # Hỗ trợ tới 100+ tài khoản chạy đồng thời song song
+    # Hỗ trợ tới 100+ tài khoản chạy đồng thời song song & đăng ký Bộ Điều Phối Luồng Sóng Đều (WaveFairnessEngine)
     selected_accs = accs[:120] if multi_acc else [accs[0]]
+    runtime_opts["_wave_key"] = tid
+    WaveFairnessEngine.register_accounts_for_wave(tid, [a["id"] for a in selected_accs])
     acc_names_list = [f"{a.get('name') or 'Acc'} (#{a['id']})" for a in selected_accs]
     with TASKS_RAM_LOCK:
         if tid in TASKS_RAM_STORE:
@@ -8509,6 +8903,283 @@ def strip_invisible_chars(s):
         out.append(ch)
     return "".join(out).strip()
 
+
+class FullConversationAutoScanner:
+    """Bộ Soi Tự Động Full Cuộc Trò Chuyện Đa Nền Tảng (Discord • Zalo • Messenger Auto-Discovery Engine v24):
+    - Tự động thu hoạch và lập chỉ mục toàn bộ 200-500+ cuộc trò chuyện (Box Nhóm DM, Chat Riêng, Kênh Server, Nhóm Zalo)
+      trên tất cả 50+ tài khoản đang kết nối.
+    - Cho phép gõ lệnh .soi / .dsbox để xem danh sách đánh số #1 -> #200+ và gõ lệnh .g / .n / .xa kèm:
+      + `allnhom` / `allbox` / `nhom=all`: Gửi đồng loạt vào TẤT CẢ các nhóm đã soi!
+      + `200nhom` / `50nhom` / `nhom=200`: Gửi đồng loạt vào đúng số lượng nhóm yêu cầu!
+      + `nhom=1,2,5` hoặc `nhom=1-200` hoặc `nhom=ID1,ID2`: Gửi chính xác vào các nhóm chỉ định!"""
+
+    _LOCK = threading.RLock()
+    _CACHE_BY_PLAT = {"discord": [], "zalo": [], "messenger": []}
+    _LAST_SCAN_TS = {"discord": 0.0, "zalo": 0.0, "messenger": 0.0}
+
+    @classmethod
+    def register_live_conversation(cls, platform, box_id, box_name="", sub_type="channel", guild_id=""):
+        plat = str(platform or "discord").lower()
+        bid = str(box_id or "").strip()
+        if not bid or bid == "0":
+            return
+        t_type = "discord_channel" if plat == "discord" else ("messenger_thread" if plat == "messenger" else "group")
+        with cls._LOCK:
+            cur_list = cls._CACHE_BY_PLAT.setdefault(plat, [])
+            if any(str(x.get("id")) == bid for x in cur_list):
+                return
+            cur_list.append({
+                "id": bid,
+                "name": box_name or f"[{plat.upper()}] Box #{bid[-5:]}",
+                "type": t_type,
+                "sub_type": sub_type,
+                "guild_id": str(guild_id or ""),
+            })
+
+    @classmethod
+    def scan_full_conversations(cls, platform="discord", force_refresh=False):
+        plat = str(platform or "discord").lower()
+        now = time.time()
+        with cls._LOCK:
+            cached = cls._CACHE_BY_PLAT.get(plat) or []
+            if not force_refresh and cached and (now - cls._LAST_SCAN_TS.get(plat, 0.0) < 180.0):
+                return [dict(x, display_idx=i + 1) for i, x in enumerate(cached)]
+
+        accs = get_all_accounts_from_ram(platform=plat, enabled_only=True)
+        if not accs:
+            accs = get_all_accounts_from_ram(platform=plat, enabled_only=False)
+
+        discovered = []
+        seen_ids = set()
+
+        if plat == "discord":
+            def _scan_one_dc(a_row):
+                try:
+                    bot = DiscordClient(a_row["token"], is_bot=bool(a_row.get("is_bot", 0)))
+                    return bot.get_all_boxes(force_refresh=force_refresh)
+                except Exception:
+                    return []
+            if accs:
+                with ThreadPoolExecutor(max_workers=min(24, len(accs))) as pool:
+                    for b_list in pool.map(_scan_one_dc, accs):
+                        for b in (b_list or []):
+                            cid = str(b.get("id") or "").strip()
+                            if cid and cid not in seen_ids:
+                                seen_ids.add(cid)
+                                discovered.append({
+                                    "id": cid,
+                                    "name": b.get("name") or f"Discord Box {cid[-5:]}",
+                                    "type": "discord_channel",
+                                    "sub_type": b.get("sub_type", "channel"),
+                                })
+        elif plat == "zalo":
+            def _scan_one_zl(a_row):
+                out = []
+                try:
+                    z = Zalo.get_pooled_client(
+                        a_row["imei"], a_row["cookies"],
+                        user_agent=a_row.get("user_agent") or "",
+                        zpw_enk_hint=a_row.get("zpw_enk") or "",
+                        uid_hint=a_row.get("uid") or ""
+                    )
+                    out.extend(z.groups(use_cache=not force_refresh))
+                except Exception:
+                    pass
+                return out
+            if accs:
+                with ThreadPoolExecutor(max_workers=min(16, len(accs))) as pool:
+                    for g_list in pool.map(_scan_one_zl, accs):
+                        for g in (g_list or []):
+                            gid = str(g.get("id") or "").strip()
+                            if gid and gid not in seen_ids:
+                                seen_ids.add(gid)
+                                discovered.append({
+                                    "id": gid,
+                                    "name": g.get("name") or f"Nhóm Zalo {gid[-6:]}",
+                                    "type": "group",
+                                })
+        elif plat == "messenger":
+            for a_row in accs:
+                try:
+                    mc = MessengerClient.get_pooled_client(a_row["cookies"], uid=a_row.get("uid") or "")
+                    for th in mc.get_threads(use_cache=not force_refresh):
+                        tid = str(th.get("id") or "").strip()
+                        if tid and tid not in seen_ids:
+                            seen_ids.add(tid)
+                            discovered.append({
+                                "id": tid,
+                                "name": th.get("name") or f"Box Mess {tid[-5:]}",
+                                "type": "messenger_thread",
+                            })
+                except Exception:
+                    continue
+
+        with cls._LOCK:
+            if discovered:
+                cls._CACHE_BY_PLAT[plat] = discovered
+                cls._LAST_SCAN_TS[plat] = now
+            else:
+                discovered = list(cls._CACHE_BY_PLAT.get(plat) or [])
+
+        return [dict(x, display_idx=i + 1) for i, x in enumerate(discovered)]
+
+    @classmethod
+    def resolve_target_groups_from_spec(cls, platform, current_thread_id, is_group_default=True, spec_mode="current", spec_val=None):
+        """Giải mã danh sách nhóm mục tiêu từ lệnh chat (.g / .n / .xa):
+        - spec_mode == 'current': Chỉ gửi vào nhóm hiện tại.
+        - spec_mode == 'all': Gửi vào TẤT CẢ các nhóm đã soi (200+ nhóm)!
+        - spec_mode == 'count': Gửi vào đúng N nhóm (VD: 50 nhóm, 200 nhóm), luôn ưu tiên nhóm hiện tại đầu tiên!
+        - spec_mode == 'custom': Chọn theo dải số thứ tự (VD: 1-200), danh sách số thứ tự (1,2,3,5) hoặc danh sách ID kênh!"""
+        plat = str(platform or "discord").lower()
+        t_type_default = "discord_channel" if plat == "discord" else ("messenger_thread" if plat == "messenger" else ("group" if is_group_default else "user"))
+        cur_id_s = str(current_thread_id or "").strip()
+        base_target = {
+            "id": cur_id_s,
+            "name": f"{plat.capitalize()}_{cur_id_s[-5:]}" if cur_id_s else "Current_Box",
+            "type": t_type_default,
+        }
+        if spec_mode == "current" or not spec_mode:
+            return [base_target]
+
+        all_conv = cls.scan_full_conversations(plat, force_refresh=False)
+        if not all_conv:
+            all_conv = cls.scan_full_conversations(plat, force_refresh=True)
+
+        if spec_mode == "all":
+            out = []
+            seen = set()
+            if cur_id_s and cur_id_s != "0":
+                seen.add(cur_id_s)
+                cur_match = next((x for x in all_conv if str(x["id"]) == cur_id_s), None)
+                out.append(cur_match if cur_match else base_target)
+            for c in all_conv:
+                cid = str(c["id"])
+                if cid not in seen:
+                    seen.add(cid)
+                    out.append({"id": cid, "name": c["name"], "type": c["type"]})
+            return out if out else [base_target]
+
+        if spec_mode == "count":
+            limit_n = max(1, int(spec_val or 1))
+            out = []
+            seen = set()
+            if cur_id_s and cur_id_s != "0":
+                seen.add(cur_id_s)
+                cur_match = next((x for x in all_conv if str(x["id"]) == cur_id_s), None)
+                out.append(cur_match if cur_match else base_target)
+            for c in all_conv:
+                if len(out) >= limit_n:
+                    break
+                cid = str(c["id"])
+                if cid not in seen:
+                    seen.add(cid)
+                    out.append({"id": cid, "name": c["name"], "type": c["type"]})
+            return out if out else [base_target]
+
+        if spec_mode == "custom" and spec_val:
+            raw_spec = str(spec_val).strip()
+            out = []
+            seen = set()
+            parts = [p.strip() for p in raw_spec.replace(";", ",").split(",") if p.strip()]
+            for p in parts:
+                m_range = re.match(r"^(\d+)\s*\-\s*(\d+)$", p)
+                if m_range:
+                    a_idx, b_idx = int(m_range.group(1)), int(m_range.group(2))
+                    lo, hi = min(a_idx, b_idx), max(a_idx, b_idx)
+                    for idx_c in range(lo, hi + 1):
+                        if 1 <= idx_c <= len(all_conv):
+                            c = all_conv[idx_c - 1]
+                            cid = str(c["id"])
+                            if cid not in seen:
+                                seen.add(cid)
+                                out.append({"id": cid, "name": c["name"], "type": c["type"]})
+                elif p.isdigit():
+                    num_v = int(p)
+                    if 1 <= num_v <= len(all_conv) and len(p) <= 5:
+                        c = all_conv[num_v - 1]
+                        cid = str(c["id"])
+                        if cid not in seen:
+                            seen.add(cid)
+                            out.append({"id": cid, "name": c["name"], "type": c["type"]})
+                    elif len(p) >= 6:
+                        if p not in seen:
+                            seen.add(p)
+                            c_match = next((x for x in all_conv if str(x["id"]) == p), None)
+                            out.append(c_match if c_match else {"id": p, "name": f"Box #{p[-5:]}", "type": t_type_default})
+                else:
+                    p_low = remove_vn_accents(p)
+                    for c in all_conv:
+                        if p_low in remove_vn_accents(c.get("name", "")):
+                            cid = str(c["id"])
+                            if cid not in seen:
+                                seen.add(cid)
+                                out.append({"id": cid, "name": c["name"], "type": c["type"]})
+            return out if out else [base_target]
+
+        return [base_target]
+
+
+def extract_multigroup_spec_and_clean_body(raw_body_str, cmd_token=""):
+    """Bóc tách thông minh các tham số chọn nhóm & tag all ở bất kỳ vị trí nào trong câu lệnh (.g / .n / .xa):
+    Hỗ trợ:
+    - `allnhom`, `allbox`, `allgroup`, `fullbox`, `fullnhom`, `tatcanhom`, `nhom=all`, `box=all` -> Gửi ALL nhóm!
+    - `200nhom`, `50nhom`, `200box`, `nhom=200`, `box=50`, `sonhom=200` -> Gửi N nhóm!
+    - `nhom=1,2,3`, `nhom=1-200`, `box=1-50`, `nhom=ID1,ID2` -> Gửi các nhóm cụ thể!
+    - `tagall`, `tag=all`, `@all`, `@everyone`, `@here` -> Tự động bật Tag All!"""
+    spec_mode = "all" if cmd_token in ("gall", "gll", "ngonall", "nall", "nll", "nhayall", "xaall") else "current"
+    spec_val = None
+    inline_tag_all = False
+
+    if not raw_body_str:
+        return "", spec_mode, spec_val, inline_tag_all
+
+    tokens = raw_body_str.split()
+    kept_tokens = []
+
+    for tk in tokens:
+        tk_clean = tk.strip()
+        tk_low = remove_vn_accents(tk_clean.lower())
+
+        # Kiểm tra từ khóa gửi ALL nhóm
+        if tk_low in ("allnhom", "allbox", "allgroup", "fullbox", "fullnhom", "tatcanhom", "moinhom", "nhom=all", "box=all", "group=all", "gui=all"):
+            spec_mode = "all"
+            spec_val = "all"
+            continue
+
+        # Kiểm tra từ khóa gửi số lượng nhóm dạng <N>nhom hoặc <N>box (VD: 200nhom, 50box, 10nhom)
+        m_num_box = re.match(r"^(\d+)(?:nhom|box|group|kenh|phong)$", tk_low)
+        if m_num_box:
+            spec_mode = "count"
+            spec_val = int(m_num_box.group(1))
+            continue
+
+        # Kiểm tra từ khóa nhom=<...> hoặc box=<...> hoặc sonhom=<...>
+        m_kv_box = re.match(r"^(?:nhom|box|group|sonhom|sobox|kenh|gui)=(.+)$", tk_low)
+        if m_kv_box:
+            val_part = m_kv_box.group(1).strip()
+            if val_part in ("all", "full", "tatca", "het"):
+                spec_mode = "all"
+                spec_val = "all"
+            elif val_part.isdigit() and len(val_part) <= 4:
+                spec_mode = "count"
+                spec_val = int(val_part)
+            elif re.match(r"^(\d+)(?:nhom|box)$", val_part):
+                spec_mode = "count"
+                spec_val = int(re.match(r"^(\d+)", val_part).group(1))
+            else:
+                spec_mode = "custom"
+                spec_val = val_part
+            continue
+
+        # Kiểm tra từ khóa bật Tag All dạng chữ (VD: tagall, tag=all, @all, @everyone)
+        if tk_low in ("tagall", "tag=all", "@all", "@everyone", "@here", "tag_all"):
+            inline_tag_all = True
+            continue
+
+        kept_tokens.append(tk)
+
+    return " ".join(kept_tokens).strip(), spec_mode, spec_val, inline_tag_all
+
 def parse_and_execute_inchat_command(
     zalo_client, acc_row, thread_id, is_group, sender_id, raw_msg,
     raw_mentions=None, discord_client=None, platform="zalo", messenger_client=None,
@@ -8589,6 +9260,15 @@ def parse_and_execute_inchat_command(
         "t": "stop",
         "st": "stop",
         "ta": "stopall",
+        "soifull": "soi",
+        "scanbox": "soi",
+        "dsbox": "soi",
+        "listbox": "soi",
+        "dsnhom": "soi",
+        "gll": "gall",
+        "ngonall": "gall",
+        "nll": "nall",
+        "nhayall": "nall",
     }
     cmd_token = stealth_alias_map.get(cmd_token, cmd_token)
 
@@ -8597,12 +9277,18 @@ def parse_and_execute_inchat_command(
     )
     is_owner = (s_uid in ("0", "", my_uid, my_s2m)) or (s_uid in OWNER_UIDS_CACHE) or is_authorized_sender
     allow_all_val = acc_row.get("allow_all_cmd")
-    allow_all = True if allow_all_val is None else bool(int(allow_all_val))
+    allow_all = False if platform == "discord" else (True if allow_all_val is None else bool(int(allow_all_val)))
 
-    always_open_cmds = {"menu", "help", "lenh", "bot", "hdsd", "files", "dsfile", "listfile", "dsquyen", "stop", "dung", "dừng", "stopall", "ping", "status", "info", "id", "uid", "mem"}
-    if cmd_token not in always_open_cmds:
-        if not (is_owner or is_user_authorized_for_cmd(s_uid, my_uid, my_s2m, allow_all=allow_all, sender_name=sender_name)):
+    if platform == "discord":
+        # Trên Discord: BẮT BUỘC chỉ Chủ Acc (Owner UID) và những người đã được cấp quyền (.cp / .chophep)
+        # mới được quyền ra lệnh và sử dụng hệ thống! Người lạ gõ lệnh (kể cả .menu hay .stop) đều bị từ chối 100%!
+        if not is_owner:
             return False
+    else:
+        always_open_cmds = {"menu", "help", "lenh", "bot", "hdsd", "files", "dsfile", "listfile", "dsquyen", "stop", "dung", "dừng", "stopall", "ping", "status", "info", "id", "uid", "mem"}
+        if cmd_token not in always_open_cmds:
+            if not (is_owner or is_user_authorized_for_cmd(s_uid, my_uid, my_s2m, allow_all=allow_all, sender_name=sender_name)):
+                return False
 
     if not pre_claimed_slot:
         if not claim_command_execution_slot(platform, thread_id, s_uid, text, msg_id=msg_id):
@@ -8701,17 +9387,16 @@ def parse_and_execute_inchat_command(
         vip_st = "ON" if DiscordStealthAntiBanEngine.SUPER_VIP_MODE else "OFF"
         if platform == "discord":
             help_txt = (
-                f"⚡ HỆ THỐNG ĐIỀU KHIỂN Đa Luồng (Anti-Reset-Key: {vip_st}):\n"
-                "• .n <số file / câu> [@Tên] — Treo nhây từng dòng (0ms)\n"
-                "• .g <số file / bài> [@Tên] — Treo ngôn nguyên bài\n"
-                "• .xa <số file / câu> [@Tên] — Siêu xả đa nhóm 0s không lag\n"
-                "• .combo <số file / câu> [@Tên] — Xả liên thanh 3 dòng/nhịp\n"
-                "• .r <số file / câu> [@Tên] — Raid tốc độ ánh sáng | .a (Đảo câu)\n"
-                "• .s <nội dung> [@Tên] | .chao [@Tên] | .vip (Bật/Tắt Siêu VIP)\n"
+                f"⚡ HỆ THỐNG ĐIỀU KHIỂN 50+ ACC × 200+ NHÓM (PRX Turbo 0s: {vip_st}):\n"
+                "• .soi (hoặc .dsbox) — Tự động soi full toàn bộ cuộc trò chuyện & kênh Discord\n"
+                "• .g <file/nd> [@Tên] [@all] [allnhom | 200nhom | nhom=1-200] — Treo ngôn đa nhóm / All nhóm 0s\n"
+                "• .n <file/nd> [@Tên] [@all] [allnhom | 200nhom | nhom=1,2,3] — Treo nhây từng dòng đa nhóm 0s\n"
+                "• .gall <file/nd> [@Tên] [@all] | .nall <file/nd> [@Tên] [@all] — Phang ALL 200+ nhóm đồng loạt\n"
+                "• .xa <file/nd> [@Tên] [allnhom] — Siêu xả 50 Acc × 200 Nhóm 0s | .combo (Xả 3 câu/nhịp)\n"
+                "• .prx <add/list/test/on/off> — Quản lý Hồ Proxy Siêu Trâu 0ms Failover\n"
                 "• .f <số file> | .ds (Xem file) | .af <tên> | <nd> (Tạo file)\n"
-                f"• .d <giây> (Hiện tại: {cur_d}s) | .mau <rainbow|word|tat> ({cur_c})\n"
-                "• .ping | .status | .id | .mem | .cp @Tên | .xq @Tên\n"
-                "• .t (Dừng phòng này) | .ta (Dừng tất cả)"
+                f"• .d <giây> (Hiện tại: {cur_d}s) | .cp @Tên (Cấp quyền) | .xq @Tên (Xóa quyền)\n"
+                "• .t (Dừng phòng này) | .ta (Dừng tất cả 200 nhóm)"
             )
         elif platform == "messenger":
             help_txt = (
@@ -8776,6 +9461,29 @@ def parse_and_execute_inchat_command(
             added_c, total_c = ProxyPoolEngine.add_proxies_incremental(raw_p)
             _send_reply(f"🚀 Đã nạp thêm {added_c} Proxy mới (Tổng: {total_c} Proxy sẵn sàng truyền tin siêu tốc 0ms)!")
         log_system_command(acc_id, thread_id, sender_id, text, "Điều khiển Proxy Pool (.prx)")
+        return True
+
+    if cmd_token in ("soi",):
+        force_s = arg_body.strip().lower() in ("new", "refresh", "full", "moi", "all")
+        conv_list = FullConversationAutoScanner.scan_full_conversations(platform, force_refresh=force_s or True)
+        total_c = len(conv_list)
+        if total_c == 0:
+            _send_reply("⚠️ Chưa tìm thấy cuộc trò chuyện nào. Hãy kiểm tra lại kết nối tài khoản!")
+        else:
+            preview_items = conv_list[:25]
+            lines_s = [f"#{c['display_idx']}. {c['name']} (ID: {c['id']})" for c in preview_items]
+            more_txt = f"\n... và {total_c - 25} nhóm/kênh khác đã được lưu sẵn vào bộ nhớ!" if total_c > 25 else ""
+            guide_txt = (
+                f"🔍 ĐÃ SOI TỰ ĐỘNG FULL {total_c} CUỘC TRÒ CHUYỆN ({platform.upper()}):\n"
+                + "\n".join(lines_s)
+                + more_txt
+                + "\n\n⚡ CÚ PHÁP BẮN ĐA NHÓM & ALL NHÓM (50 ACC × 200 NHÓM DELAY 0S):\n"
+                + "• Gửi ALL nhóm: .g <file/nd> @Tên @all allnhom (hoặc .gall 1 @all)\n"
+                + f"• Gửi số lượng nhóm: .g <file/nd> @Tên @all {min(200, total_c)}nhom (hoặc nhom=50)\n"
+                + "• Gửi nhóm chỉ định: .g <file/nd> @Tên @all nhom=1,2,3,5 (hoặc nhom=1-100)"
+            )
+            _send_reply(guide_txt, broadcast_all_accs=False)
+        log_system_command(acc_id, thread_id, sender_id, text, f"Soi tự động full {total_c} cuộc trò chuyện ({platform})")
         return True
 
     if cmd_token in ("2fa", "otp", "totp"):
@@ -9238,9 +9946,11 @@ def parse_and_execute_inchat_command(
         "nhay": "treo_nhay",
         "treonhay": "treo_nhay",
         "treo_nhay": "treo_nhay",
+        "nall": "treo_nhay",
         "ngon": "treo_ngon",
         "treongon": "treo_ngon",
         "treo_ngon": "treo_ngon",
+        "gall": "treo_ngon",
         "raid": "raid_mode",
         "auto": "auto_shuffle",
         "chao": "chao_mode",
@@ -9254,6 +9964,7 @@ def parse_and_execute_inchat_command(
         "nhaypoll": "nhay_poll",
         "nhaynamebox": "nhay_namebox",
         "xa": "sieu_xa_nhieu_nhom",
+        "xaall": "sieu_xa_nhieu_nhom",
         "sieuxa": "sieu_xa_nhieu_nhom",
         "xanhom": "sieu_xa_nhieu_nhom",
         "combo": "combo_lien_thanh",
@@ -9278,8 +9989,13 @@ def parse_and_execute_inchat_command(
         is_heading = bool(SYSTEM_RUNTIME_CONFIG["is_heading"])
         antiband_flag = bool(SYSTEM_RUNTIME_CONFIG["antiband"])
 
+    # Bước 1: Bóc tách thông số chọn nhóm (allnhom, 200nhom, nhom=1-200, nhom=1,2,3) & tagall trước khi tách @Tag
+    pre_cleaned_arg, group_spec_mode, group_spec_val, inline_tag_all_1 = extract_multigroup_spec_and_clean_body(
+        arg_body, cmd_token=cmd_token
+    )
+
     cleaned_body, extracted_mentions, extracted_tag_all = extract_trailing_tags_and_resolve(
-        arg_body,
+        pre_cleaned_arg,
         incoming_mentions=raw_mentions,
         zalo_client=zalo_client if platform == "zalo" else None,
         group_id=thread_id if platform == "zalo" else None,
@@ -9291,8 +10007,25 @@ def parse_and_execute_inchat_command(
         messenger_thread_id=thread_id if platform == "messenger" else None
     )
 
-    if cmd_token in ("all", "tagall", "anall", "tagallan"):
+    # Bước 2: Bóc tách lần 2 phòng trường hợp thông số nhom=... nằm kẹp giữa nội dung và @Tag
+    cleaned_body, group_spec_mode_2, group_spec_val_2, inline_tag_all_2 = extract_multigroup_spec_and_clean_body(
+        cleaned_body, cmd_token=cmd_token
+    )
+    if group_spec_mode == "current" and group_spec_mode_2 != "current":
+        group_spec_mode = group_spec_mode_2
+        group_spec_val = group_spec_val_2
+
+    if inline_tag_all_1 or inline_tag_all_2 or cmd_token in ("all", "tagall", "anall", "tagallan"):
         extracted_tag_all = True
+
+    if group_spec_mode != "current":
+        target_obj = FullConversationAutoScanner.resolve_target_groups_from_spec(
+            platform=platform,
+            current_thread_id=thread_id,
+            is_group_default=is_group,
+            spec_mode=group_spec_mode,
+            spec_val=group_spec_val
+        )
 
     is_auto_shuffle = (chosen_mode == "auto_shuffle")
     if chosen_mode in ("raid_mode", "sieu_xa_nhieu_nhom"):
@@ -9418,7 +10151,10 @@ def parse_and_execute_inchat_command(
         blocks = list(blocks)
         random.shuffle(blocks)
 
-    stop_tasks_for_thread(thread_id)
+    if len(target_obj) > 1:
+        stop_tasks_for_thread(None)
+    else:
+        stop_tasks_for_thread(thread_id)
 
     tid = start_task_programmatic(
         targets=target_obj,
@@ -9440,8 +10176,14 @@ def parse_and_execute_inchat_command(
         trigger_cmd=text
     )
 
-    tag_desc = "@All" if extracted_tag_all else (", ".join("@" + m["name"] for m in extracted_mentions) if extracted_mentions else "Không tag")
-    log_system_command(acc_id, thread_id, sender_id, text, f"[{platform.upper()}] Chạy {chosen_mode} (Task {tid[-6:]}) | Tag: {tag_desc}")
+    tag_parts = []
+    if extracted_tag_all:
+        tag_parts.append("@All")
+    if extracted_mentions:
+        tag_parts.append(", ".join("@" + m["name"] for m in extracted_mentions))
+    tag_desc = " + ".join(tag_parts) if tag_parts else "Không tag"
+    box_desc = f"{len(target_obj)} nhóm đồng loạt" if len(target_obj) > 1 else "1 nhóm hiện tại"
+    log_system_command(acc_id, thread_id, sender_id, text, f"[{platform.upper()}] Chạy {chosen_mode} trên {box_desc} (Delay {delay_val}s) | Tag: {tag_desc}")
     return True
 
 # LISTENER 24/7 TRÊN ZALO (WEBSOCKET + HTTP FALLBACK)
@@ -10059,16 +10801,13 @@ class ZaloRealtimeListener:
         for ug in unseeded[:4]:
             if ug not in target_gids:
                 target_gids.append(ug)
-        # Ưu tiên 5: Vòng xoay tuần tự qua toàn bộ các nhóm còn lại
-        batch_size = min(4, len(all_gids))
-        start_i = self.poll_cursor % len(all_gids)
-        for i in range(batch_size):
-            g_cand = str(all_gids[(start_i + i) % len(all_gids)])
-            if g_cand not in target_gids:
-                target_gids.append(g_cand)
-        self.poll_cursor = (start_i + batch_size) % len(all_gids)
+        # Chỉ quét sâu các nhóm thực sự có thay đổi gridVerMap hoặc đang chạy chiến dịch (giữ Cookie/IMEI bền vững 100%)
+        if not target_gids and all_gids:
+            g_cand = str(all_gids[self.poll_cursor % len(all_gids)])
+            target_gids.append(g_cand)
+            self.poll_cursor = (self.poll_cursor + 1) % len(all_gids)
 
-        selected_batch = target_gids[:10]
+        selected_batch = target_gids[:3]
         if not selected_batch:
             return
 
@@ -10095,25 +10834,24 @@ class ZaloRealtimeListener:
                     uid_hint=acc_row.get("uid") or ""
                 )
                 now_ka = time.time()
-                if now_ka - getattr(self, "_last_pc_keepalive_ts", 0.0) > 120.0:
+                if now_ka - getattr(self, "_last_pc_keepalive_ts", 0.0) > 180.0:
                     self._last_pc_keepalive_ts = now_ka
                     try:
-                        pc_lbl = acc_row.get("pc_name") or "DESKTOP-VN92K8M (Windows 11 Pro)"
-                        srv_sign = hashlib.md5(f"zsecuregetserverinfo{client.imei}30645{pc_lbl}".encode("utf-8")).hexdigest()
+                        srv_sign = hashlib.md5(f"zsecuregetserverinfo645Web{client.imei}30".encode("utf-8")).hexdigest()
                         client.s.get(
                             "https://wpa.chat.zalo.me/api/login/getServerInfo",
-                            params={"imei": client.imei, "type": 30, "client_version": 645, "computer_name": pc_lbl, "signkey": srv_sign},
+                            params={"imei": client.imei, "type": 30, "client_version": 645, "computer_name": "Web", "signkey": srv_sign},
                             timeout=4.0
                         )
                     except Exception:
                         pass
                 self._poll_active_groups_inline(client, acc_row)
                 if "Cần cập nhật" in self.ws_status or "Đang" in self.ws_status or time.time() < self.ws_conflict_until:
-                    self.ws_status = "Thiết Bị PC Đang Trong Acc (.menu Sẵn Sàng 24/7)"
+                    self.ws_status = "APIZalo Đã Log Trong Acc (.menu Sẵn Sàng 24/7)"
             except Exception as e:
                 if "Phiên đăng nhập" in str(e) or "zpw_enk" in str(e):
                     self.ws_status = "Cần cập nhật lại Cookie Zalo"
-            self.stop_ev.wait(0.95)
+            self.stop_ev.wait(2.2)
 
     def _run_ws_session(self, client, acc_row, ws_url):
         parsed = urlparse(ws_url)
@@ -10594,8 +11332,21 @@ class DiscordRealtimeListener:
                         elif op == 0 and t_ev == "RESUMED":
                             self.ws_status = "Discord Ghost Vault (Resumed - .menu Sẵn Sàng)"
 
+                        elif op == 0 and t_ev in ("CHANNEL_CREATE", "THREAD_CREATE") and isinstance(d_ev, dict):
+                            cid_new = str(d_ev.get("id") or "")
+                            cname_new = d_ev.get("name") or f"Box #{cid_new[-5:]}"
+                            if cid_new:
+                                FullConversationAutoScanner.register_live_conversation(
+                                    "discord", cid_new, f"[Auto-Soi] # {cname_new}", guild_id=str(d_ev.get("guild_id") or "")
+                                )
+
                         elif op == 0 and t_ev == "MESSAGE_CREATE" and isinstance(d_ev, dict):
                             self.last_event_ts = time.time()
+                            cid_m = str(d_ev.get("channel_id") or "")
+                            if cid_m:
+                                FullConversationAutoScanner.register_live_conversation(
+                                    "discord", cid_m, f"[Active] Box #{cid_m[-5:]}", guild_id=str(d_ev.get("guild_id") or "")
+                                )
                             self._handle_discord_message_event(client, acc_now, d_ev)
 
                         elif op == 1:
@@ -11676,8 +12427,11 @@ input,select,textarea,button{font-family:inherit;font-size:13px}
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:4px">
                 <label class="field-lbl" style="margin:0;color:#1e40af">Chọn Nhanh Box / Kênh Mục Tiêu (<span id="quickBoxSelectedCount">0</span> Box đã chọn):</label>
                 <div style="display:flex;gap:4px;flex-wrap:wrap">
-                  <button type="button" class="btn btn-primary btn-sm" id="btnQuickLoadBoxes" onclick="loadGroupsAndRooms(true)">🔄 Quét Tải Box Ngay</button>
-                  <button type="button" class="btn btn-sm" onclick="selectAllTargets()">Chọn hết</button>
+                  <button type="button" class="btn btn-primary btn-sm" id="btnQuickLoadBoxes" onclick="loadGroupsAndRooms(true)">🔍 Soi Full Cuộc Trò Chuyện</button>
+                  <button type="button" class="btn btn-sm" onclick="selectTopNTargets(50)">Chọn 50 Nhóm</button>
+                  <button type="button" class="btn btn-sm" onclick="selectTopNTargets(100)">Chọn 100 Nhóm</button>
+                  <button type="button" class="btn btn-sm" onclick="selectTopNTargets(200)">Chọn 200 Nhóm</button>
+                  <button type="button" class="btn btn-success btn-sm" onclick="selectAllTargets()">Chọn ALL Nhóm</button>
                   <button type="button" class="btn btn-sm" onclick="clearAllTargets()">Bỏ chọn</button>
                 </div>
               </div>
@@ -13030,6 +13784,24 @@ function fetchRoomMembersByIdx(idx) {
   const item = ALL_TARGETS[Number(idx)];
   if (!item) return;
   fetchRoomMembers(String(item.id), item.type);
+}
+
+function selectTopNTargets(limitN) {
+  const visible = getFilteredTargetItems().slice(0, Number(limitN) || 200);
+  const bindPerAcc = Boolean(document.getElementById('chkBindBoxToSpecificAcc') && document.getElementById('chkBindBoxToSpecificAcc').checked);
+  visible.forEach(({t}) => {
+    const idStr = String(t.id);
+    let assignedAccs = [];
+    if (bindPerAcc) {
+      if (ROOM_ACCOUNT_FILTER !== 'all') assignedAccs = [parseInt(ROOM_ACCOUNT_FILTER, 10)];
+      else if (t.acc_ids && t.acc_ids.length) assignedAccs = t.acc_ids.slice();
+    }
+    const key = (ROOM_ACCOUNT_FILTER !== 'all' && bindPerAcc) ? `${ROOM_ACCOUNT_FILTER}::${idStr}` : `all::${idStr}`;
+    SELECTED_TARGETS.set(key, {id: idStr, name: t.name, type: t.type, strict_bind: bindPerAcc, assigned_acc_ids: assignedAccs});
+  });
+  renderTargetList();
+  updateTargetBadges();
+  showToast(`Đã chọn nhanh ${visible.length} nhóm mục tiêu!`);
 }
 
 function selectAllTargets() {
