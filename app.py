@@ -1,3 +1,17 @@
+import sys, types
+try:
+    import zalo_login as _zl_mod
+except ImportError:
+    _zl_mod = types.ModuleType("zalo_login")
+    class LoginQRCallbackEventType:
+        QRCodeGenerated = "QRCodeGenerated"
+        QRCodeExpired = "QRCodeExpired"
+        QRCodeScanned = "QRCodeScanned"
+        QRCodeDeclined = "QRCodeDeclined"
+        GotLoginInfo = "GotLoginInfo"
+    _zl_mod.LoginQRCallbackEventType = LoginQRCallbackEventType
+    sys.modules["zalo_login"] = _zl_mod
+
 import os
 import re
 import ssl
@@ -845,6 +859,7 @@ SYSTEM_RUNTIME_CONFIG = {
     "delay": 0.0,
     "color_mode": "rainbow",
     "fixed_color": "red",
+    "font_style": "big_bold",
     "icon_count": 3,
     "use_emoji": True,
     "is_heading": True,
@@ -893,7 +908,7 @@ VALID_SYSTEM_CMD_TOKENS = {
     "ping", "p", "status", "info", "stinfo", "id", "uid", "mem", "tv", "thanhvien",
     "addfile", "taof", "af", "clear", "reset",
     "delay", "tocdo", "time", "d", "mau", "color", "doimau",
-    "icon", "emoji", "chuto", "heading", "antiband", "antiban",
+    "icon", "emoji", "chuto", "heading", "chunho", "cochu", "kieuchu", "font", "antiband", "antiban",
     "chophep", "capquyen", "adduser", "add", "admin",
     "xoaquyen", "deluser", "del", "cam",
     "dsquyen", "listuser", "quyen",
@@ -1054,19 +1069,29 @@ def list_authorized_users():
 
 # BỘ ICON & EMOJI CHUẨN ZALO 100% (ĐÃ FIX TRIỆT ĐỂ LỖI CHỮ THÔ ':-')
 ZALO_PALETTE = [
-    {"id": "red",    "name": "Đỏ Rực",        "hex": "#db342e", "zcode": "db342e"},
+    {"id": "red",    "name": "Đỏ Rực",         "hex": "#db342e", "zcode": "db342e"},
+    {"id": "orange", "name": "Cam Rực Lửa",    "hex": "#f27806", "zcode": "f27806"},
     {"id": "yellow", "name": "Vàng Hoàng Kim", "hex": "#f7b503", "zcode": "f7b503"},
     {"id": "green",  "name": "Xanh Ngọc Lục",  "hex": "#15a85f", "zcode": "15a85f"},
-    {"id": "orange", "name": "Cam Rực Lửa",    "hex": "#f27806", "zcode": "f27806"},
+    {"id": "blue",   "name": "Xanh Dương VIP", "hex": "#0068ff", "zcode": "0068ff"},
+    {"id": "cyan",   "name": "Xanh Băng Tuyết","hex": "#00b4d8", "zcode": "00b4d8"},
+    {"id": "purple", "name": "Tím Hoàng Gia",  "hex": "#8b5cf6", "zcode": "8b5cf6"},
+    {"id": "pink",   "name": "Hồng Ánh Sao",   "hex": "#ec4899", "zcode": "ec4899"},
 ]
 
-ZALO_NATIVE_ZCODES = ["db342e", "f7b503", "15a85f", "f27806"]
+ZALO_NATIVE_ZCODES = ["db342e", "f27806", "f7b503", "15a85f", "0068ff", "00b4d8", "8b5cf6", "ec4899"]
+ZALO_FIRE_ZCODES = ["db342e", "f27806", "f7b503"]
+ZALO_OCEAN_ZCODES = ["15a85f", "00b4d8", "0068ff"]
+ZALO_ROYAL_ZCODES = ["8b5cf6", "ec4899", "db342e", "f7b503"]
 ZALO_COLOR_MAP = {
     "red": "db342e", "do": "db342e", "đỏ": "db342e",
+    "orange": "f27806", "cam": "f27806",
     "yellow": "f7b503", "vang": "f7b503", "vàng": "f7b503",
     "green": "15a85f", "xanh": "15a85f", "xanhla": "15a85f",
-    "orange": "f27806", "cam": "f27806",
-    "ocean": "15a85f", "blue": "f7b503", "purple": "db342e", "pink": "f27806",
+    "blue": "0068ff", "xanhduong": "0068ff",
+    "cyan": "00b4d8", "ngoc": "00b4d8", "ocean": "00b4d8",
+    "purple": "8b5cf6", "tim": "8b5cf6", "tím": "8b5cf6",
+    "pink": "ec4899", "hong": "ec4899", "hồng": "ec4899",
 }
 
 ZALO_ICON_VIP = [
@@ -1139,6 +1164,25 @@ def _is_emoji_or_zalo_shortcut_token(tk):
         return True
     return False
 
+def strip_trailing_icons_when_zero(text):
+    """Khi .icon 0 đang bật, loại bỏ toàn bộ icon/emoji thừa ở cuối mỗi dòng nhưng giữ nguyên 100% thụt dòng đầu câu!"""
+    if not text:
+        return ""
+    out_lines = []
+    for ln in str(text).split("\n"):
+        if not ln.strip():
+            out_lines.append(ln)
+            continue
+        leading_len = len(ln) - len(ln.lstrip(" \t"))
+        leading_ws = ln[:leading_len]
+        body_part = ln[leading_len:]
+        tokens = body_part.split(" ")
+        while tokens and _is_emoji_or_zalo_shortcut_token(tokens[-1].strip()):
+            tokens.pop()
+        cleaned_body = " ".join(tokens).rstrip()
+        out_lines.append(leading_ws + (cleaned_body if cleaned_body else body_part.rstrip()))
+    return "\n".join(out_lines)
+
 # BỘ LỌC TỰ ĐỘNG XOÁ SỐ THỨ TỰ ĐẦU DÒNG ("1. ", "2. ", "3) ") & TẢI FILE NHANH
 FILE_MEMORY_CACHE = {}
 FILE_CACHE_LOCK = threading.RLock()
@@ -1148,9 +1192,16 @@ LEADING_NUMBER_RE = re.compile(
     re.IGNORECASE
 )
 
-def strip_leading_line_number(line):
+def strip_leading_line_number(line, preserve_indent=False):
     if not line:
         return ""
+    if preserve_indent:
+        raw_r = str(line).rstrip("\r\n")
+        lead_len = len(raw_r) - len(raw_r.lstrip(" \t"))
+        lead_ws = raw_r[:lead_len]
+        body_c = LEADING_NUMBER_RE.sub("", raw_r[lead_len:]).rstrip()
+        body_c = clean_corrupted_shortcuts(body_c)
+        return lead_ws + (body_c if body_c else raw_r[lead_len:])
     cleaned = LEADING_NUMBER_RE.sub("", line.strip()).strip()
     cleaned = clean_corrupted_shortcuts(cleaned)
     return cleaned if cleaned else line.strip()
@@ -1181,10 +1232,11 @@ def parse_file_stream_fast(filepath, strip_numbers=True):
     raw_lines = text.split("\n")
 
     for ln in raw_lines:
-        stripped = ln.strip()
+        r_ln = ln.rstrip("\r\n")
+        stripped = r_ln.strip()
         if stripped:
-            raw_non_empty_lines.append(stripped)
-            clean_ln = strip_leading_line_number(stripped) if strip_numbers else clean_corrupted_shortcuts(stripped)
+            raw_non_empty_lines.append(r_ln)
+            clean_ln = strip_leading_line_number(r_ln, preserve_indent=True) if strip_numbers else clean_corrupted_shortcuts(r_ln)
             all_lines.append(clean_ln)
             current_block.append(clean_ln)
         else:
@@ -1601,7 +1653,7 @@ class ProxyPoolEngine:
                 px_sess = cls._get_or_create_proxy_session(raw_px)
                 px_kwargs = dict(kwargs)
                 px_kwargs.pop("proxies", None)
-                px_kwargs["timeout"] = (0.75, 1.95)
+                px_kwargs["timeout"] = (0.42, 0.95)
                 if base_headers and "headers" not in px_kwargs:
                     px_kwargs["headers"] = base_headers
                 if base_cookies and "cookies" not in px_kwargs:
@@ -1620,7 +1672,7 @@ class ProxyPoolEngine:
                     cls.report_proxy_bad(raw_px, cooldown_sec=12.0)
 
         if "timeout" not in kwargs:
-            kwargs["timeout"] = (1.5, 3.0)
+            kwargs["timeout"] = (0.85, 1.85)
         return session_obj.request(method, url, **kwargs)
 
     @classmethod
@@ -1681,10 +1733,8 @@ class ProxyPoolEngine:
 
 
 class Chrome131TLSAdapter(HTTPAdapter):
-    """Bộ điều hợp TLS chuẩn trình duyệt Chrome 131 (Chống phát hiện JA3/JA4 Fingerprint):
-    - Ép toàn bộ kết nối HTTPS của requests.Session sử dụng đúng bộ khóa mã hóa TLS 1.3 / ECDHE và ALPN http/1.1
-      giống hệt kết nối Gateway WebSocket, ngăn chặn hoàn toàn việc Cloudflare/Discord phát hiện lệch vân tay TLS
-      khi gõ lệnh gửi tin nhắn POST /messages!"""
+    """Bộ điều hợp TLS chuẩn trình duyệt Chrome 131 + TCP_NODELAY (PRX > 1.500+ Tin/Phút Không Độ Trễ):
+    - Tắt thuật toán Nagle (TCP_NODELAY = 1) và bật SO_KEEPALIVE trên từng socket giúp đẩy gói tin tức thì trong 0ms!"""
 
     def __init__(self, *args, **kwargs):
         self._ssl_ctx = DiscordStealthAntiBanEngine.create_chrome_tls_context()
@@ -1692,10 +1742,18 @@ class Chrome131TLSAdapter(HTTPAdapter):
 
     def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
         pool_kwargs["ssl_context"] = self._ssl_ctx
+        pool_kwargs["socket_options"] = [
+            (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),
+            (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+        ]
         return super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
 
     def proxy_manager_for(self, proxy, **proxy_kwargs):
         proxy_kwargs["ssl_context"] = self._ssl_ctx
+        proxy_kwargs["socket_options"] = [
+            (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),
+            (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+        ]
         return super().proxy_manager_for(proxy, **proxy_kwargs)
 
 class DiscordFirewallEngine:
@@ -1765,21 +1823,9 @@ class DiscordFirewallEngine:
 
     @classmethod
     def apply_pure_latin_polymorphism(cls, text, channel_id=""):
-        """Đa hình tin nhắn 100% thuần Latin/ASCII (Không Cyrillic, Không Zero-Width):
-        Giúp chạy tốc độ 0.0s trên Discord mà mỗi tin nhắn vẫn có mã băm khác nhau và vượt qua 100% bộ lọc Trust & Safety."""
-        clean_t = cls.sanitize_outbound_text(text)
-        if not clean_t:
-            return clean_t
-        # Nếu là tin nhắn hệ thống ngắn hoặc danh sách ghi chú nhiều dòng (> 4 dòng) thì giữ nguyên bản sạch
-        if clean_t.count("\n") >= 4:
-            return clean_t
-        global _ANTIBAN_COUNTER
-        with _ANTIBAN_LOCK:
-            _ANTIBAN_COUNTER = (_ANTIBAN_COUNTER + 1) & 0xFFFFFF
-            seq = _ANTIBAN_COUNTER
-        c_hash = zlib.crc32(str(channel_id or "dc").encode("utf-8")) & 0xFF
-        suffix = cls.PURE_LATIN_VARIATIONS[(seq + c_hash) % len(cls.PURE_LATIN_VARIATIONS)]
-        return f"{clean_t}{suffix}"
+        """Giữ nguyên 100% nội dung gốc và thụt dòng của người dùng (Tuyệt đối KHÔNG gắn thêm ký tự lạ *., .., * ở cuối câu!).
+        Mỗi gói tin Discord đã có Snowflake Nonce 64-bit duy nhất giúp gửi 0s siêu tốc không bao giờ lỗi."""
+        return cls.sanitize_outbound_text(text)
 
     @classmethod
     def get_firewall_snapshot(cls):
@@ -3658,18 +3704,46 @@ class Zalo:
             return None
         if color_mode == "fixed" and fixed_color:
             return ZALO_COLOR_MAP.get(fixed_color, "db342e")
+        if color_mode == "fire_gradient":
+            pool = ZALO_FIRE_ZCODES
+        elif color_mode == "ocean_gradient":
+            pool = ZALO_OCEAN_ZCODES
+        elif color_mode == "royal_gradient":
+            pool = ZALO_ROYAL_ZCODES
+        else:
+            pool = ZALO_NATIVE_ZCODES
         if color_mode == "random":
-            candidates = [c for c in ZALO_NATIVE_ZCODES if c != prev_zcode]
+            candidates = [c for c in pool if c != prev_zcode] or pool
             return random.choice(candidates)
-        chosen = ZALO_NATIVE_ZCODES[step_index % len(ZALO_NATIVE_ZCODES)]
-        if chosen == prev_zcode:
-            chosen = ZALO_NATIVE_ZCODES[(step_index + 1) % len(ZALO_NATIVE_ZCODES)]
+        chosen = pool[step_index % len(pool)]
+        if chosen == prev_zcode and len(pool) > 1:
+            chosen = pool[(step_index + 1) % len(pool)]
         return chosen
+
+    @staticmethod
+    def _resolve_zalo_font_tokens(font_style="big_bold", is_heading=True, force_line_heading=False, step_idx=0):
+        fs = str(font_style or ("big_bold" if is_heading else "normal")).lower()
+        if force_line_heading or fs in ("big_bold", "chuto", "heading"):
+            return ["b", "f_18"]
+        if fs in ("small_bold", "chunho", "nho"):
+            return ["b", "f_13"]
+        if fs in ("normal_bold", "vua", "bold"):
+            return ["b", "f_15"]
+        if fs in ("alternating_bold", "xenke", "sole"):
+            return ["b", "f_18"] if (step_idx % 2 == 0) else ["b", "f_13"]
+        if fs in ("italic_bold", "nghieng"):
+            return ["b", "i", "f_18"]
+        if fs in ("underline_bold", "gachchan"):
+            return ["b", "u", "f_18"]
+        if is_heading:
+            return ["b", "f_18"]
+        return ["b"]
 
     def build_colored_message_with_vip_icons(
         self, raw_text, color_mode="rainbow", fixed_color="red",
         is_heading=True, color_offset=0, antiband=True,
-        use_emoji=True, icon_count=3, strip_line_num=False
+        use_emoji=True, icon_count=3, strip_line_num=False,
+        font_style="big_bold"
     ):
         raw_clean = clean_corrupted_shortcuts(raw_text)
         lines = raw_clean.split("\n")
@@ -3683,21 +3757,26 @@ class Zalo:
         first_color = "db342e"
 
         for ln in lines:
-            stripped = ln.strip()
+            r_ln = ln.rstrip("\r")
+            stripped = r_ln.strip()
             if not stripped:
                 core_lines.append("")
                 current_u16_pos += 1
                 continue
 
+            lead_len = len(r_ln) - len(r_ln.lstrip(" \t"))
+            lead_ws = r_ln[:lead_len]
+            body_s = r_ln[lead_len:]
+
             force_line_heading = False
-            if stripped.startswith("#"):
-                stripped = re.sub(r"^#+\s*", "", stripped).strip() or stripped
+            if body_s.startswith("#") and not body_s.startswith("# >"):
+                body_s = re.sub(r"^#+\s*", "", body_s).strip() or body_s
                 force_line_heading = True
 
             if strip_line_num:
-                stripped = strip_leading_line_number(stripped)
+                body_s = strip_leading_line_number(body_s, preserve_indent=True)
 
-            tokens = stripped.split(" ")
+            tokens = body_s.split(" ")
             line_tail_icons = []
             while tokens and _is_emoji_or_zalo_shortcut_token(tokens[-1]):
                 tk = tokens.pop()
@@ -3708,17 +3787,18 @@ class Zalo:
                 else:
                     line_tail_icons.insert(0, get_icon_hard(line_tail_icons))
 
-            core_text = " ".join(tokens).strip()
-            if not core_text and line_tail_icons:
-                core_text = " ".join(line_tail_icons)
+            core_body = " ".join(tokens).rstrip()
+            if not core_body and line_tail_icons and use_emoji and icon_count > 0:
+                core_body = " ".join(line_tail_icons)
                 line_tail_icons = []
 
-            if line_tail_icons:
+            if line_tail_icons and use_emoji and icon_count > 0:
                 collected_tail_icons.extend(line_tail_icons)
 
+            core_text = lead_ws + core_body
             core_lines.append(core_text)
             core_u16_len = utf16_len(core_text)
-            use_big_font = is_heading or force_line_heading
+            font_tokens = self._resolve_zalo_font_tokens(font_style, is_heading, force_line_heading, active_line_idx)
 
             if color_mode == "word_rainbow":
                 words = core_text.split(" ")
@@ -3732,10 +3812,9 @@ class Zalo:
                         if w_step == color_offset and zcode:
                             first_color = zcode
                         prev_w_zcode = zcode
+                        w_f_tokens = self._resolve_zalo_font_tokens(font_style, is_heading, force_line_heading, w_step)
                         w_step += 1
-                        st_parts = ["b"]
-                        if use_big_font:
-                            st_parts.append("f_18")
+                        st_parts = list(w_f_tokens)
                         if zcode:
                             st_parts.append(f"c_{zcode}")
                         styles.append({
@@ -3753,11 +3832,7 @@ class Zalo:
                 prev_line_zcode = zcode
                 active_line_idx += 1
 
-                st_parts = []
-                if use_big_font:
-                    st_parts.extend(["b", "f_18"])
-                elif color_mode != "none":
-                    st_parts.append("b")
+                st_parts = list(font_tokens) if (is_heading or font_style != "normal" or color_mode != "none") else []
                 if zcode:
                     st_parts.append(f"c_{zcode}")
 
@@ -3772,13 +3847,12 @@ class Zalo:
 
         core_msg = "\n".join(core_lines)
         tail_icon_str = ""
-        if use_emoji and icon_count > 0:
+        # Khi .icon 0 (icon_count <= 0 hoặc use_emoji=False), tuyệt đối KHÔNG gắn bất kỳ icon nào ở cuối!
+        if use_emoji and int(icon_count or 0) > 0:
             if collected_tail_icons:
-                tail_icon_str = " ".join(collected_tail_icons[:max(icon_count, 3)])
+                tail_icon_str = " ".join(collected_tail_icons[:int(icon_count)])
             else:
-                tail_icon_str = build_unique_zalo_icons(icon_count)
-        elif collected_tail_icons:
-            tail_icon_str = " ".join(collected_tail_icons[:3])
+                tail_icon_str = build_unique_zalo_icons(int(icon_count))
 
         return core_msg, styles, first_color, tail_icon_str
 
@@ -3959,7 +4033,7 @@ class Zalo:
                  is_group=True, mentions=None, tag_all=False, is_heading=True,
                  color_offset=0, antiband=True, use_emoji=False, icon_count=0,
                  auto_retry_thread_type=False, strip_line_num=False, parse_auto_tags=True,
-                 hide_tag_all=True):
+                 hide_tag_all=True, font_style="big_bold"):
         eff_mentions = list(mentions) if mentions else []
         eff_tag_all = bool(tag_all)
         working_text = raw_text
@@ -3988,7 +4062,8 @@ class Zalo:
             antiband=antiband,
             use_emoji=use_emoji,
             icon_count=icon_count,
-            strip_line_num=strip_line_num
+            strip_line_num=strip_line_num,
+            font_style=font_style
         )
 
         msg_with_tags, m_arr = self.attach_mentions_real_zalo(
@@ -4146,7 +4221,7 @@ def extract_trailing_tags_and_resolve(
     if not raw_text and not incoming_mentions:
         return "", [], False
 
-    text = (raw_text or "").strip()
+    text = (raw_text or "").rstrip()
     resolved_mentions = []
     tag_all = False
 
@@ -4378,7 +4453,7 @@ def extract_trailing_tags_and_resolve(
             text = text[:-(len(rname) + 1)].rstrip()
 
     resolved_mentions.reverse()
-    return text.strip(), resolved_mentions, tag_all
+    return text.rstrip(), resolved_mentions, tag_all
 
 # HỆ THỐNG REG & KHỞI TẠO PHIÊN DISCORD Bảo Vệ Tự Động (CHỐNG RESET MẬT KHẨU 100%)
 DISCORD_TOKEN_REGEX = re.compile(
@@ -6258,19 +6333,27 @@ class DiscordClient:
         return r.status_code in (200, 201)
 
     def format_unframed_discord_text(self, raw_text, is_heading=True, style_mode="rainbow"):
-        lines = [ln.strip() for ln in str(raw_text or "").split("\n")]
+        """Giữ nguyên 100% thụt dòng (indentation), xuống dòng và các ký hiệu Markdown (# >, >, -, *) của văn bản gốc!"""
+        raw_lines = str(raw_text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
         out_lines = []
-        for ln in lines:
-            if not ln:
+        for r_ln in raw_lines:
+            if not r_ln.strip():
                 out_lines.append("")
                 continue
-            clean_ln = re.sub(r"^#+\s*", "", ln).strip()
+            lead_len = len(r_ln) - len(r_ln.lstrip(" \t"))
+            lead_ws = r_ln[:lead_len]
+            body = r_ln[lead_len:].rstrip()
+            # Nếu người dùng đã tự định dạng Markdown (# >, >, #, ```) thì giữ nguyên cấu trúc đó
+            if body.startswith(("# >", "> ", "```", ">>>")):
+                out_lines.append(lead_ws + body)
+                continue
+            clean_ln = re.sub(r"^#+\s*", "", body).strip()
             if is_heading:
-                out_lines.append(f"# **{clean_ln}**")
+                out_lines.append(f"{lead_ws}# **{clean_ln}**" if not lead_ws else f"{lead_ws}**{clean_ln}**")
             elif style_mode != "none":
-                out_lines.append(f"**{clean_ln}**")
+                out_lines.append(f"{lead_ws}**{clean_ln}**")
             else:
-                out_lines.append(clean_ln)
+                out_lines.append(f"{lead_ws}{clean_ln}")
         return "\n".join(out_lines)
 
     _DISCORD_MSG_FORMAT_CACHE = {}
@@ -6294,7 +6377,7 @@ class DiscordClient:
         else:
             raw = clean_corrupted_shortcuts(content)
             if strip_line_num:
-                raw = "\n".join(strip_leading_line_number(ln) for ln in raw.split("\n"))
+                raw = "\n".join(strip_leading_line_number(ln, preserve_indent=True) for ln in raw.split("\n"))
 
             tag_tokens = []
             if tag_all:
@@ -8006,6 +8089,17 @@ def box_target_worker(client, acc_id, plat, target, blocks, runtime_opts,
     def _fire_single_packet(pkt_text, eff_m, eff_all, c_mode, f_color, heading_f, ab_f, em_f, ic_cnt, strip_num_f, col_off):
         if is_task_stopped_fast(stop_ev, start_global_epoch, start_box_epoch, target_id):
             return
+        with SYSTEM_CFG_LOCK:
+            g_ic = int(SYSTEM_RUNTIME_CONFIG.get("icon_count", ic_cnt))
+            g_em = bool(SYSTEM_RUNTIME_CONFIG.get("use_emoji", em_f))
+            g_fs = SYSTEM_RUNTIME_CONFIG.get("font_style", runtime_opts.get("font_style", "big_bold"))
+        if not g_em or g_ic <= 0 or not em_f or int(ic_cnt or 0) <= 0:
+            em_f = False
+            ic_cnt = 0
+            pkt_text = strip_trailing_icons_when_zero(pkt_text)
+        else:
+            ic_cnt = int(ic_cnt)
+        f_style = runtime_opts.get("font_style") or g_fs
         t0_s = time.perf_counter()
         try:
             if plat == "zalo":
@@ -8016,7 +8110,8 @@ def box_target_worker(client, acc_id, plat, target, blocks, runtime_opts,
                     color_offset=col_off, antiband=ab_f,
                     use_emoji=em_f, icon_count=ic_cnt,
                     auto_retry_thread_type=True, strip_line_num=strip_num_f,
-                    hide_tag_all=bool(runtime_opts.get("hide_tag_all", True))
+                    hide_tag_all=bool(runtime_opts.get("hide_tag_all", True)),
+                    font_style=f_style
                 )
             elif plat == "messenger":
                 client.send_message(
@@ -8126,8 +8221,8 @@ def box_target_worker(client, acc_id, plat, target, blocks, runtime_opts,
             if mode in ("raid_burst", "sieu_xa_nhieu_nhom"):
                 color_mode = "word_rainbow"
                 is_heading = True
-                use_emoji = True
-                icon_count = max(icon_count, 4)
+                if use_emoji and icon_count > 0:
+                    icon_count = max(icon_count, 4)
 
             if mode == "combo_lien_thanh" and len(blocks) >= 2:
                 c1 = strip_leading_line_number(blocks[(b_idx - 1) % len(blocks)])
@@ -8415,8 +8510,8 @@ def multi_box_shard_worker(client, acc_id, plat, shard_targets, blocks, runtime_
         if mode in ("raid_burst", "sieu_xa_nhieu_nhom"):
             color_mode = "word_rainbow"
             is_heading = True
-            use_emoji = True
-            icon_count = max(icon_count, 4)
+            if use_emoji and icon_count > 0:
+                icon_count = max(icon_count, 4)
 
         fired_in_pass = 0
         for t in valid_targets:
@@ -8444,12 +8539,27 @@ def multi_box_shard_worker(client, acc_id, plat, shard_targets, blocks, runtime_
                 raw = f"{c1}\n{c2}\n{c3}"
                 target_b_idx[t_id] += 2
 
+            with SYSTEM_CFG_LOCK:
+                g_ic = int(SYSTEM_RUNTIME_CONFIG.get("icon_count", icon_count))
+                g_em = bool(SYSTEM_RUNTIME_CONFIG.get("use_emoji", use_emoji))
+                g_fs = SYSTEM_RUNTIME_CONFIG.get("font_style", runtime_opts.get("font_style", "big_bold"))
+            if not g_em or g_ic <= 0 or not use_emoji or int(icon_count or 0) <= 0:
+                eff_em = False
+                eff_ic = 0
+            else:
+                eff_em = True
+                eff_ic = int(icon_count)
+            f_style = runtime_opts.get("font_style") or g_fs
+
             if mode == "treo_ngon":
                 pkt_text = raw.replace("\r\n", "\n").replace("\r", "\n")
                 s_num_flag = False
             else:
-                pkt_text = strip_leading_line_number(raw) if strip_line_num else raw
+                pkt_text = strip_leading_line_number(raw, preserve_indent=True) if strip_line_num else raw
                 s_num_flag = strip_line_num
+
+            if not eff_em or eff_ic <= 0:
+                pkt_text = strip_trailing_icons_when_zero(pkt_text)
 
             is_grp = (t.get("type", "group") == "group") or bool(tag_users) or bool(tag_all)
             t0_s = time.perf_counter()
@@ -8460,20 +8570,21 @@ def multi_box_shard_worker(client, acc_id, plat, shard_targets, blocks, runtime_
                         is_group=is_grp, mentions=(tag_users if is_grp else None),
                         tag_all=(tag_all if is_grp else False), is_heading=is_heading,
                         color_offset=color_counter, antiband=antiband,
-                        use_emoji=use_emoji, icon_count=icon_count,
+                        use_emoji=eff_em, icon_count=eff_ic,
                         auto_retry_thread_type=True, strip_line_num=s_num_flag,
-                        hide_tag_all=bool(runtime_opts.get("hide_tag_all", True))
+                        hide_tag_all=bool(runtime_opts.get("hide_tag_all", True)),
+                        font_style=f_style
                     )
                 elif plat == "messenger":
                     client.send_message(
                         t_id, pkt_text, is_group=True, mentions=tag_users,
                         tag_all=tag_all, antiband=antiband,
-                        use_emoji=use_emoji, icon_count=icon_count,
+                        use_emoji=eff_em, icon_count=eff_ic,
                         is_heading=is_heading, strip_line_num=s_num_flag,
                         stop_ev=stop_ev, start_global_epoch=start_global_epoch, start_box_epoch=box_epochs.get(t_id)
                     )
                 else:
-                    msg_ln = (pkt_text + " " + build_unique_zalo_icons(icon_count)) if (use_emoji and icon_count > 0) else pkt_text
+                    msg_ln = (pkt_text + " " + build_unique_zalo_icons(eff_ic)) if (eff_em and eff_ic > 0) else pkt_text
                     sent_res = client.send_message(
                         t_id, msg_ln, color_mode=color_mode,
                         fixed_color=fixed_color, antiband=antiband,
@@ -8601,7 +8712,7 @@ def single_acc_multi_box_dispatcher(acc_dict, targets, blocks, runtime_opts, sto
 
     # Phân mảnh thông minh khi chạy tới 200+ nhóm trên 50+ Acc:
     # Tối đa 16 luồng Shard/Acc (50 Acc × 16 = 800 luồng sạch), xoay vòng lệch pha giữa các Acc để 200 nhóm nổ tin nhắn đồng loạt!
-    max_shards_per_acc = 16 if total_boxes > 16 else total_boxes
+    max_shards_per_acc = 32 if total_boxes > 32 else total_boxes
     rotated_targets = list(my_targets)
     if len(rotated_targets) > 1 and acc_idx > 0:
         rot_offset = (acc_idx * 3) % len(rotated_targets)
@@ -8706,7 +8817,8 @@ def start_task_programmatic(targets, blocks, delay=1.0, use_emoji=True, icon_cou
                             tag_users=None, tag_all=False, is_heading=True, multi_acc=True,
                             mode="fast", color_mode="rainbow", fixed_color="red",
                             antiband=True, antidieall=True, specific_acc_id=None, source_label="web",
-                            defer_db_insert=False, account_ids=None, trigger_cmd="", hide_tag_all=True):
+                            defer_db_insert=False, account_ids=None, trigger_cmd="", hide_tag_all=True,
+                            font_style=None):
     tid = new_tid("cmd" if source_label == "chat" else "task")
     stop_ev = threading.Event()
     tag_users = tag_users or []
@@ -8721,10 +8833,22 @@ def start_task_programmatic(targets, blocks, delay=1.0, use_emoji=True, icon_cou
     if not clean_blocks:
         clean_blocks = list(blocks)
 
+    with SYSTEM_CFG_LOCK:
+        eff_fs = font_style or SYSTEM_RUNTIME_CONFIG.get("font_style", "big_bold" if is_heading else "normal")
+        if source_label == "web":
+            SYSTEM_RUNTIME_CONFIG["delay"] = float(delay)
+            SYSTEM_RUNTIME_CONFIG["icon_count"] = int(icon_count)
+            SYSTEM_RUNTIME_CONFIG["use_emoji"] = bool(use_emoji) and (int(icon_count) > 0)
+            SYSTEM_RUNTIME_CONFIG["color_mode"] = color_mode
+            SYSTEM_RUNTIME_CONFIG["fixed_color"] = fixed_color
+            SYSTEM_RUNTIME_CONFIG["font_style"] = eff_fs
+            SYSTEM_RUNTIME_CONFIG["is_heading"] = bool(is_heading)
+
     runtime_opts = {
         "delay": float(delay),
-        "use_emoji": bool(use_emoji),
-        "icon_count": int(icon_count),
+        "use_emoji": bool(use_emoji) and (int(icon_count) > 0),
+        "icon_count": int(icon_count) if bool(use_emoji) else 0,
+        "font_style": eff_fs,
         "tag_users": list(tag_users),
         "tag_all": bool(tag_all),
         "hide_tag_all": bool(hide_tag_all),
@@ -8792,11 +8916,17 @@ def start_task_programmatic(targets, blocks, delay=1.0, use_emoji=True, icon_cou
     return tid
 
 def update_running_tasks_config(thread_id=None, **kwargs):
+    """Cập nhật tức thì cấu hình hệ thống (SYSTEM_RUNTIME_CONFIG) và áp dụng đồng bộ lên MỌI nhóm đang chạy + giao diện Web!"""
     updated = 0
     with SYSTEM_CFG_LOCK:
         for k, v in kwargs.items():
             if k in SYSTEM_RUNTIME_CONFIG:
                 SYSTEM_RUNTIME_CONFIG[k] = v
+
+    try:
+        DiscordClient._DISCORD_MSG_FORMAT_CACHE.clear()
+    except Exception:
+        pass
 
     for tid, info in list(ACTIVE_TASKS.items()):
         if thread_id is None or str(thread_id) in info.get("targets", []):
@@ -8808,6 +8938,11 @@ def update_running_tasks_config(thread_id=None, **kwargs):
                 with TASKS_RAM_LOCK:
                     if tid in TASKS_RAM_STORE:
                         TASKS_RAM_STORE[tid]["delay"] = float(kwargs["delay"])
+    try:
+        with _STATUS_CACHE_LOCK:
+            _STATUS_SNAPSHOT_CACHE["ts"] = 0.0
+    except Exception:
+        pass
     return updated
 
 def stop_tasks_for_thread(thread_id=None):
@@ -8855,10 +8990,16 @@ def stop_tasks_for_thread(thread_id=None):
         _STATUS_SNAPSHOT_CACHE["ts"] = 0.0
     return stopped
 
-def log_system_command(acc_id, thread_id, sender_id, cmd_text, action_taken):
+def log_system_command(acc_id, thread_id, sender_id, cmd_text, action_taken, sender_name=""):
     acc_obj = get_account_from_ram(acc_id) if acc_id else None
-    acc_name = (acc_obj.get("name") if acc_obj else "") or f"Acc #{acc_id}"
-    plat_lbl = ((acc_obj.get("platform") if acc_obj else "") or "zalo").upper()
+    acc_name = (acc_obj.get("name") if acc_obj else "") or (f"Acc #{acc_id}" if acc_id else "Web Admin")
+    plat_lbl = ((acc_obj.get("platform") if acc_obj else "") or ("web" if not acc_id else "zalo")).upper()
+    s_uid_str = str(sender_id or "").strip()
+    resolved_sender_name = (
+        str(sender_name or "").strip()
+        or GLOBAL_USER_NAME_CACHE.get(s_uid_str)
+        or (acc_name if s_uid_str in ("0", "", str((acc_obj or {}).get("uid") or "")) else f"UID_{s_uid_str[-5:]}")
+    )
     now_t = time.time()
     entry = {
         "acc_id": acc_id,
@@ -8866,7 +9007,8 @@ def log_system_command(acc_id, thread_id, sender_id, cmd_text, action_taken):
         "platform": plat_lbl,
         "time_str": time.strftime("%H:%M:%S", time.localtime(now_t)),
         "thread_id": str(thread_id or ""),
-        "sender_id": str(sender_id or ""),
+        "sender_id": s_uid_str,
+        "sender_name": resolved_sender_name,
         "cmd_text": sanitize_log_text(cmd_text)[:240],
         "action_taken": sanitize_log_text(action_taken)[:240],
         "created_at": now_t,
@@ -9133,52 +9275,54 @@ def extract_multigroup_spec_and_clean_body(raw_body_str, cmd_token=""):
     if not raw_body_str:
         return "", spec_mode, spec_val, inline_tag_all
 
-    tokens = raw_body_str.split()
-    kept_tokens = []
-
-    for tk in tokens:
-        tk_clean = tk.strip()
-        tk_low = remove_vn_accents(tk_clean.lower())
-
-        # Kiểm tra từ khóa gửi ALL nhóm
-        if tk_low in ("allnhom", "allbox", "allgroup", "fullbox", "fullnhom", "tatcanhom", "moinhom", "nhom=all", "box=all", "group=all", "gui=all"):
-            spec_mode = "all"
-            spec_val = "all"
+    kept_lines = []
+    for raw_ln in str(raw_body_str).replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if not raw_ln.strip():
+            kept_lines.append("")
             continue
-
-        # Kiểm tra từ khóa gửi số lượng nhóm dạng <N>nhom hoặc <N>box (VD: 200nhom, 50box, 10nhom)
-        m_num_box = re.match(r"^(\d+)(?:nhom|box|group|kenh|phong)$", tk_low)
-        if m_num_box:
-            spec_mode = "count"
-            spec_val = int(m_num_box.group(1))
-            continue
-
-        # Kiểm tra từ khóa nhom=<...> hoặc box=<...> hoặc sonhom=<...>
-        m_kv_box = re.match(r"^(?:nhom|box|group|sonhom|sobox|kenh|gui)=(.+)$", tk_low)
-        if m_kv_box:
-            val_part = m_kv_box.group(1).strip()
-            if val_part in ("all", "full", "tatca", "het"):
+        lead_len = len(raw_ln) - len(raw_ln.lstrip(" \t"))
+        lead_ws = raw_ln[:lead_len]
+        line_tokens = raw_ln[lead_len:].split(" ")
+        kept_line_tokens = []
+        for tk in line_tokens:
+            tk_clean = tk.strip()
+            if not tk_clean:
+                kept_line_tokens.append(tk)
+                continue
+            tk_low = remove_vn_accents(tk_clean.lower())
+            if tk_low in ("allnhom", "allbox", "allgroup", "fullbox", "fullnhom", "tatcanhom", "moinhom", "nhom=all", "box=all", "group=all", "gui=all"):
                 spec_mode = "all"
                 spec_val = "all"
-            elif val_part.isdigit() and len(val_part) <= 4:
+                continue
+            m_num_box = re.match(r"^(\d+)(?:nhom|box|group|kenh|phong)$", tk_low)
+            if m_num_box:
                 spec_mode = "count"
-                spec_val = int(val_part)
-            elif re.match(r"^(\d+)(?:nhom|box)$", val_part):
-                spec_mode = "count"
-                spec_val = int(re.match(r"^(\d+)", val_part).group(1))
-            else:
-                spec_mode = "custom"
-                spec_val = val_part
-            continue
-
-        # Kiểm tra từ khóa bật Tag All dạng chữ (VD: tagall, tag=all, @all, @everyone)
-        if tk_low in ("tagall", "tag=all", "@all", "@everyone", "@here", "tag_all"):
-            inline_tag_all = True
-            continue
-
-        kept_tokens.append(tk)
-
-    return " ".join(kept_tokens).strip(), spec_mode, spec_val, inline_tag_all
+                spec_val = int(m_num_box.group(1))
+                continue
+            m_kv_box = re.match(r"^(?:nhom|box|group|sonhom|sobox|kenh|gui)=(.+)$", tk_low)
+            if m_kv_box:
+                val_part = m_kv_box.group(1).strip()
+                if val_part in ("all", "full", "tatca", "het"):
+                    spec_mode = "all"
+                    spec_val = "all"
+                elif val_part.isdigit() and len(val_part) <= 4:
+                    spec_mode = "count"
+                    spec_val = int(val_part)
+                elif re.match(r"^(\d+)(?:nhom|box)$", val_part):
+                    spec_mode = "count"
+                    spec_val = int(re.match(r"^(\d+)", val_part).group(1))
+                else:
+                    spec_mode = "custom"
+                    spec_val = val_part
+                continue
+            if tk_low in ("tagall", "tag=all", "@all", "@everyone", "@here", "tag_all"):
+                inline_tag_all = True
+                continue
+            kept_line_tokens.append(tk)
+        joined_ln = " ".join(kept_line_tokens).rstrip()
+        if joined_ln:
+            kept_lines.append(lead_ws + joined_ln)
+    return "\n".join(kept_lines).strip("\r\n"), spec_mode, spec_val, inline_tag_all
 
 def parse_and_execute_inchat_command(
     zalo_client, acc_row, thread_id, is_group, sender_id, raw_msg,
@@ -9225,7 +9369,7 @@ def parse_and_execute_inchat_command(
     else:
         cmd_token = text[1:first_space].lower().strip()
         raw_after_space = text[first_space + 1:]
-        arg_body = raw_after_space.strip()
+        arg_body = raw_after_space.lstrip(" \t").rstrip() if not raw_after_space.startswith("\n") else raw_after_space.lstrip("\r\n").rstrip()
         leading_sp = len(raw_after_space) - len(raw_after_space.lstrip())
         prefix_u16_offset = utf16_len(text[:first_space + 1 + leading_sp])
 
@@ -9870,42 +10014,80 @@ def parse_and_execute_inchat_command(
     if cmd_token in ("mau", "color", "doimau"):
         arg_c = remove_vn_accents(arg_body.strip())
         if arg_c in ("rainbow", "dong", "cauvong"):
-            update_running_tasks_config(color_mode="rainbow")
-            reply_txt = "Đã bật tự động phối màu từng dòng"
+            update_running_tasks_config(thread_id=None, color_mode="rainbow")
+            reply_txt = "🎨 Đã bật phối màu Cầu Vồng 8 màu theo từng dòng (Áp dụng đồng bộ lên MỌI nhóm & Web)!"
         elif arg_c in ("word", "word_rainbow", "tu", "tungtu"):
-            update_running_tasks_config(color_mode="word_rainbow")
-            reply_txt = "Đã bật phối màu từng từ"
+            update_running_tasks_config(thread_id=None, color_mode="word_rainbow")
+            reply_txt = "🎨 Đã bật phối màu Cầu Vồng theo từng từ (Áp dụng đồng bộ lên MỌI nhóm & Web)!"
+        elif arg_c in ("fire", "lua", "fire_gradient"):
+            update_running_tasks_config(thread_id=None, color_mode="fire_gradient")
+            reply_txt = "🔥 Đã bật phối màu Lửa Hoàng Kim (Đỏ - Cam - Vàng)!"
+        elif arg_c in ("ocean", "bien", "bang", "ocean_gradient"):
+            update_running_tasks_config(thread_id=None, color_mode="ocean_gradient")
+            reply_txt = "🌊 Đã bật phối màu Đại Dương Băng Tuyết (Xanh Lá - Xanh Băng - Xanh Dương)!"
+        elif arg_c in ("royal", "hoanggia", "royal_gradient"):
+            update_running_tasks_config(thread_id=None, color_mode="royal_gradient")
+            reply_txt = "👑 Đã bật phối màu Hoàng Gia (Tím - Hồng - Đỏ - Vàng)!"
         elif arg_c in ("random", "ngaunhien"):
-            update_running_tasks_config(color_mode="random")
-            reply_txt = "Đã bật phối màu ngẫu nhiên"
+            update_running_tasks_config(thread_id=None, color_mode="random")
+            reply_txt = "🎲 Đã bật phối màu ngẫu nhiên 8 sắc độ!"
         elif arg_c in ("none", "tat", "off"):
-            update_running_tasks_config(color_mode="none")
-            reply_txt = "Đã tắt đổi màu chữ"
+            update_running_tasks_config(thread_id=None, color_mode="none")
+            reply_txt = "⚪ Đã tắt đổi màu chữ trên toàn bộ các nhóm!"
         elif arg_c in ZALO_COLOR_MAP:
-            c_map_id = {"do": "red", "red": "red", "vang": "yellow", "yellow": "yellow", "xanh": "green", "xanhla": "green", "green": "green", "cam": "orange", "orange": "orange"}.get(arg_c, "red")
-            update_running_tasks_config(color_mode="fixed", fixed_color=c_map_id)
-            reply_txt = f"Đã khóa cố định màu chữ: {c_map_id}"
+            c_map_id = {
+                "do": "red", "red": "red", "cam": "orange", "orange": "orange",
+                "vang": "yellow", "yellow": "yellow", "xanh": "green", "xanhla": "green", "green": "green",
+                "xanhduong": "blue", "blue": "blue", "ngoc": "cyan", "cyan": "cyan",
+                "tim": "purple", "purple": "purple", "hong": "pink", "pink": "pink"
+            }.get(arg_c, "red")
+            update_running_tasks_config(thread_id=None, color_mode="fixed", fixed_color=c_map_id)
+            reply_txt = f"🎨 Đã khóa cố định màu chữ: {c_map_id.upper()} (Áp dụng toàn bộ nhóm & Web)!"
         else:
-            reply_txt = "Chọn màu: .mau rainbow | .mau word | .mau random | .mau do | .mau vang | .mau xanh | .mau cam | .mau tat"
+            reply_txt = "🎨 Chọn màu Zalo VIP: .mau rainbow | .mau word | .mau fire | .mau ocean | .mau royal | .mau do | .mau cam | .mau vang | .mau xanh | .mau xanhduong | .mau ngoc | .mau tim | .mau hong | .mau tat"
         _send_reply(reply_txt)
-        log_system_command(acc_id, thread_id, sender_id, text, reply_txt)
+        log_system_command(acc_id, thread_id, sender_id, text, reply_txt, sender_name=sender_name)
         return True
 
     if cmd_token in ("icon", "emoji"):
         try:
             ic_n = max(0, min(10, int(arg_body.strip())))
-            update_running_tasks_config(icon_count=ic_n, use_emoji=(ic_n > 0))
-            reply_txt = f"Đã chỉnh số lượng Icon VIP: {ic_n}"
+            cnt_u = update_running_tasks_config(thread_id=None, icon_count=ic_n, use_emoji=(ic_n > 0))
+            if ic_n == 0:
+                reply_txt = f"🚫 Đã khóa .icon 0 (Tắt sạch 100% Emoji/Icon đuôi trên TẤT CẢ các nhóm & đồng bộ lên Web — Đã áp dụng cho {cnt_u} tiến trình)!"
+            else:
+                reply_txt = f"✨ Đã chỉnh số lượng Icon VIP: {ic_n} (Áp dụng đồng bộ lên TẤT CẢ các nhóm & Web)!"
         except Exception:
-            reply_txt = "Cú pháp: .icon <số lượng từ 0 đến 10>"
+            reply_txt = "Cú pháp: .icon <số lượng từ 0 đến 10> (Gõ .icon 0 để tắt sạch icon trên mọi nhóm)"
         _send_reply(reply_txt)
+        log_system_command(acc_id, thread_id, sender_id, text, reply_txt, sender_name=sender_name)
         return True
 
-    if cmd_token in ("chuto", "heading"):
-        on_val = arg_body.strip().lower() not in ("off", "tat", "0")
-        update_running_tasks_config(is_heading=on_val)
-        reply_txt = "Đã BẬT chữ lớn in đậm" if on_val else "Đã TẮT chữ lớn in đậm"
+    if cmd_token in ("chuto", "heading", "chunho", "cochu", "kieuchu", "font"):
+        arg_f = remove_vn_accents(arg_body.strip().lower())
+        if cmd_token == "chunho" or arg_f in ("nho", "small", "small_bold", "chunho", "f13", "13"):
+            update_running_tasks_config(thread_id=None, is_heading=False, font_style="small_bold")
+            reply_txt = "🔤 Đã bật kiểu chữ Zalo: CHỮ NHỎ IN ĐẬM (b,f_13) trên mọi nhóm & Web!"
+        elif arg_f in ("vua", "normal_bold", "f15", "15"):
+            update_running_tasks_config(thread_id=None, is_heading=False, font_style="normal_bold")
+            reply_txt = "🔤 Đã bật kiểu chữ Zalo: CHỮ VỪA IN ĐẬM (b,f_15) trên mọi nhóm & Web!"
+        elif arg_f in ("xenke", "sole", "alternating", "alternating_bold"):
+            update_running_tasks_config(thread_id=None, is_heading=True, font_style="alternating_bold")
+            reply_txt = "🔤 Đã bật kiểu chữ Zalo: ĐẬM TO & NHỎ ĐAN XEN SIÊU ĐẸP (f_18 / f_13)!"
+        elif arg_f in ("nghieng", "italic", "italic_bold"):
+            update_running_tasks_config(thread_id=None, is_heading=True, font_style="italic_bold")
+            reply_txt = "🔤 Đã bật kiểu chữ Zalo: CHỮ TO IN ĐẬM NGHIÊNG (b,i,f_18)!"
+        elif arg_f in ("gachchan", "underline", "underline_bold"):
+            update_running_tasks_config(thread_id=None, is_heading=True, font_style="underline_bold")
+            reply_txt = "🔤 Đã bật kiểu chữ Zalo: CHỮ TO IN ĐẬM GẠCH CHÂN (b,u,f_18)!"
+        elif arg_f in ("off", "tat", "0", "thuong", "normal"):
+            update_running_tasks_config(thread_id=None, is_heading=False, font_style="normal")
+            reply_txt = "🔤 Đã chuyển về chữ thường mặc định trên mọi nhóm & Web!"
+        else:
+            update_running_tasks_config(thread_id=None, is_heading=True, font_style="big_bold")
+            reply_txt = "🔤 Đã bật kiểu chữ Zalo: CHỮ TO IN ĐẬM VIP (b,f_18) trên mọi nhóm & Web!"
         _send_reply(reply_txt)
+        log_system_command(acc_id, thread_id, sender_id, text, reply_txt, sender_name=sender_name)
         return True
 
     if cmd_token in ("antiband", "antiban"):
@@ -10033,8 +10215,8 @@ def parse_and_execute_inchat_command(
         delay_val = 0.0
         color_mode = "word_rainbow"
         is_heading = True
-        use_emoji = True
-        icon_count = max(icon_count, 4)
+        if use_emoji and icon_count > 0:
+            icon_count = max(icon_count, 4)
     elif chosen_mode == "auto_shuffle":
         chosen_mode = "treo_nhay"
     elif chosen_mode == "chao_mode":
@@ -10045,13 +10227,14 @@ def parse_and_execute_inchat_command(
     if platform == "zalo" and (extracted_mentions or extracted_tag_all):
         target_obj[0]["type"] = "group"
 
-    tokens = cleaned_body.split()
+    first_line_part, sep_nl, rest_lines_part = cleaned_body.partition("\n")
+    tokens = first_line_part.split()
     consumed = 0
     file_query = direct_file_num
 
     if chosen_mode == "file_cmd":
         chosen_mode = "treo_nhay"
-        if not file_query and tokens:
+        if not file_query and tokens and not sep_nl:
             file_query = tokens[0]
             consumed = 1
 
@@ -10065,7 +10248,7 @@ def parse_and_execute_inchat_command(
                 break
         elif tk_low.startswith("color=") or tk_low.startswith("mau="):
             c_val = tk_low.split("=", 1)[1]
-            if c_val in ("rainbow", "word_rainbow", "random", "none"):
+            if c_val in ("rainbow", "word_rainbow", "fire_gradient", "ocean_gradient", "royal_gradient", "random", "none"):
                 color_mode = c_val
             elif c_val in ZALO_COLOR_MAP:
                 color_mode = "fixed"
@@ -10075,6 +10258,7 @@ def parse_and_execute_inchat_command(
             try:
                 icon_count = max(0, int(tk_low.split("=", 1)[1]))
                 use_emoji = (icon_count > 0)
+                update_running_tasks_config(thread_id=None, icon_count=icon_count, use_emoji=use_emoji)
                 consumed += 1
             except Exception:
                 break
@@ -10093,7 +10277,11 @@ def parse_and_execute_inchat_command(
         else:
             break
 
-    remaining_content = " ".join(tokens[consumed:]).strip() if consumed > 0 else cleaned_body.strip()
+    if consumed > 0:
+        rem_first = " ".join(tokens[consumed:]).strip()
+        remaining_content = (f"{rem_first}\n{rest_lines_part}" if rem_first else rest_lines_part) if sep_nl else rem_first
+    else:
+        remaining_content = cleaned_body.strip("\r\n")
 
     blocks = []
     if file_query:
@@ -11549,7 +11737,7 @@ LOGIN_HTML = r"""<!DOCTYPE html>
 <html lang="vi">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,minimum-scale=1.0,user-scalable=no,viewport-fit=cover">
 <title>{{ custom_title if custom_title else 'Bảng Điều Khiển' }}</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -11591,6 +11779,151 @@ body{
   color:#dc2626;padding:9px 12px;border-radius:8px;font-size:12px;margin-bottom:14px;font-weight:500;
 }
 .sec-note{margin-top:16px;padding-top:12px;border-top:1px solid #e2e8f0;font-size:11px;color:#64748b;display:flex;justify-content:space-between}
+
+/* ==================== LIQUID GLASS + PILL GEOMETRY + LOCK ZOOM v25 ==================== */
+:root{
+  --bg:#070b19;
+  --surface:rgba(255,255,255,0.10);
+  --surface-sub:rgba(255,255,255,0.06);
+  --border:rgba(255,255,255,0.22);
+  --border-light:rgba(255,255,255,0.14);
+  --txt:#f8fafc;
+  --txt-muted:#cbd5e1;
+  --blue:#38bdf8;
+  --blue-hover:#0284c7;
+  --green:#34d399;
+  --red:#fb7185;
+  --amber:#fbbf24;
+  --indigo:#818cf8;
+}
+html,body{
+  touch-action:manipulation;
+  -webkit-touch-callout:none;
+  -webkit-user-select:none;
+  user-select:none;
+  overscroll-behavior-y:none;
+  background:
+    radial-gradient(circle at 12% 18%, rgba(56,189,248,0.28) 0%, transparent 42%),
+    radial-gradient(circle at 86% 14%, rgba(168,85,247,0.26) 0%, transparent 45%),
+    radial-gradient(circle at 50% 85%, rgba(16,185,129,0.22) 0%, transparent 48%),
+    linear-gradient(145deg, #050814 0%, #0b132b 52%, #111827 100%) !important;
+  background-attachment:fixed !important;
+  color:var(--txt) !important;
+}
+input,textarea,code,pre{
+  -webkit-user-select:text;
+  user-select:text;
+  touch-action:manipulation;
+}
+.header-bar,.visual-card,.status-strip,.live-cmd-banner,.kpi-box,.panel,.login-card{
+  background:linear-gradient(135deg, rgba(255,255,255,0.14) 0%, rgba(255,255,255,0.05) 100%) !important;
+  backdrop-filter:blur(28px) saturate(195%) !important;
+  -webkit-backdrop-filter:blur(28px) saturate(195%) !important;
+  border:1px solid rgba(255,255,255,0.24) !important;
+  box-shadow:0 12px 34px -8px rgba(2,6,23,0.55), inset 0 1px 1px rgba(255,255,255,0.32) !important;
+  border-radius:26px !important;
+}
+.header-bar,.status-strip,.live-cmd-banner{
+  border-radius:9999px !important;
+  padding:10px 20px !important;
+}
+@media(max-width:780px){
+  .header-bar,.status-strip,.live-cmd-banner{border-radius:24px !important;}
+}
+.panel-hd{
+  background:rgba(255,255,255,0.08) !important;
+  border-bottom:1px solid rgba(255,255,255,0.16) !important;
+  padding:11px 18px !important;
+}
+/* TỐI ƯU TOÀN BỘ VIỀN THÀNH VIÊN THUỐC (PILL SHAPE 9999PX) */
+.btn,.nav-tab,.sub-tab,.acc-pill,.badge,.inp,.sel,.chk-label,.tab-count,.form-input,.btn-submit{
+  border-radius:9999px !important;
+  transition:all 0.2s cubic-bezier(0.16,1,0.3,1) !important;
+}
+.txt{
+  border-radius:22px !important;
+  background:rgba(15,23,42,0.52) !important;
+  border:1px solid rgba(255,255,255,0.24) !important;
+  color:#f8fafc !important;
+  padding:10px 14px !important;
+}
+.inp,.sel,.form-input{
+  background:rgba(15,23,42,0.52) !important;
+  border:1px solid rgba(255,255,255,0.24) !important;
+  color:#f8fafc !important;
+  padding:8px 14px !important;
+}
+.sel option{background:#0f172a;color:#f8fafc}
+.inp:focus,.sel:focus,.txt:focus,.form-input:focus{
+  border-color:#38bdf8 !important;
+  box-shadow:0 0 0 3px rgba(56,189,248,0.28), inset 0 1px 1px rgba(255,255,255,0.35) !important;
+  background:rgba(15,23,42,0.72) !important;
+}
+.btn,.nav-tab,.sub-tab,.acc-pill{
+  background:rgba(255,255,255,0.10) !important;
+  border:1px solid rgba(255,255,255,0.24) !important;
+  color:#f8fafc !important;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.28) !important;
+}
+.btn:hover,.nav-tab:hover,.sub-tab:hover,.acc-pill:hover{
+  background:rgba(255,255,255,0.20) !important;
+  transform:translateY(-1px);
+}
+.btn-primary,.nav-tab.active,.sub-tab.active,.acc-pill.active,.btn-submit{
+  background:linear-gradient(135deg, rgba(56,189,248,0.88) 0%, rgba(59,130,246,0.92) 55%, rgba(99,102,241,0.92) 100%) !important;
+  border-color:rgba(186,230,253,0.65) !important;
+  color:#ffffff !important;
+  box-shadow:0 6px 20px -4px rgba(56,189,248,0.55), inset 0 1px 1px rgba(255,255,255,0.45) !important;
+}
+.btn-success{
+  background:linear-gradient(135deg, rgba(16,185,129,0.90) 0%, rgba(5,150,105,0.94) 100%) !important;
+  border-color:rgba(167,243,208,0.6) !important;
+  color:#ffffff !important;
+  box-shadow:0 6px 18px -4px rgba(16,185,129,0.5) !important;
+}
+.btn-danger{
+  background:linear-gradient(135deg, rgba(244,63,94,0.90) 0%, rgba(225,29,72,0.94) 100%) !important;
+  border-color:rgba(254,205,211,0.6) !important;
+  color:#ffffff !important;
+  box-shadow:0 6px 18px -4px rgba(244,63,94,0.5) !important;
+}
+.chk-label{
+  background:rgba(255,255,255,0.08) !important;
+  border:1px solid rgba(255,255,255,0.20) !important;
+  color:#f8fafc !important;
+  padding:7px 13px !important;
+}
+.list-item{
+  background:rgba(255,255,255,0.05) !important;
+  border-bottom:1px solid rgba(255,255,255,0.10) !important;
+  border-radius:18px !important;
+  margin:4px 6px !important;
+}
+.list-item:hover{background:rgba(255,255,255,0.12) !important}
+.scroll-area{
+  background:rgba(15,23,42,0.36) !important;
+  border:1px solid rgba(255,255,255,0.16) !important;
+  border-radius:20px !important;
+}
+.data-table th{
+  background:rgba(255,255,255,0.08) !important;
+  color:#bae6fd !important;
+  border-bottom:1px solid rgba(255,255,255,0.16) !important;
+}
+.data-table td{
+  border-bottom:1px solid rgba(255,255,255,0.10) !important;
+  color:#f1f5f9 !important;
+}
+.data-table tr:hover td{background:rgba(255,255,255,0.07) !important}
+.badge-blue{background:rgba(56,189,248,0.22) !important;color:#7dd3fc !important;border-color:rgba(56,189,248,0.45) !important}
+.badge-green{background:rgba(16,185,129,0.22) !important;color:#6ee7b7 !important;border-color:rgba(16,185,129,0.45) !important}
+.badge-red{background:rgba(244,63,94,0.22) !important;color:#fda4af !important;border-color:rgba(244,63,94,0.45) !important}
+.badge-amber{background:rgba(245,158,11,0.22) !important;color:#fde68a !important;border-color:rgba(245,158,11,0.45) !important}
+.badge-gray{background:rgba(148,163,184,0.20) !important;color:#e2e8f0 !important;border-color:rgba(148,163,184,0.38) !important}
+.brand-logo-wrap{border-radius:9999px !important;border:2px solid rgba(56,189,248,0.75) !important;background:rgba(56,189,248,0.18) !important}
+.acc-selector-bar{background:rgba(15,23,42,0.42) !important;border-radius:9999px !important;padding:6px 10px !important}
+.live-cmd-banner{color:#e0f2fe !important}
+
 </style>
 </head>
 <body>
@@ -11626,7 +11959,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="vi">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,minimum-scale=1.0,user-scalable=no,viewport-fit=cover">
 <title>{{ custom_title if custom_title else 'Bảng Điều Khiển Đa Tài Khoản' }}</title>
 <style>
 :root{
@@ -11867,6 +12200,151 @@ input,select,textarea,button{font-family:inherit;font-size:13px}
   background:#0f172a;color:#ffffff;padding:8px 12px;border-radius:6px;
   font-size:12px;font-weight:600;box-shadow:0 4px 12px rgba(0,0,0,0.2);
 }
+
+/* ==================== LIQUID GLASS + PILL GEOMETRY + LOCK ZOOM v25 ==================== */
+:root{
+  --bg:#070b19;
+  --surface:rgba(255,255,255,0.10);
+  --surface-sub:rgba(255,255,255,0.06);
+  --border:rgba(255,255,255,0.22);
+  --border-light:rgba(255,255,255,0.14);
+  --txt:#f8fafc;
+  --txt-muted:#cbd5e1;
+  --blue:#38bdf8;
+  --blue-hover:#0284c7;
+  --green:#34d399;
+  --red:#fb7185;
+  --amber:#fbbf24;
+  --indigo:#818cf8;
+}
+html,body{
+  touch-action:manipulation;
+  -webkit-touch-callout:none;
+  -webkit-user-select:none;
+  user-select:none;
+  overscroll-behavior-y:none;
+  background:
+    radial-gradient(circle at 12% 18%, rgba(56,189,248,0.28) 0%, transparent 42%),
+    radial-gradient(circle at 86% 14%, rgba(168,85,247,0.26) 0%, transparent 45%),
+    radial-gradient(circle at 50% 85%, rgba(16,185,129,0.22) 0%, transparent 48%),
+    linear-gradient(145deg, #050814 0%, #0b132b 52%, #111827 100%) !important;
+  background-attachment:fixed !important;
+  color:var(--txt) !important;
+}
+input,textarea,code,pre{
+  -webkit-user-select:text;
+  user-select:text;
+  touch-action:manipulation;
+}
+.header-bar,.visual-card,.status-strip,.live-cmd-banner,.kpi-box,.panel,.login-card{
+  background:linear-gradient(135deg, rgba(255,255,255,0.14) 0%, rgba(255,255,255,0.05) 100%) !important;
+  backdrop-filter:blur(28px) saturate(195%) !important;
+  -webkit-backdrop-filter:blur(28px) saturate(195%) !important;
+  border:1px solid rgba(255,255,255,0.24) !important;
+  box-shadow:0 12px 34px -8px rgba(2,6,23,0.55), inset 0 1px 1px rgba(255,255,255,0.32) !important;
+  border-radius:26px !important;
+}
+.header-bar,.status-strip,.live-cmd-banner{
+  border-radius:9999px !important;
+  padding:10px 20px !important;
+}
+@media(max-width:780px){
+  .header-bar,.status-strip,.live-cmd-banner{border-radius:24px !important;}
+}
+.panel-hd{
+  background:rgba(255,255,255,0.08) !important;
+  border-bottom:1px solid rgba(255,255,255,0.16) !important;
+  padding:11px 18px !important;
+}
+/* TỐI ƯU TOÀN BỘ VIỀN THÀNH VIÊN THUỐC (PILL SHAPE 9999PX) */
+.btn,.nav-tab,.sub-tab,.acc-pill,.badge,.inp,.sel,.chk-label,.tab-count,.form-input,.btn-submit{
+  border-radius:9999px !important;
+  transition:all 0.2s cubic-bezier(0.16,1,0.3,1) !important;
+}
+.txt{
+  border-radius:22px !important;
+  background:rgba(15,23,42,0.52) !important;
+  border:1px solid rgba(255,255,255,0.24) !important;
+  color:#f8fafc !important;
+  padding:10px 14px !important;
+}
+.inp,.sel,.form-input{
+  background:rgba(15,23,42,0.52) !important;
+  border:1px solid rgba(255,255,255,0.24) !important;
+  color:#f8fafc !important;
+  padding:8px 14px !important;
+}
+.sel option{background:#0f172a;color:#f8fafc}
+.inp:focus,.sel:focus,.txt:focus,.form-input:focus{
+  border-color:#38bdf8 !important;
+  box-shadow:0 0 0 3px rgba(56,189,248,0.28), inset 0 1px 1px rgba(255,255,255,0.35) !important;
+  background:rgba(15,23,42,0.72) !important;
+}
+.btn,.nav-tab,.sub-tab,.acc-pill{
+  background:rgba(255,255,255,0.10) !important;
+  border:1px solid rgba(255,255,255,0.24) !important;
+  color:#f8fafc !important;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.28) !important;
+}
+.btn:hover,.nav-tab:hover,.sub-tab:hover,.acc-pill:hover{
+  background:rgba(255,255,255,0.20) !important;
+  transform:translateY(-1px);
+}
+.btn-primary,.nav-tab.active,.sub-tab.active,.acc-pill.active,.btn-submit{
+  background:linear-gradient(135deg, rgba(56,189,248,0.88) 0%, rgba(59,130,246,0.92) 55%, rgba(99,102,241,0.92) 100%) !important;
+  border-color:rgba(186,230,253,0.65) !important;
+  color:#ffffff !important;
+  box-shadow:0 6px 20px -4px rgba(56,189,248,0.55), inset 0 1px 1px rgba(255,255,255,0.45) !important;
+}
+.btn-success{
+  background:linear-gradient(135deg, rgba(16,185,129,0.90) 0%, rgba(5,150,105,0.94) 100%) !important;
+  border-color:rgba(167,243,208,0.6) !important;
+  color:#ffffff !important;
+  box-shadow:0 6px 18px -4px rgba(16,185,129,0.5) !important;
+}
+.btn-danger{
+  background:linear-gradient(135deg, rgba(244,63,94,0.90) 0%, rgba(225,29,72,0.94) 100%) !important;
+  border-color:rgba(254,205,211,0.6) !important;
+  color:#ffffff !important;
+  box-shadow:0 6px 18px -4px rgba(244,63,94,0.5) !important;
+}
+.chk-label{
+  background:rgba(255,255,255,0.08) !important;
+  border:1px solid rgba(255,255,255,0.20) !important;
+  color:#f8fafc !important;
+  padding:7px 13px !important;
+}
+.list-item{
+  background:rgba(255,255,255,0.05) !important;
+  border-bottom:1px solid rgba(255,255,255,0.10) !important;
+  border-radius:18px !important;
+  margin:4px 6px !important;
+}
+.list-item:hover{background:rgba(255,255,255,0.12) !important}
+.scroll-area{
+  background:rgba(15,23,42,0.36) !important;
+  border:1px solid rgba(255,255,255,0.16) !important;
+  border-radius:20px !important;
+}
+.data-table th{
+  background:rgba(255,255,255,0.08) !important;
+  color:#bae6fd !important;
+  border-bottom:1px solid rgba(255,255,255,0.16) !important;
+}
+.data-table td{
+  border-bottom:1px solid rgba(255,255,255,0.10) !important;
+  color:#f1f5f9 !important;
+}
+.data-table tr:hover td{background:rgba(255,255,255,0.07) !important}
+.badge-blue{background:rgba(56,189,248,0.22) !important;color:#7dd3fc !important;border-color:rgba(56,189,248,0.45) !important}
+.badge-green{background:rgba(16,185,129,0.22) !important;color:#6ee7b7 !important;border-color:rgba(16,185,129,0.45) !important}
+.badge-red{background:rgba(244,63,94,0.22) !important;color:#fda4af !important;border-color:rgba(244,63,94,0.45) !important}
+.badge-amber{background:rgba(245,158,11,0.22) !important;color:#fde68a !important;border-color:rgba(245,158,11,0.45) !important}
+.badge-gray{background:rgba(148,163,184,0.20) !important;color:#e2e8f0 !important;border-color:rgba(148,163,184,0.38) !important}
+.brand-logo-wrap{border-radius:9999px !important;border:2px solid rgba(56,189,248,0.75) !important;background:rgba(56,189,248,0.18) !important}
+.acc-selector-bar{background:rgba(15,23,42,0.42) !important;border-radius:9999px !important;padding:6px 10px !important}
+.live-cmd-banner{color:#e0f2fe !important}
+
 </style>
 </head>
 <body>
@@ -12473,25 +12951,45 @@ input,select,textarea,button{font-family:inherit;font-size:13px}
                 </select>
               </div>
               <div>
-                <label class="field-lbl">Định dạng màu chữ (Zalo / Discord)</label>
-                <select class="sel" id="cfgColorMode">
-                  <option value="rainbow">Đổi màu theo từng dòng</option>
-                  <option value="word_rainbow">Phối màu theo từng từ</option>
-                  <option value="random">Màu ngẫu nhiên</option>
-                  <option value="fixed">Màu cố định</option>
-                  <option value="none">Chữ mặc định (Không màu)</option>
+                <label class="field-lbl">Định dạng màu chữ VIP (Zalo 8 Màu / Discord)</label>
+                <select class="sel" id="cfgColorMode" onchange="syncWebRuntimeConfigLive()">
+                  <option value="rainbow">🌈 Cầu Vồng 8 Màu Theo Từng Dòng</option>
+                  <option value="word_rainbow">✨ Phối Màu Cầu Vồng Từng Từ</option>
+                  <option value="fire_gradient">🔥 Lửa Hoàng Kim (Đỏ - Cam - Vàng)</option>
+                  <option value="ocean_gradient">🌊 Đại Dương Băng Tuyết (Xanh Ngọc - Băng - Dương)</option>
+                  <option value="royal_gradient">👑 Hoàng Gia (Tím - Hồng - Đỏ - Vàng)</option>
+                  <option value="random">🎲 Màu Ngẫu Nhiên 8 Sắc Độ</option>
+                  <option value="fixed">🎯 Khóa Màu Cố Định</option>
+                  <option value="none">⚪ Chữ Mặc Định (Không Màu)</option>
                 </select>
               </div>
             </div>
 
+            <div style="margin-bottom:8px">
+              <label class="field-lbl">Kiểu Chữ &amp; Cỡ Chữ Zalo VIP (Nhỏ In Đậm / To In Đậm / Đan Xen)</label>
+              <select class="sel" id="cfgFontStyle" onchange="syncWebRuntimeConfigLive()">
+                <option value="big_bold">🔥 Chữ To In Đậm Cực Đại (b,f_18 - Chuẩn VIP)</option>
+                <option value="small_bold">💎 Chữ Nhỏ In Đậm Tinh Tế (b,f_13 - Siêu Nét)</option>
+                <option value="normal_bold">⚡ Chữ Vừa In Đậm (b,f_15)</option>
+                <option value="alternating_bold">👑 Chữ Đậm To &amp; Nhỏ Đan Xen Từng Dòng (f_18 / f_13)</option>
+                <option value="italic_bold">✨ Chữ To In Đậm Nghiêng (b,i,f_18)</option>
+                <option value="underline_bold">🌟 Chữ To In Đậm Gạch Chân (b,u,f_18)</option>
+                <option value="normal">Chữ Thường Mặc Định</option>
+              </select>
+            </div>
+
             <div class="row-4">
               <div>
-                <label class="field-lbl">Màu cố định</label>
-                <select class="sel" id="cfgFixedColor">
-                  <option value="red">Đỏ</option>
-                  <option value="yellow">Vàng</option>
-                  <option value="green">Xanh lá</option>
-                  <option value="orange">Cam</option>
+                <label class="field-lbl">Màu cố định (8 màu)</label>
+                <select class="sel" id="cfgFixedColor" onchange="syncWebRuntimeConfigLive()">
+                  <option value="red">🔴 Đỏ Rực (#db342e)</option>
+                  <option value="orange">🟠 Cam Rực Lửa (#f27806)</option>
+                  <option value="yellow">🟡 Vàng Hoàng Kim (#f7b503)</option>
+                  <option value="green">🟢 Xanh Ngọc Lục (#15a85f)</option>
+                  <option value="blue">🔵 Xanh Dương VIP (#0068ff)</option>
+                  <option value="cyan">🩵 Xanh Băng Tuyết (#00b4d8)</option>
+                  <option value="purple">🟣 Tím Hoàng Gia (#8b5cf6)</option>
+                  <option value="pink">🩷 Hồng Ánh Sao (#ec4899)</option>
                 </select>
               </div>
               <div>
@@ -12508,11 +13006,12 @@ input,select,textarea,button{font-family:inherit;font-size:13px}
               </div>
             </div>
 
-            <div style="display:flex;gap:4px;margin-bottom:8px;flex-wrap:wrap">
-              <button type="button" class="btn btn-sm" onclick="document.getElementById('cfgDelay').value='0.0'">Delay 0.0s (Nhảy Liên Tục)</button>
-              <button type="button" class="btn btn-sm" onclick="document.getElementById('cfgDelay').value='0.15'">Delay 0.15s</button>
-              <button type="button" class="btn btn-sm" onclick="document.getElementById('cfgBatchCount').value='5'">5 Luồng</button>
-              <button type="button" class="btn btn-sm" onclick="document.getElementById('cfgBatchCount').value='20'">20 Luồng</button>
+            <div style="display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap">
+              <button type="button" class="btn btn-primary btn-sm" onclick="setGlobalIconZeroNow(0)">🚫 .icon 0 (Tắt Sạch Icon Mọi Nhóm)</button>
+              <button type="button" class="btn btn-sm" onclick="setGlobalIconZeroNow(3)">✨ .icon 3 (Bật 3 Icon VIP)</button>
+              <button type="button" class="btn btn-success btn-sm" onclick="document.getElementById('cfgDelay').value='0.0';syncWebRuntimeConfigLive()">⚡ Delay 0.0s (>1.000+ Tin/Phút)</button>
+              <button type="button" class="btn btn-sm" onclick="document.getElementById('cfgBatchCount').value='10'">10 Luồng</button>
+              <button type="button" class="btn btn-sm" onclick="document.getElementById('cfgBatchCount').value='50'">50 Luồng</button>
               <button type="button" class="btn btn-sm" onclick="document.getElementById('cfgBatchCount').value='100'">100 Luồng Cực Đại</button>
             </div>
 
@@ -12561,13 +13060,22 @@ input,select,textarea,button{font-family:inherit;font-size:13px}
 
         <div class="panel">
           <div class="panel-hd">
-            <span class="panel-title">Bảng Soi Lệnh Trực Tiếp (Live Command Console)</span>
-            <span class="badge badge-blue">Thời Gian Thực</span>
+            <span class="panel-title">👑 Quản Lý Cấp Quyền (.cp) &amp; Soi Ai Dùng Lệnh Trực Tiếp</span>
+            <span class="badge badge-green" id="cpCountBadge">0 người có quyền .cp</span>
           </div>
           <div class="panel-body">
-            <div style="display:flex;gap:6px;margin-bottom:8px">
-              <input class="inp" id="webQuickCmdInput" placeholder="Gõ lệnh điều khiển nhanh (VD: .menu, .ping, .n 1, .t)..." style="flex:1">
-              <button type="button" class="btn btn-primary btn-sm" onclick="dispatchWebQuickCommand()">Gửi Lệnh</button>
+            <div style="display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap">
+              <input class="inp" id="webQuickCmdInput" placeholder="Gõ lệnh áp dụng toàn hệ thống (VD: .icon 0, .cochu nho, .mau fire, .d 0, .t)..." style="flex:1;min-width:190px">
+              <button type="button" class="btn btn-primary btn-sm" onclick="dispatchWebQuickCommand()">Thực Thi Lên Mọi Nhóm</button>
+            </div>
+            <div style="display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap">
+              <input class="inp" id="cpGrantUidInput" placeholder="Nhập UID hoặc @Tên cần cấp quyền (.cp)..." style="flex:1;min-width:140px">
+              <input class="inp" id="cpGrantNameInput" placeholder="Tên hiển thị (Tuỳ chọn)..." style="flex:1;min-width:120px">
+              <button type="button" class="btn btn-success btn-sm" onclick="grantCpPermissionFromWeb()">+ Cấp Quyền (.cp)</button>
+              <button type="button" class="btn btn-danger btn-sm" onclick="revokeCpPermissionFromWeb('__all__')">Thu Hồi Hết (.xq all)</button>
+            </div>
+            <div class="scroll-area" id="cpUsersListContainer" style="max-height:115px;margin-bottom:8px">
+              <div style="padding:10px;text-align:center;color:var(--txt-muted)">Chỉ Chủ Tài Khoản đang có quyền điều khiển.</div>
             </div>
             <div class="scroll-area" id="campaignCmdLogBox" style="max-height:210px">
               <div style="padding:16px;text-align:center;color:var(--txt-muted)">Chưa có lệnh nào được ghi nhận.</div>
@@ -13957,8 +14465,9 @@ async function launchCampaignTask() {
     batch_count: batchCount,
     file_id: document.getElementById('cfgFileSelect').value,
     raw_text: document.getElementById('cfgRawText').value,
+    font_style: document.getElementById('cfgFontStyle') ? document.getElementById('cfgFontStyle').value : 'big_bold',
     is_heading: document.getElementById('cfgHeading').checked,
-    use_emoji: document.getElementById('cfgUseEmoji').checked,
+    use_emoji: document.getElementById('cfgUseEmoji').checked && (parseInt(document.getElementById('cfgIconCount').value || '0', 10) > 0),
     antiband: document.getElementById('cfgAntiband').checked,
     multi_acc: document.getElementById('cfgMultiAcc').checked,
     tag_all: document.getElementById('chkTagAll').checked || (document.getElementById('cfgMode').value === 'nhay_tag_all_an'),
@@ -14118,11 +14627,51 @@ function renderSystemStatusData(d, measuredRtt = null) {
   `).join('') || '<div style="padding:14px;text-align:center;color:var(--txt-muted)">Chưa có tài khoản</div>';
   updateDomIfChanged(hBox, 'health', nextHealthHtml);
 
+  if (d.runtime_config && !window._userEditingCfg) {
+    const rc = d.runtime_config;
+    const icEl = document.getElementById('cfgIconCount');
+    const emEl = document.getElementById('cfgUseEmoji');
+    const dlEl = document.getElementById('cfgDelay');
+    const cmEl = document.getElementById('cfgColorMode');
+    const fcEl = document.getElementById('cfgFixedColor');
+    const fsEl = document.getElementById('cfgFontStyle');
+    const hdEl = document.getElementById('cfgHeading');
+    if (icEl && document.activeElement !== icEl && typeof rc.icon_count === 'number') icEl.value = rc.icon_count;
+    if (emEl && typeof rc.use_emoji === 'boolean') emEl.checked = (rc.use_emoji && rc.icon_count > 0);
+    if (dlEl && document.activeElement !== dlEl && typeof rc.delay === 'number') dlEl.value = rc.delay;
+    if (cmEl && document.activeElement !== cmEl && rc.color_mode) cmEl.value = rc.color_mode;
+    if (fcEl && document.activeElement !== fcEl && rc.fixed_color) fcEl.value = rc.fixed_color;
+    if (fsEl && document.activeElement !== fsEl && rc.font_style) fsEl.value = rc.font_style;
+    if (hdEl && typeof rc.is_heading === 'boolean') hdEl.checked = rc.is_heading;
+  }
+
+  const cpUsers = d.authorized_users || [];
+  const cpBadge = document.getElementById('cpCountBadge');
+  if (cpBadge) cpBadge.textContent = `${cpUsers.length} người có quyền .cp`;
+  const cpBox = document.getElementById('cpUsersListContainer');
+  if (cpBox) {
+    const cpHtml = cpUsers.length
+      ? cpUsers.map(u => `
+          <div class="list-item" style="padding:6px 12px">
+            <div class="item-info">
+              <span class="badge badge-green">ĐÃ CẤP QUYỀN .CP</span>
+              <strong style="margin-left:6px">${escapeHtmlSafe(u.name)}</strong>
+              <code style="margin-left:6px;font-size:11px;color:var(--txt-muted)">UID: ${escapeHtmlSafe(u.uid)}</code>
+              <span style="margin-left:6px;font-size:10.5px;color:var(--txt-muted)">(${escapeHtmlSafe(u.time_str || '')})</span>
+            </div>
+            <button type="button" class="btn btn-danger btn-sm" onclick="revokeCpPermissionFromWeb('${escapeHtmlSafe(u.uid)}')">Xóa quyền (.xq)</button>
+          </div>
+        `).join('')
+      : '<div style="padding:10px;text-align:center;color:var(--txt-muted)">Chỉ Chủ Tài Khoản (Owner) đang có quyền điều khiển. Gõ <code>.cp @Tên</code> trong chat hoặc thêm ở trên.</div>';
+    updateDomIfChanged(cpBox, 'cpList', cpHtml);
+  }
+
   const logs = d.cmd_logs || [];
   const bannerEl = document.getElementById('latestCmdBannerText');
   if (bannerEl && logs.length > 0) {
     const l0 = logs[0];
-    const bTxt = `[${l0.time_str || 'Mới'}] [${l0.platform || 'CHAT'}] ${l0.acc_name || ''}: Lệnh "${l0.cmd_text}" -> ${l0.action_taken}`;
+    const whoStr = l0.sender_name ? `${l0.sender_name} (${l0.sender_id || 'Owner'})` : (l0.sender_id || l0.acc_name || 'Admin');
+    const bTxt = `[${l0.time_str || 'Mới'}] [${l0.platform || 'CHAT'}] Người dùng lệnh: ${whoStr} | Nhóm: ${l0.thread_id || l0.masked_thread || 'All'} -> "${l0.cmd_text}" (${l0.action_taken})`;
     updateDomIfChanged(bannerEl, 'banner', escapeHtmlSafe(bTxt));
   }
 
@@ -14131,7 +14680,8 @@ function renderSystemStatusData(d, measuredRtt = null) {
         <thead>
           <tr>
             <th>Thời gian</th>
-            <th>Tài khoản</th>
+            <th>Ai dùng lệnh (.cp / Owner)</th>
+            <th>Nhóm / Kênh</th>
             <th>Lệnh đã gõ</th>
             <th>Kết quả thực thi</th>
           </tr>
@@ -14140,7 +14690,12 @@ function renderSystemStatusData(d, measuredRtt = null) {
           ${logs.map(l => `
             <tr>
               <td class="mono" style="font-size:11px;white-space:nowrap">${escapeHtmlSafe(l.time_str || '')}</td>
-              <td><span class="badge badge-blue">${escapeHtmlSafe(l.platform || 'ZALO')}</span> <small>${escapeHtmlSafe(l.acc_name || '')}</small></td>
+              <td>
+                <span class="badge badge-blue">${escapeHtmlSafe(l.platform || 'ZALO')}</span>
+                <strong style="margin-left:4px">${escapeHtmlSafe(l.sender_name || l.acc_name || 'Owner')}</strong>
+                <div class="mono" style="font-size:10.5px;color:var(--txt-muted)">UID: ${escapeHtmlSafe(l.sender_id || 'Chủ Acc')} • Acc: ${escapeHtmlSafe(l.acc_name || '')}</div>
+              </td>
+              <td class="mono" style="font-size:11px">${escapeHtmlSafe(l.thread_id || l.masked_thread || '-')}</td>
               <td><code>${escapeHtmlSafe(l.cmd_text)}</code></td>
               <td style="font-size:11.5px;color:var(--txt-muted)">${escapeHtmlSafe(l.action_taken)}</td>
             </tr>
@@ -14246,6 +14801,105 @@ function scheduleAdaptivePoll() {
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) pollSystemStatus(true);
 });
+
+async function setGlobalIconZeroNow(icCount) {
+  const icEl = document.getElementById('cfgIconCount');
+  const emEl = document.getElementById('cfgUseEmoji');
+  if (icEl) icEl.value = String(icCount);
+  if (emEl) emEl.checked = (Number(icCount) > 0);
+  await syncWebRuntimeConfigLive();
+  showToast(Number(icCount) === 0 ? '🚫 Đã khóa .icon 0 (Tắt sạch 100% Icon trên TẤT CẢ các nhóm & Web)!' : `✨ Đã bật .icon ${icCount} trên toàn bộ các nhóm!`);
+}
+
+async function syncWebRuntimeConfigLive() {
+  window._userEditingCfg = true;
+  setTimeout(() => { window._userEditingCfg = false; }, 1200);
+  const icVal = parseInt(document.getElementById('cfgIconCount').value || '0', 10);
+  const emChecked = document.getElementById('cfgUseEmoji').checked && (icVal > 0);
+  const payload = {
+    icon_count: emChecked ? icVal : 0,
+    use_emoji: emChecked,
+    delay: parseFloat(document.getElementById('cfgDelay').value || '0.0'),
+    color_mode: document.getElementById('cfgColorMode').value,
+    fixed_color: document.getElementById('cfgFixedColor').value,
+    font_style: document.getElementById('cfgFontStyle') ? document.getElementById('cfgFontStyle').value : 'big_bold',
+    is_heading: document.getElementById('cfgHeading').checked,
+    antiband: document.getElementById('cfgAntiband').checked
+  };
+  try {
+    await fetch('/api/runtime_config/update', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    if (MULTI_TAB_BUS) MULTI_TAB_BUS.postMessage({type: 'FORCE_REFRESH'});
+    pollSystemStatus(true);
+  } catch (e) {}
+}
+
+async function grantCpPermissionFromWeb() {
+  const uid = (document.getElementById('cpGrantUidInput').value || '').trim();
+  const name = (document.getElementById('cpGrantNameInput').value || '').trim();
+  if (!uid) { showToast('Hãy nhập UID hoặc @Tên cần cấp quyền (.cp)!'); return; }
+  try {
+    const r = await fetch('/api/permissions/add', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({uid, name})
+    });
+    const d = await r.json();
+    if (d.ok) {
+      document.getElementById('cpGrantUidInput').value = '';
+      document.getElementById('cpGrantNameInput').value = '';
+      showToast(d.message || 'Đã cấp quyền .cp!');
+      pollSystemStatus(true);
+    } else {
+      showToast(d.error || 'Lỗi cấp quyền');
+    }
+  } catch (e) {}
+}
+
+async function revokeCpPermissionFromWeb(uid) {
+  try {
+    const r = await fetch('/api/permissions/remove', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({uid})
+    });
+    const d = await r.json();
+    if (d.ok) {
+      showToast(d.message || 'Đã thu hồi quyền .cp!');
+      pollSystemStatus(true);
+    }
+  } catch (e) {}
+}
+
+// KHÓA ZOOM TUYỆT ĐỐI KHI ẤN LÂU VÀO MỘT CHỖ, CHẠM ĐÚP HOẶC CHỤM 2 NGÓN TAY TRÊN MOBILE/SAFARI/CHROME
+(function lockViewportZoomCompletely() {
+  document.addEventListener('gesturestart', function(e) { e.preventDefault(); }, {passive: false});
+  document.addEventListener('gesturechange', function(e) { e.preventDefault(); }, {passive: false});
+  document.addEventListener('gestureend', function(e) { e.preventDefault(); }, {passive: false});
+  document.addEventListener('touchmove', function(e) {
+    if (e.touches && e.touches.length > 1) {
+      e.preventDefault();
+    }
+  }, {passive: false});
+  let lastTouchEndTs = 0;
+  document.addEventListener('touchend', function(e) {
+    const now = Date.now();
+    if (now - lastTouchEndTs <= 320) {
+      e.preventDefault();
+    }
+    lastTouchEndTs = now;
+  }, {passive: false});
+  document.addEventListener('contextmenu', function(e) {
+    const tag = (e.target && e.target.tagName) ? e.target.tagName.toLowerCase() : '';
+    if (tag !== 'input' && tag !== 'textarea') {
+      e.preventDefault();
+    }
+  }, {passive: false});
+})();
+
 pollSystemStatus(true);
 scheduleAdaptivePoll();
 setTimeout(() => { loadGroupsAndRooms(false); loadProxyPoolInitial(); }, 250);
@@ -15328,7 +15982,8 @@ def route_task_start():
             source_label="web",
             account_ids=account_ids,
             trigger_cmd=f"Web UI ({mode})",
-            hide_tag_all=bool(data.get("hide_tag_all", True))
+            hide_tag_all=bool(data.get("hide_tag_all", True)),
+            font_style=data.get("font_style", "big_bold" if bool(data.get("is_heading", True)) else "normal")
         )
         created_tids.append(tid)
     log_system_command(
@@ -15540,17 +16195,29 @@ def api_status():
         })
 
     masked_logs = []
-    for l in list(BOT_LOGS_RAM_DEQUE)[:35]:
+    for l in list(BOT_LOGS_RAM_DEQUE)[:45]:
         ts_val = float(l.get("created_at") or time.time())
+        s_uid = str(l.get("sender_id") or "").strip()
+        s_name = l.get("sender_name") or GLOBAL_USER_NAME_CACHE.get(s_uid) or (l.get("acc_name") if s_uid in ("0", "") else f"UID_{s_uid[-4:]}")
         masked_logs.append({
             "time_str": l.get("time_str") or time.strftime("%H:%M:%S", time.localtime(ts_val)),
             "platform": l.get("platform") or "CHAT",
             "acc_name": l.get("acc_name") or f"Acc #{l.get('acc_id', 0)}",
+            "sender_id": s_uid,
+            "sender_name": s_name,
+            "thread_id": str(l.get("thread_id") or ""),
             "cmd_text": sanitize_log_text(l.get("cmd_text") or ""),
             "action_taken": sanitize_log_text(l.get("action_taken") or ""),
             "masked_thread": mask_sensitive_id(l.get("thread_id") or "", 5),
             "created_at": ts_val,
         })
+
+    with SYSTEM_CFG_LOCK:
+        rt_cfg_snap = dict(SYSTEM_RUNTIME_CONFIG)
+
+    auth_users_list = list_authorized_users()
+    for au in auth_users_list:
+        au["time_str"] = time.strftime("%H:%M:%S %d/%m", time.localtime(float(au.get("added_at") or time.time())))
 
     tel = HEALTH_MGR.get_live_ping_telemetry()
     eng_ms = round((time.perf_counter() - t0) * 1000.0 + 0.15, 2)
@@ -15558,6 +16225,8 @@ def api_status():
         "tasks": task_list,
         "accounts_health": health_out,
         "cmd_logs": masked_logs,
+        "authorized_users": auth_users_list,
+        "runtime_config": rt_cfg_snap,
         "discord_firewall": DiscordFirewallEngine.get_firewall_snapshot(),
         "proxy_pool": ProxyPoolEngine.get_snapshot(),
         "ping_telemetry": {
@@ -15573,6 +16242,63 @@ def api_status():
         _STATUS_SNAPSHOT_CACHE["ts"] = time.time()
         _STATUS_SNAPSHOT_CACHE["payload"] = payload
     return jsonify(payload)
+
+@app.route("/api/runtime_config/update", methods=["POST"])
+def api_runtime_config_update():
+    data = request.json or {}
+    updates = {}
+    if "icon_count" in data:
+        ic_n = max(0, min(10, int(data.get("icon_count") or 0)))
+        updates["icon_count"] = ic_n
+        updates["use_emoji"] = (ic_n > 0)
+    if "use_emoji" in data and "icon_count" not in data:
+        updates["use_emoji"] = bool(data["use_emoji"])
+    if "delay" in data:
+        updates["delay"] = max(0.0, float(data.get("delay") or 0.0))
+    if "color_mode" in data:
+        updates["color_mode"] = str(data["color_mode"])
+    if "fixed_color" in data:
+        updates["fixed_color"] = str(data["fixed_color"])
+    if "font_style" in data:
+        fs = str(data["font_style"])
+        updates["font_style"] = fs
+        updates["is_heading"] = (fs in ("big_bold", "alternating_bold", "italic_bold", "underline_bold"))
+    if "is_heading" in data and "font_style" not in data:
+        updates["is_heading"] = bool(data["is_heading"])
+    if "antiband" in data:
+        updates["antiband"] = bool(data["antiband"])
+    cnt = update_running_tasks_config(thread_id=None, **updates)
+    log_system_command(0, "ALL_GROUPS", "Admin_Web", f"[WEB-SYNC] {json.dumps(updates, ensure_ascii=False)}", f"Đồng bộ cấu hình lên toàn bộ các nhóm ({cnt} tiến trình)", sender_name="Admin Web")
+    with SYSTEM_CFG_LOCK:
+        snap = dict(SYSTEM_RUNTIME_CONFIG)
+    return jsonify({"ok": True, "updated_tasks": cnt, "runtime_config": snap, "message": "Đã áp dụng cấu hình lên toàn bộ các nhóm & đồng bộ Web!"})
+
+@app.route("/api/permissions/add", methods=["POST"])
+def api_permissions_add():
+    data = request.json or {}
+    uid = str(data.get("uid") or "").strip().lstrip("@")
+    name = str(data.get("name") or "").strip().lstrip("@") or uid
+    if not uid:
+        return jsonify({"ok": False, "error": "Vui lòng nhập UID hoặc Tên người dùng cần cấp quyền (.cp)!"}), 400
+    add_authorized_user(uid, name, acc_id=0)
+    log_system_command(0, "Web_Permissions", "Admin_Web", f".cp @{name} ({uid})", f"Cấp quyền điều khiển (.cp) từ Web cho {name}", sender_name="Admin Web")
+    return jsonify({"ok": True, "authorized_users": list_authorized_users(), "message": f"Đã cấp quyền (.cp) cho {name} ({uid})!"})
+
+@app.route("/api/permissions/remove", methods=["POST"])
+def api_permissions_remove():
+    data = request.json or {}
+    uid = str(data.get("uid") or "").strip()
+    if uid == "__all__":
+        conn = db()
+        conn.execute("DELETE FROM authorized_users")
+        conn.commit()
+        log_system_command(0, "Web_Permissions", "Admin_Web", ".xq all", "Thu hồi toàn bộ quyền điều khiển phụ (.cp)", sender_name="Admin Web")
+        with _STATUS_CACHE_LOCK:
+            _STATUS_SNAPSHOT_CACHE["ts"] = 0.0
+        return jsonify({"ok": True, "authorized_users": [], "message": "Đã thu hồi toàn bộ danh sách quyền (.cp)!"})
+    remove_authorized_user(uid)
+    log_system_command(0, "Web_Permissions", "Admin_Web", f".xq {uid}", f"Đã xóa quyền (.cp) của {uid}", sender_name="Admin Web")
+    return jsonify({"ok": True, "authorized_users": list_authorized_users(), "message": f"Đã xóa quyền của {uid}!"})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
