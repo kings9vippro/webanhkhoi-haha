@@ -873,9 +873,15 @@ SYSTEM_RUNTIME_CONFIG = {
 }
 SYSTEM_CFG_LOCK = threading.RLock()
 
-SYSTEM_SENT_IDS = deque(maxlen=1500)
-SYSTEM_SENT_TEXT_HASHES = deque(maxlen=1500)
+SYSTEM_SENT_IDS = deque(maxlen=3000)
+SYSTEM_SENT_TEXT_HASHES = deque(maxlen=3000)
+_SENT_IDS_MAP = {}
+_SENT_HASH_MAP = {}
 SYSTEM_SENT_LOCK = threading.RLock()
+
+# Chế độ tự động chặn & bám sát mục tiêu (.chan / .bam) 0ms
+AUTO_INTERCEPT_BOXES = {}
+AUTO_INTERCEPT_LOCK = threading.RLock()
 
 def _normalize_for_echo_hash(s):
     if not s:
@@ -887,17 +893,29 @@ def _normalize_for_echo_hash(s):
 def register_system_sent_message(msg_id=None, client_id=None, text=None):
     now = time.time()
     with SYSTEM_SENT_LOCK:
+        if len(_SENT_IDS_MAP) > 4000:
+            cutoff = now - 95.0
+            for k in [k for k, v in _SENT_IDS_MAP.items() if v < cutoff]:
+                _SENT_IDS_MAP.pop(k, None)
+        if len(_SENT_HASH_MAP) > 4000:
+            cutoff_h = now - 65.0
+            for k in [k for k, v in _SENT_HASH_MAP.items() if v < cutoff_h]:
+                _SENT_HASH_MAP.pop(k, None)
         if msg_id:
-            SYSTEM_SENT_IDS.append((str(msg_id), now))
+            s_mid = str(msg_id)
+            _SENT_IDS_MAP[s_mid] = now
+            SYSTEM_SENT_IDS.append((s_mid, now))
         if client_id:
-            SYSTEM_SENT_IDS.append((str(client_id), now))
+            s_cid = str(client_id)
+            _SENT_IDS_MAP[s_cid] = now
+            SYSTEM_SENT_IDS.append((s_cid, now))
         if text:
             nh = _normalize_for_echo_hash(text)
             if nh:
-                SYSTEM_SENT_TEXT_HASHES.append((nh, now))
+                _SENT_HASH_MAP[nh] = now
                 first_line = _normalize_for_echo_hash(text.split("\n")[0])
                 if first_line:
-                    SYSTEM_SENT_TEXT_HASHES.append((first_line, now))
+                    _SENT_HASH_MAP[first_line] = now
 
 VALID_SYSTEM_CMD_TOKENS = {
     "menu", "help", "lenh", "hdsd", "m", "h",
@@ -906,7 +924,7 @@ VALID_SYSTEM_CMD_TOKENS = {
     "spam", "fast", "nhanh", "s", "nhay", "treonhay", "treo_nhay", "n",
     "ngon", "treongon", "treo_ngon", "g", "file", "chay", "f",
     "files", "dsfile", "listfile", "ds", "tag", "all", "tagall", "anall", "tagallan", "antan", "tagan", "antag", "hientag", "prx", "proxy",
-    "soi", "soifull", "scanbox", "dsbox", "listbox", "dsnhom", "gall", "gll", "ngonall", "nall", "nll", "nhayall", "xaall",
+    "soi", "soifull", "scanbox", "dsbox", "listbox", "dsnhom", "chan", "bam", "bamsat", "chanall", "gall", "gll", "ngonall", "nall", "nll", "nhayall", "xaall",
     "raid", "r", "auto", "a", "dao", "chao", "hi", "xa", "sieuxa", "xanhom", "combo", "battrinh",
     "ping", "p", "status", "info", "stinfo", "id", "uid", "mem", "tv", "thanhvien",
     "addfile", "taof", "af", "clear", "reset",
@@ -942,19 +960,25 @@ def is_direct_user_command_text(text):
 
 def is_system_echo_message(msg_id=None, client_id=None, text=None):
     now = time.time()
-    with SYSTEM_SENT_LOCK:
-        for mid, ts in list(SYSTEM_SENT_IDS):
-            if now - ts <= 95.0:
-                if (msg_id and str(msg_id) == mid) or (client_id and str(client_id) == mid):
-                    return True
-        if text:
-            if is_direct_user_command_text(text):
-                return False
-            nh = _normalize_for_echo_hash(text)
-            first_line = _normalize_for_echo_hash(text.split("\n")[0])
-            for h_saved, ts in list(SYSTEM_SENT_TEXT_HASHES):
-                if now - ts <= 65.0 and h_saved and (nh == h_saved or first_line == h_saved):
-                    return True
+    if msg_id:
+        ts_m = _SENT_IDS_MAP.get(str(msg_id))
+        if ts_m is not None and (now - ts_m <= 95.0):
+            return True
+    if client_id:
+        ts_c = _SENT_IDS_MAP.get(str(client_id))
+        if ts_c is not None and (now - ts_c <= 95.0):
+            return True
+    if text:
+        if is_direct_user_command_text(text):
+            return False
+        nh = _normalize_for_echo_hash(text)
+        ts_h = _SENT_HASH_MAP.get(nh)
+        if ts_h is not None and (now - ts_h <= 65.0):
+            return True
+        first_line = _normalize_for_echo_hash(text.split("\n")[0])
+        ts_fl = _SENT_HASH_MAP.get(first_line)
+        if ts_fl is not None and (now - ts_fl <= 65.0):
+            return True
     return False
 
 def new_tid(p):
@@ -1399,13 +1423,6 @@ class ZaloSmartAntiBanEngine:
             "Accept-Language": "vi-VN,vi;q=0.95,en-US;q=0.8,en;q=0.7",
             "Origin": "https://chat.zalo.me",
             "Referer": "https://chat.zalo.me/",
-            "X-Forwarded-For": vn_ip,
-            "X-Real-IP": vn_ip,
-            "CF-Connecting-IP": vn_ip,
-            "True-Client-IP": vn_ip,
-            "CF-IPCountry": "VN",
-            "X-Country-Code": "VN",
-            "X-Timezone": "Asia/Ho_Chi_Minh",
             "Sec-Ch-Ua": prof["sec_ch_ua"],
             "Sec-Ch-Ua-Mobile": "?0",
             "Sec-Ch-Ua-Platform": prof["platform"],
@@ -1457,7 +1474,7 @@ class ZaloSmartAntiBanEngine:
     @staticmethod
     def compute_human_cadence_delay(base_delay, burst_cnt=0, risk_score=0.0, adaptive_bonus=0.0, text_len=20):
         # Chạy chuẩn xác 100% tốc độ Delay người dùng cài đặt (Tối thiểu 0.20s trên Zalo), KHÔNG cộng thêm delay ảo hay thời gian nghỉ!
-        return max(0.20, float(base_delay))
+        return 0.0 if float(base_delay or 0.0) <= 0.0 else float(base_delay)
 
 class WaveFairnessEngine:
     """Bộ Điều Phối Luồng Sóng Đa Tài Khoản Siêu Mượt (50+ Acc × 200+ Nhóm Lock-Free Synchronizer v24):
@@ -1697,6 +1714,10 @@ class ProxyPoolEngine:
 
     @classmethod
     def request_with_fast_failover(cls, session_obj, method, url, seed_key=None, **kwargs):
+        if not cls._PROXIES or not cls._ENABLED:
+            if "timeout" not in kwargs:
+                kwargs["timeout"] = (0.75, 1.45)
+            return session_obj.request(method, url, **kwargs)
         """Thực thi HTTP request siêu tốc qua Hồ Proxy Dedicated Keep-Alive + 3-Hop Instant 0ms Failover:
         - Phân mảnh đường truyền theo từng cặp (Acc + Nhóm + Nhịp) giúp 50 Acc × 200 Nhóm chia tải đều trên toàn bộ dàn Proxy.
         - Nếu 1 Proxy chập chờn (> 0.75s) hoặc dính 429/502/503, tự động phóng sang Proxy khỏe tiếp theo hoặc Direct Keep-Alive
@@ -5219,7 +5240,19 @@ class ZaloQRLoginManager:
     def start_qr_session(cls, auto_save=True, vn_region="HCM", custom_pc_name="", vn_proxy=""):
         session_id = str(uuid.uuid4())
         qr_nonce = secrets.token_hex(6)
-        reg_map = {"HCM": "vn_hcm", "HN": "vn_hn", "DN": "vn_dn", "MAC": "vn_mac", "SG": "sg_firefox", "SINGAPORE": "sg_firefox"}
+        reg_map = {
+            "HCM": "vn_hcm", "VN_HCM": "vn_hcm",
+            "HN": "vn_hn", "VN_HN": "vn_hn",
+            "DN": "vn_dn", "VN_DN": "vn_dn",
+            "MAC": "vn_mac", "VN_MAC": "vn_mac",
+            "MAC_AIR": "vn_mac_air", "VN_MAC_AIR": "vn_mac_air",
+            "IMAC": "vn_imac", "VN_IMAC": "vn_imac",
+            "MAC_STUDIO": "vn_mac_studio", "VN_MAC_STUDIO": "vn_mac_studio",
+            "DELL": "vn_dell_xps", "VN_DELL_XPS": "vn_dell_xps",
+            "THINKPAD": "vn_thinkpad", "VN_THINKPAD": "vn_thinkpad",
+            "HP": "vn_hp_spectre", "VN_HP_SPECTRE": "vn_hp_spectre",
+            "SG": "sg_vip", "SINGAPORE": "sg_vip", "SG_VIP": "sg_vip",
+        }
         reg_code = reg_map.get(str(vn_region or "HCM").upper(), "vn_hcm")
         pc_dev = ZaloWebIDGenerator.create_random_pc_device(
             f"{session_id}_{qr_nonce}", region_code=reg_code, custom_pc_name=custom_pc_name
@@ -5238,6 +5271,8 @@ class ZaloQRLoginManager:
             "vn_location": reg_lbl,
             "vn_isp": "VNPT/Viettel/Singtel Fiber",
             "vn_ip": vn_ip_val,
+            "mac_address": pc_dev.get("mac_address", "A4:83:E7:2B:91:04"),
+            "device_model": pc_dev.get("device_model", pc_dev.get("pc_name", "MacBook Pro M3 Max")),
             "proxy_vn": str(vn_proxy or "").strip(),
             "vn_proxy": str(vn_proxy or "").strip(),
             "status": "generating",
@@ -5321,6 +5356,8 @@ class ZaloQRLoginManager:
             "vn_location": st.get("vn_location", "TP. Hồ Chí Minh, Việt Nam"),
             "vn_isp": st.get("vn_isp", "Viettel Telecom VN"),
             "vn_ip": st.get("vn_ip", "14.161.28.105"),
+            "mac_address": st.get("mac_address", "A4:83:E7:2B:91:04"),
+            "device_model": st.get("device_model", st.get("pc_name", "MacBook Pro M3 Max")),
             "step_num": step_map.get(st.get("status", "generating"), 1),
             "status": st.get("status", "generating"),
             "message": st.get("message", ""),
@@ -5522,18 +5559,46 @@ class ZaloQRLoginManager:
         if not st:
             return
 
-        # Ưu tiên 1: Nếu môi trường có sẵn thư viện zalo_login độc lập
+        # Ưu tiên 1: Sử dụng luồng chuẩn zalo_login với đầy đủ sự kiện thời gian thực (Generated -> Scanned -> Confirmed -> GotLoginInfo)
         try:
-            from zalo_login import login_qr_with_unique_imei as _ext_qr_login
+            from zalo_login import login_qr_with_unique_imei as _ext_qr_login, LoginQRCallbackEventType as _EvType
             def _on_qr_cb(qr_b64_img):
                 raw_b64 = qr_b64_img.split(",", 1)[-1].strip()
                 raw_png = base64.b64decode(raw_b64 + ("=" * ((4 - len(raw_b64) % 4) % 4)))
                 st["qr_png_bytes"] = raw_png
                 st["qr_base64"] = "data:image/png;base64," + base64.b64encode(raw_png).decode("utf-8")
                 st["status"] = "waiting_scan"
-                st["message"] = f"Đã tạo mã QR cho {st.get('pc_name', 'PC')}. Mở Zalo trên điện thoại để quét!"
+                st["message"] = f"Đã tạo mã QR cho {st.get('pc_name', 'PC')}. Hãy mở Zalo trên điện thoại quét mã và bấm Đăng nhập!"
                 cls._persist_qr_state_to_db(st)
+
+            def _on_ev_cb(ev):
+                if not isinstance(ev, dict):
+                    return
+                et = ev.get("type")
+                ed = ev.get("data") or {}
+                if et == _EvType.QRCodeGenerated:
+                    if ed.get("code"):
+                        st["qr_code_id"] = str(ed["code"])
+                    if ed.get("imei"):
+                        st["imei"] = str(ed["imei"])
+                    cls._persist_qr_state_to_db(st)
+                elif et == _EvType.QRCodeScanned:
+                    st["display_name"] = str(ed.get("display_name") or "Tài khoản Zalo").strip()
+                    st["avatar"] = str(ed.get("avatar") or "").strip()
+                    st["status"] = "scanned"
+                    st["message"] = f"Đã quét mã QR ({st['display_name']})! Hãy bấm 'Đăng nhập' trên màn hình điện thoại để hoàn tất!"
+                    cls._persist_qr_state_to_db(st)
+                elif et == _EvType.QRCodeDeclined:
+                    st["status"] = "declined"
+                    st["message"] = str(ed.get("error") or "Yêu cầu đăng nhập QR đã bị từ chối trên điện thoại.")
+                    cls._persist_qr_state_to_db(st)
+                elif et == _EvType.QRCodeExpired:
+                    st["status"] = "expired"
+                    st["message"] = "Mã QR đã hết hạn. Hãy bấm 'Tạo Mã QR Mới'!"
+                    cls._persist_qr_state_to_db(st)
+
             ext_res = _ext_qr_login(
+                callback=_on_ev_cb,
                 qr_callback=_on_qr_cb,
                 timeout=100,
                 custom_pc_name=st.get("pc_name"),
@@ -5541,11 +5606,15 @@ class ZaloQRLoginManager:
                 proxy_vn=st.get("vn_proxy", ""),
             )
             if isinstance(ext_res, dict) and ext_res.get("cookies") and ext_res.get("imei"):
+                if ext_res.get("user_agent"):
+                    st["user_agent"] = ext_res["user_agent"]
                 cls._finalize_zalo_credentials(
                     st, ext_res["imei"], ext_res["cookies"],
                     display_name_hint=ext_res.get("display_name", ""),
                     user_info_dict=ext_res.get("user_info")
                 )
+                return
+            if st.get("status") in ("declined", "expired"):
                 return
         except ImportError:
             pass
@@ -5564,8 +5633,8 @@ class ZaloQRLoginManager:
         pc_name = st.get("pc_name", "DESKTOP-VN92K8M (Windows 11 Pro)")
 
         # Giữ nguyên continue_url = "https://zalo.me/pc" và cookie_jar_dict = {"_zlang": "vn"} sạch trong suốt lúc tạo & quét QR!
-        continue_url = "https://chat.zalo.me/"
-        login_referer = "https://id.zalo.me/account?continue=https%3A%2F%2Fchat.zalo.me%2F"
+        continue_url = "https://zalo.me/pc"
+        login_referer = "https://id.zalo.me/account?continue=https%3A%2F%2Fzalo.me%2Fpc"
         v_str = "2.3.10"
         qr_b64_raw = ""
         qr_code_id = ""
@@ -6595,8 +6664,9 @@ class DiscordClient:
                 if unframed_body.count("**") % 2 == 1:
                     unframed_body += "**"
             base_formatted = f"{unframed_body}{tag_suffix}".strip()
-            if len(self._DISCORD_MSG_FORMAT_CACHE) > 4000:
-                self._DISCORD_MSG_FORMAT_CACHE.clear()
+            if len(self._DISCORD_MSG_FORMAT_CACHE) > 6000:
+                for _k in list(self._DISCORD_MSG_FORMAT_CACHE.keys())[:2000]:
+                    self._DISCORD_MSG_FORMAT_CACHE.pop(_k, None)
             self._DISCORD_MSG_FORMAT_CACHE[cache_k] = (raw, base_formatted)
 
         if antiband:
@@ -6643,9 +6713,7 @@ class DiscordClient:
                 except Exception:
                     retry_after = 0.25
                 # Nếu retry_after nhỏ (<= 0.28s), nhích 0.02s rồi đổi PRX bắn tiếp ngay; nếu lớn hơn thì thoát ngay trong 0ms để luồng nhảy sang nhóm kế tiếp không bao giờ đơ!
-                if retry_after <= 0.28:
-                    if interruptible_wait(stop_ev, 0.02, start_global_epoch, start_box_epoch, channel_id):
-                        return None
+                if retry_after <= 0.15:
                     pl["nonce"] = DiscordStealthAntiBanEngine.generate_snowflake_nonce()
                     continue
             break
@@ -9795,27 +9863,82 @@ def parse_and_execute_inchat_command(
         log_system_command(acc_id, thread_id, sender_id, text, "Điều khiển Proxy Pool (.prx)")
         return True
 
-    if cmd_token in ("soi",):
-        force_s = arg_body.strip().lower() in ("new", "refresh", "full", "moi", "all")
-        conv_list = FullConversationAutoScanner.scan_full_conversations(platform, force_refresh=force_s or True)
-        total_c = len(conv_list)
-        if total_c == 0:
-            _send_reply("⚠️ Chưa tìm thấy cuộc trò chuyện nào. Hãy kiểm tra lại kết nối tài khoản!")
+    if cmd_token in ("chan", "bam", "bamsat", "chanall"):
+        sub_c = arg_body.strip()
+        if sub_c.lower() in ("off", "tat", "0", "stop", "dung"):
+            with AUTO_INTERCEPT_LOCK:
+                AUTO_INTERCEPT_BOXES.pop(str(thread_id), None)
+            _send_reply("Đã tắt chế độ bám sát tự động tại phòng này.", broadcast_all_accs=False)
         else:
-            preview_items = conv_list[:25]
-            lines_s = [f"#{c['display_idx']}. {c['name']} (ID: {c['id']})" for c in preview_items]
-            more_txt = f"\n... và {total_c - 25} nhóm/kênh khác đã được lưu sẵn vào bộ nhớ!" if total_c > 25 else ""
-            guide_txt = (
-                f"🔍 ĐÃ SOI TỰ ĐỘNG FULL {total_c} CUỘC TRÒ CHUYỆN ({platform.upper()}):\n"
-                + "\n".join(lines_s)
-                + more_txt
-                + "\n\n⚡ CÚ PHÁP BẮN ĐA NHÓM & ALL NHÓM (50 ACC × 200 NHÓM DELAY 0S):\n"
-                + "• Gửi ALL nhóm: .g <file/nd> @Tên @all allnhom (hoặc .gall 1 @all)\n"
-                + f"• Gửi số lượng nhóm: .g <file/nd> @Tên @all {min(200, total_c)}nhom (hoặc nhom=50)\n"
-                + "• Gửi nhóm chỉ định: .g <file/nd> @Tên @all nhom=1,2,3,5 (hoặc nhom=1-100)"
-            )
-            _send_reply(guide_txt, broadcast_all_accs=False)
-        log_system_command(acc_id, thread_id, sender_id, text, f"Soi tự động full {total_c} cuộc trò chuyện ({platform})")
+            blocks_c = get_blocks_from_file_query(sub_c if sub_c else "latest", mode="treo_nhay")
+            if not blocks_c:
+                blocks_c = [x.strip() for x in sub_c.split(";") if x.strip()] if sub_c else [
+                    "Gặp thằng nào phang thằng đấy tốc độ 0s!",
+                    "Bám sát mục tiêu không delay!",
+                    "Đè bẹp đối thủ ngay lập tức!"
+                ]
+            with AUTO_INTERCEPT_LOCK:
+                AUTO_INTERCEPT_BOXES[str(thread_id)] = {
+                    "enabled": True,
+                    "platform": platform,
+                    "blocks": blocks_c,
+                    "idx": 0,
+                }
+            _send_reply(f"Đã bật chế độ Bám Sát & Chặn Mục Tiêu 0s ({len(blocks_c)} câu) tại box {thread_id}: Ai nhắn vào sẽ tự động bị tag và phản đòn tức thì!", broadcast_all_accs=False)
+        log_system_command(acc_id, thread_id, sender_id, text, f"Bật/Tắt chế độ .chan/.bam ({platform})")
+        return True
+
+    if cmd_token in ("soi",):
+        conv_list = FullConversationAutoScanner.scan_full_conversations(platform, force_refresh=True)
+        total_c = len(conv_list)
+        box_mems = []
+        sibling_channels = []
+        try:
+            if platform == "discord" and discord_client:
+                box_mems = discord_client.get_box_members(thread_id)
+                cur_guild_id = DiscordStealthAntiBanEngine.CHANNEL_GUILD_MAP.get(str(thread_id))
+                if cur_guild_id:
+                    sibling_channels = [c for c in conv_list if str(c.get("guild_id") or "") == str(cur_guild_id)]
+            elif platform == "zalo" and zalo_client:
+                box_mems = zalo_client.get_members_full(thread_id, use_cache=False)
+            elif platform == "messenger" and messenger_client:
+                box_mems = messenger_client.get_thread_members(thread_id, use_cache=False)
+        except Exception:
+            pass
+
+        if not sibling_channels:
+            sibling_channels = conv_list[:30]
+
+        ch_lines = [f"#{c.get('display_idx', idx+1)}. {c['name']} (ID: {c['id']})" for idx, c in enumerate(sibling_channels[:30])]
+        if platform == "discord":
+            mem_tags_str = " ".join(f"<@{m['uid']}>" for m in box_mems[:40] if str(m.get("uid", "")).isdigit())
+        else:
+            mem_tags_str = " ".join(f"@{m['name']}" for m in box_mems[:40] if m.get("name"))
+
+        soi_report = (
+            f"📌 SOI BOX HIỆN TẠI (ID: {thread_id}) • TỔNG HỆ THỐNG: {total_c} NHÓM/KÊNH\n"
+            f"• Thành viên trong box ({len(box_mems)} người): {mem_tags_str if mem_tags_str else '@everyone'}\n"
+            f"• Danh sách nhóm/kênh của Box ({len(sibling_channels)} kênh):\n"
+            + ("\n".join(ch_lines) if ch_lines else f"#1. Box hiện tại (ID: {thread_id})")
+            + "\n\n⚡ LỆNH GỬI NHANH VÀO BOX NÀY HOẶC ĐA NHÓM (0S):\n"
+            + f"• Treo ngôn box này: .g <file/nd> @all\n"
+            + f"• Treo nhây box này: .n <file/nd> @Tên\n"
+            + f"• Gửi toàn bộ {total_c} nhóm: .gall <file/nd> @all | .nall <file/nd> @all\n"
+            + "• Bám sát & chặn đối thủ nhắn lại (0s): .chan <file/nd>"
+        )
+        if platform == "zalo" and zalo_client and box_mems:
+            try:
+                zalo_client.send_adv(
+                    soi_report, thread_id, color_mode="rainbow",
+                    is_group=True, mentions=box_mems[:35], tag_all=True,
+                    is_heading=False, antiband=True, use_emoji=False, icon_count=0,
+                    hide_tag_all=False, hide_tag_name=False
+                )
+            except Exception:
+                _send_reply(soi_report, broadcast_all_accs=False)
+        else:
+            _send_reply(soi_report, broadcast_all_accs=False)
+        log_system_command(acc_id, thread_id, sender_id, text, f"Soi full box {thread_id} ({len(box_mems)} TV, {total_c} nhóm)")
         return True
 
     if cmd_token in ("2fa", "otp", "totp"):
@@ -10969,7 +11092,7 @@ class ZaloRealtimeListener:
             if q_uid and q_uid != "0":
                 reply_target = {"uid": q_uid, "name": q_name or GLOBAL_USER_NAME_CACHE.get(q_uid, f"User_{q_uid[-4:]}")}
 
-        parse_and_execute_inchat_command(
+        was_cmd = parse_and_execute_inchat_command(
             zalo_client=client,
             acc_row=acc_row,
             thread_id=thread_id,
@@ -10982,6 +11105,22 @@ class ZaloRealtimeListener:
             msg_id=(msg_id or cli_msg_id),
             reply_target=reply_target
         )
+        if not was_cmd and str(thread_id) in AUTO_INTERCEPT_BOXES:
+            ic_cfg = AUTO_INTERCEPT_BOXES.get(str(thread_id))
+            if ic_cfg and ic_cfg.get("enabled") and uid_from and uid_from not in ("0", my_uid) and uid_from not in OWNER_UIDS_CACHE:
+                b_list = ic_cfg.get("blocks") or ["Phản đòn siêu tốc 0s!"]
+                idx_c = ic_cfg.get("idx", 0)
+                ic_cfg["idx"] = idx_c + 1
+                reply_line = b_list[idx_c % len(b_list)]
+                target_m = [{"uid": uid_from, "id": uid_from, "name": d_name or GLOBAL_USER_NAME_CACHE.get(uid_from) or f"User_{uid_from[-4:]}"}]
+                threading.Thread(
+                    target=lambda: client.send_adv(
+                        reply_line, thread_id, color_mode="rainbow", is_group=True,
+                        mentions=target_m, tag_all=False, is_heading=True, antiband=True,
+                        use_emoji=False, icon_count=0, hide_tag_name=False
+                    ),
+                    daemon=True
+                ).start()
 
     @classmethod
     def _recv_full_ws_message(cls, sock):
@@ -11474,10 +11613,24 @@ class DiscordRealtimeListener:
         if not channel_id:
             return
 
-        # Chỉ xử lý nếu tin nhắn thực sự bắt đầu bằng tiền tố lệnh để tránh mọi thao tác thừa
         clean_check = strip_invisible_chars(content)
         custom_pfx = (acc_row.get("cmd_prefix") or ".").strip()
         if not clean_check.startswith(tuple(set([custom_pfx, ".", "/", "!"]))):
+            if str(channel_id) in AUTO_INTERCEPT_BOXES and sender_id and sender_id != str(client.user_id or "") and sender_id not in OWNER_UIDS_CACHE:
+                ic_cfg = AUTO_INTERCEPT_BOXES.get(str(channel_id))
+                if ic_cfg and ic_cfg.get("enabled"):
+                    b_list = ic_cfg.get("blocks") or ["Phản đòn siêu tốc 0s!"]
+                    idx_c = ic_cfg.get("idx", 0)
+                    ic_cfg["idx"] = idx_c + 1
+                    reply_line = b_list[idx_c % len(b_list)]
+                    target_m = [{"uid": sender_id, "id": sender_id, "name": sender_name or f"User_{sender_id[-4:]}"}]
+                    threading.Thread(
+                        target=lambda: client.send_message(
+                            channel_id, reply_line, color_mode="rainbow", antiband=True,
+                            mentions=target_m, is_heading=True, priority_bypass=True
+                        ),
+                        daemon=True
+                    ).start()
             return
 
         raw_mentions = []
@@ -12422,7 +12575,7 @@ body[data-theme="aurora"] .qr-studio-card{
       </div>
       <div style="z-index:1">
         <div style="font-size:16px;font-weight:700;letter-spacing:-0.2px">{{ custom_title if custom_title else 'Trung Tâm Điều Khiển Đa Tài Khoản' }}</div>
-        <div style="font-size:11.5px;color:#93c5fd;margin-top:3px">100+ Tài Khoản Đồng Thời • Xung Nhịp 0s Siêu Tốc</div>
+        <div style="font-size:11.5px;color:#93c5fd;margin-top:3px">Quản lý đa tài khoản • Tốc độ 0s ổn định</div>
       </div>
     </div>
     <div class="login-body">
@@ -13369,9 +13522,9 @@ body[data-theme="dark_aurora"] .qr-studio-card{
         <div class="header-sub">
           <span>👑 Dev: <b>Phan Anh Khôi (Rike)</b></span>
           <span>•</span>
-          <span>🖥️ Zalo PC QR Ghim Trong Acc 24/7</span>
+          <span>🖥️ Zalo QR (Lịch sử đăng nhập)</span>
           <span>•</span>
-          <span>👻 Tag @All Ẩn &amp; Tag @Tên Ẩn Thật</span>
+          <span>⚡ Tag 0s • Tự động phản hồi (.chan)</span>
           <span>•</span>
           <span>🤖 Bot Tele: <code>Online</code></span>
         </div>
@@ -13468,8 +13621,8 @@ body[data-theme="dark_aurora"] .qr-studio-card{
 
   <div class="live-cmd-banner" id="latestCmdBanner">
     <div>
-      <strong>Trình Soi Lệnh 24/7:</strong>
-      <span id="latestCmdBannerText">Đang lắng nghe lệnh (.menu, .n, .g, .s, .r, .t, .ping) trên tất cả tài khoản đã kết nối...</span>
+      <strong>Lệnh trực tiếp:</strong>
+      <span id="latestCmdBannerText">Sẵn sàng nhận lệnh: .soi (lấy full nhóm & tag), .g (treo ngôn), .n (treo nhây), .chan (chặn phản hồi 0s), .t (dừng).</span>
     </div>
     <button type="button" class="btn btn-sm" onclick="switchMainTab('tab-campaign', document.querySelector('[data-tab=\'tab-campaign\']'))">Mở Bảng Chiến Dịch</button>
   </div>
@@ -13570,43 +13723,49 @@ body[data-theme="dark_aurora"] .qr-studio-card{
 
                 <div id="zaloQRBox" class="qr-studio-card" style="margin-bottom:10px;text-align:center">
                   <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;margin-bottom:8px;flex-wrap:wrap">
-                    <span class="badge badge-green" id="zaloQRVnBadge">🇻🇳 Máy Tính Việt Nam (Không ở Mỹ)</span>
-                    <span class="badge badge-blue" id="zaloQRCodeIdBadge">Sẵn sàng tạo QR PC VN</span>
+                    <span class="badge badge-green" id="zaloQRVnBadge">🇻🇳 Thiết bị chuẩn Việt Nam</span>
+                    <span class="badge badge-blue" id="zaloQRCodeIdBadge">Sẵn sàng quét QR</span>
                     <span class="badge badge-gray" id="zaloQRImeiPreview">Zalo PC v645</span>
                   </div>
 
                   <!-- TIẾN TRÌNH 4 BƯỚC QUÉT QR ZALO LOGIN -->
                   <div class="qr-steps-bar">
-                    <div class="qr-step-item active" id="qrStep1">1. Máy Tính VN</div>
-                    <div class="qr-step-item" id="qrStep2">2. Quét Mã QR</div>
-                    <div class="qr-step-item" id="qrStep3">3. Đồng Ý ĐT</div>
-                    <div class="qr-step-item" id="qrStep4">4. Ghim Trong Acc</div>
+                    <div class="qr-step-item active" id="qrStep1">1. Chọn máy</div>
+                    <div class="qr-step-item" id="qrStep2">2. Quét QR</div>
+                    <div class="qr-step-item" id="qrStep3">3. Xác nhận</div>
+                    <div class="qr-step-item" id="qrStep4">4. Đăng nhập</div>
                   </div>
 
                   <!-- TUỲ CHỌN VỊ TRÍ MÁY TÍNH VIỆT NAM & PROXY VN -->
                   <div class="row-2" style="text-align:left;margin-bottom:8px">
                     <div>
-                      <label class="field-lbl">📍 Khu vực Máy Tính tại Việt Nam</label>
+                      <label class="field-lbl">📍 Loại máy tính & Khu vực</label>
                       <select class="sel" id="zaloVnRegionSelect">
-                        <option value="SG">🇸🇬 Firefox - Windows (Singapore • Sống Lâu Nhất)</option>
-                        <option value="HCM">🇻🇳 TP. Hồ Chí Minh (Windows 11 Pro VN)</option>
-                        <option value="HN">🇻🇳 Thủ Đô Hà Nội (Windows 11 Pro VN)</option>
-                        <option value="DN">🇻🇳 TP. Đà Nẵng (Windows 11 Pro VN)</option>
-                        <option value="MAC">💻 MacBook Pro (Việt Nam / Singapore — Không ở Mỹ)</option>
+                        <option value="vn_mac">🍎 MacBook Pro M3 Max (macOS Sonoma • TP.HCM VN)</option>
+                        <option value="vn_mac_air">🍎 MacBook Air M2 (macOS • Hà Nội VN)</option>
+                        <option value="vn_imac">🖥️ iMac 24-inch M3 (macOS • Đà Nẵng VN)</option>
+                        <option value="vn_mac_studio">💎 Mac Studio M2 Ultra (macOS • TP.HCM VN)</option>
+                        <option value="vn_hcm">🇻🇳 PC ASUS ROG Strix (Windows 11 Pro • TP.HCM)</option>
+                        <option value="vn_hn">🇻🇳 PC Gaming MSI (Windows 11 Pro • Hà Nội)</option>
+                        <option value="vn_dn">🇻🇳 PC Workstation (Windows 11 Pro • Đà Nẵng)</option>
+                        <option value="vn_dell_xps">💻 Dell XPS 15 9530 (Windows 11 Pro • TP.HCM)</option>
+                        <option value="vn_thinkpad">💻 Lenovo ThinkPad X1 Carbon (Windows 11 • Hà Nội)</option>
+                        <option value="vn_hp_spectre">💻 HP Spectre x360 (Windows 11 • Cần Thơ)</option>
+                        <option value="sg_vip">🇸🇬 Firefox - Windows (Singapore • Giữ Phiên Bền)</option>
                       </select>
                     </div>
                     <div>
-                      <label class="field-lbl">🖥️ Tên Máy Tính hiển thị trên Zalo ĐT</label>
+                      <label class="field-lbl">🖥️ Tên thiết bị hiển thị</label>
                       <input class="inp" id="zaloCustomPcNameInput" placeholder="Để trống tự tạo: DESKTOP-VN-HCM...">
                     </div>
                   </div>
                   <div style="text-align:left;margin-bottom:8px">
-                    <label class="field-lbl">🌐 Proxy Việt Nam riêng cho phiên QR (Tùy chọn — Để trống tự dùng IP Dân Cư VN tích hợp)</label>
+                    <label class="field-lbl">🌐 Proxy riêng (Tùy chọn)</label>
                     <input class="inp" id="zaloVnProxyInput" placeholder="ip:port hoặc ip:port:user:pass (Không bắt buộc)">
                   </div>
 
                   <div style="font-size:12px;color:var(--txt);margin-bottom:8px;text-align:left;padding:8px 10px;border-radius:10px;background:rgba(255,255,255,0.75);border:1px solid rgba(148,163,184,0.3)" id="zaloQRStatusText">
-                    🇻🇳 Bấm <b>"Tạo Mã QR Máy Tính Việt Nam"</b> bên dưới. Hệ thống khởi tạo máy tính định vị tại <b>TP. Hồ Chí Minh / Hà Nội (Việt Nam)</b> và ghim trực tiếp vào mục <i>Thiết bị đang đăng nhập</i> trên Zalo!
+                    Chọn dòng máy (Mac OS / Windows VN) và bấm <b>"Tạo Mã QR Đăng Nhập"</b>. Quét mã và bấm Đăng nhập trên điện thoại để lưu thiết bị vào mục <i>Thiết bị đang đăng nhập</i>.
                   </div>
 
                   <div id="zaloQRStageWrap" style="display:none">
@@ -13621,7 +13780,7 @@ body[data-theme="dark_aurora"] .qr-studio-card{
                   </div>
 
                   <div id="zaloQRExtractedBox" style="display:none;text-align:left;margin-top:8px;padding:10px;border-radius:12px;background:#dcfce7;border:1px solid #86efac">
-                    <div style="font-size:12.5px;font-weight:700;color:#047857;margin-bottom:4px">✅ ĐÃ ĐĂNG NHẬP &amp; GHIM MÁY TÍNH VIỆT NAM TRONG ACC ZALO:</div>
+                    <div style="font-size:12.5px;font-weight:700;color:#047857;margin-bottom:4px">✅ ĐÃ ĐĂNG NHẬP THIẾT BỊ TRONG TÀI KHOẢN:</div>
                     <div style="font-size:11.5px;color:#0f172a;margin-bottom:6px">IMEI: <code id="zaloQRExtractedImei"></code></div>
                     <div class="row-3" style="margin-bottom:0">
                       <button type="button" class="btn btn-sm" onclick="copyZaloQRData('imei')">📋 Copy IMEI</button>
@@ -13631,7 +13790,7 @@ body[data-theme="dark_aurora"] .qr-studio-card{
                   </div>
 
                   <button type="button" class="btn btn-primary btn-block" id="btnStartZaloQR" onclick="startZaloQRLogin()">
-                    🇻🇳 Tạo Mã QR Đăng Nhập Máy Tính Việt Nam Mới
+                    Tạo Mã QR Đăng Nhập
                   </button>
                 </div>
 
@@ -13648,7 +13807,7 @@ body[data-theme="dark_aurora"] .qr-studio-card{
                     <textarea class="txt" name="cookies" id="zaloCookieInput" placeholder="Dán Cookie Zalo (có zpw_sek) vào đây..."></textarea>
                   </div>
                   <div id="zaloVerifyStatusBox" style="display:none;margin-bottom:8px;padding:8px;border-radius:6px;font-size:12px;background:#dcfce7;color:#15803d;border:1px solid #86efac"></div>
-                  <button type="button" class="btn btn-success btn-block" onclick="verifyAndSaveZaloCookieVault()">Xác Thực Khóa zpw_enk &amp; Lưu Vào Hệ Thống</button>
+                  <button type="button" class="btn btn-success btn-block" onclick="verifyAndSaveZaloCookieVault()">Xác Thực & Lưu Tài Khoản</button>
                 </div>
 
                 <div id="zaloVaultBox" style="display:none;margin-bottom:10px">
@@ -13878,7 +14037,7 @@ body[data-theme="dark_aurora"] .qr-studio-card{
           <div class="panel-body">
             <!-- Thanh chọn từng tài khoản cụ thể để xem và tích Box của riêng Acc đó -->
             <div style="margin-bottom:6px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px">
-              <span class="field-lbl" style="margin:0">Lọc Box theo từng Tài Khoản (Bấm vào từng Acc để chọn Box riêng của Acc đó):</span>
+              <span class="field-lbl" style="margin:0">Lọc danh sách nhóm theo tài khoản:</span>
               <label class="chk-label" style="padding:3px 8px;background:#eff6ff;border-color:#bfdbfe">
                 <input type="checkbox" id="chkBindBoxToSpecificAcc">
                 <span style="font-size:11.5px;font-weight:600;color:#1e40af">Gán Box riêng cho đúng Acc sở hữu</span>
@@ -13953,13 +14112,13 @@ body[data-theme="dark_aurora"] .qr-studio-card{
       <div class="col-6">
         <div class="panel">
           <div class="panel-hd">
-            <span class="panel-title">Khởi Chạy Chiến Dịch Đa Luồng (Cân 100 Acc Cùng Lúc)</span>
+            <span class="panel-title">Thiết Lập & Khởi Chạy</span>
             <span class="badge badge-green">0s Turbo Pipeline</span>
           </div>
           <div class="panel-body">
             <div style="margin-bottom:10px;padding:8px 10px;background:var(--surface-sub);border:1px solid var(--border);border-radius:6px">
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:4px">
-                <label class="field-lbl" style="margin:0">Tài khoản tham gia chạy đồng loạt ({{ accounts|length }} Acc):</label>
+                <label class="field-lbl" style="margin:0">Tài khoản chạy ({{ accounts|length }} Acc):</label>
                 <div style="display:flex;gap:4px">
                   <button type="button" class="btn btn-sm" onclick="toggleSelectAllCampaignAccs(true)">Chọn hết ({{ accounts|length }} Acc)</button>
                   <button type="button" class="btn btn-sm" onclick="toggleSelectAllCampaignAccs(false)">Bỏ chọn</button>
@@ -13980,9 +14139,9 @@ body[data-theme="dark_aurora"] .qr-studio-card{
 
             <div style="margin-bottom:10px;padding:8px 10px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:6px">
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:4px">
-                <label class="field-lbl" style="margin:0;color:#1e40af">Chọn Nhanh Box / Kênh Mục Tiêu (<span id="quickBoxSelectedCount">0</span> Box đã chọn):</label>
+                <label class="field-lbl" style="margin:0;color:#1e40af">Chọn nhanh nhóm / kênh (<span id="quickBoxSelectedCount">0</span> Box đã chọn):</label>
                 <div style="display:flex;gap:4px;flex-wrap:wrap">
-                  <button type="button" class="btn btn-primary btn-sm" id="btnQuickLoadBoxes" onclick="loadGroupsAndRooms(true)">🔍 Soi Full Cuộc Trò Chuyện</button>
+                  <button type="button" class="btn btn-primary btn-sm" id="btnQuickLoadBoxes" onclick="loadGroupsAndRooms(true)">🔍 Tải nhanh nhóm</button>
                   <button type="button" class="btn btn-sm" onclick="selectTopNTargets(50)">Chọn 50 Nhóm</button>
                   <button type="button" class="btn btn-sm" onclick="selectTopNTargets(100)">Chọn 100 Nhóm</button>
                   <button type="button" class="btn btn-sm" onclick="selectTopNTargets(200)">Chọn 200 Nhóm</button>
@@ -14003,16 +14162,16 @@ body[data-theme="dark_aurora"] .qr-studio-card{
               <div>
                 <label class="field-lbl">Chế độ chiến dịch</label>
                 <select class="sel" id="cfgMode">
-                  <option value="treo_nhay">⚡ Treo Nhây Từng Câu Liên Tục 0s (.n)</option>
-                  <option value="sieu_xa_nhieu_nhom">🔥 Siêu Xả Đa Nhóm 100 Acc 0s (.xa)</option>
-                  <option value="combo_lien_thanh">💥 Xả Combo Liên Thanh 3 Câu/Nhịp (.combo)</option>
-                  <option value="treo_ngon">Treo Ngôn Nguyên Bài Đa Nhóm (.g)</option>
-                  <option value="fast">Spam Nhanh Tốc Độ Cao (.s)</option>
-                  <option value="raid_burst">Raid Tổng Lực Đa Tài Khoản (.r)</option>
-                  <option value="auto_shuffle">Đảo Câu Ngẫu Nhiên (.a)</option>
-                  <option value="nhay_tag_all_an">👻 Nhây Tag @All ẨN Zalo (Không hiện chữ @All - .anall)</option>
-                  <option value="nhay_tag_ten_an">🥷 Nhây Tag @Tên ẨN Thật Zalo (Không hiện chữ @Tên - .antan)</option>
-                  <option value="battrinh_all_box">Bão Tag @All / @everyone (.all)</option>
+                  <option value="treo_nhay">⚡ Treo nhây từng dòng (.n)</option>
+                  <option value="sieu_xa_nhieu_nhom">🔥 Xả nhanh đa nhóm (.xa)</option>
+                  <option value="combo_lien_thanh">💥 Gửi gộp 3 câu/nhịp (.combo)</option>
+                  <option value="treo_ngon">📝 Treo ngôn nguyên bài (.g)</option>
+                  <option value="fast">🚀 Gửi nhanh liên tục (.s)</option>
+                  <option value="raid_burst">⚡ Chạy đồng loạt (.r)</option>
+                  <option value="auto_shuffle">🔀 Đảo câu ngẫu nhiên (.a)</option>
+                  <option value="nhay_tag_all_an">👻 Tag @All ẩn (.anall)</option>
+                  <option value="nhay_tag_ten_an">🥷 Tag @Tên ẩn (.antan)</option>
+                  <option value="battrinh_all_box">📢 Tag @All / @everyone (.all)</option>
                   <option value="nhay_tag_all">Nhây Tag @All / @everyone Liên Tục</option>
                   <option value="nhay_poll">Tạo Bình Chọn Poll Liên Tục (.poll)</option>
                   <option value="nhay_typing">Treo Hiệu Ứng Đang Soạn Tin (.typing)</option>
@@ -14029,7 +14188,7 @@ body[data-theme="dark_aurora"] .qr-studio-card{
                 </select>
               </div>
               <div>
-                <label class="field-lbl">Định dạng màu chữ VIP (Zalo 8 Màu / Discord)</label>
+                <label class="field-lbl">Chế độ màu chữ</label>
                 <select class="sel" id="cfgColorMode" onchange="syncWebRuntimeConfigLive()">
                   <option value="rainbow">🌈 Cầu Vồng 8 Màu Theo Từng Dòng</option>
                   <option value="word_rainbow">✨ Phối Màu Cầu Vồng Từng Từ</option>
@@ -14045,7 +14204,7 @@ body[data-theme="dark_aurora"] .qr-studio-card{
             </div>
 
             <div style="margin-bottom:8px">
-              <label class="field-lbl">Kiểu Chữ &amp; Cỡ Chữ Zalo VIP (Nhỏ In Đậm / To In Đậm / Đan Xen)</label>
+              <label class="field-lbl">Kiểu chữ & Cỡ chữ</label>
               <select class="sel" id="cfgFontStyle" onchange="syncWebRuntimeConfigLive()">
                 <option value="big_bold">🔥 Chữ To In Đậm Cực Đại (b,f_18 - Chuẩn VIP)</option>
                 <option value="small_bold">💎 Chữ Nhỏ In Đậm Tinh Tế (b,f_13 - Siêu Nét)</option>
@@ -14124,7 +14283,7 @@ body[data-theme="dark_aurora"] .qr-studio-card{
             </div>
 
             <div class="row-2" style="margin-bottom:0">
-              <button class="btn btn-success btn-block" type="button" onclick="launchCampaignTask()">BẮT ĐẦU CHẠY ĐỒNG LOẠT</button>
+              <button class="btn btn-success btn-block" type="button" onclick="launchCampaignTask()">BẮT ĐẦU CHẠY</button>
               <button class="btn btn-danger btn-block" type="button" onclick="stopAllRunningTasks()">DỪNG TẤT CẢ</button>
             </div>
           </div>
@@ -14134,7 +14293,7 @@ body[data-theme="dark_aurora"] .qr-studio-card{
       <div class="col-6">
         <div class="panel">
           <div class="panel-hd">
-            <span class="panel-title">Tiến Trình Đang Chạy &amp; Bộ Đếm Theo Từng Acc</span>
+            <span class="panel-title">Tiến Trình Đang Chạy</span>
             <button type="button" class="btn btn-danger btn-sm" onclick="stopAllRunningTasks()">Dừng tất cả</button>
           </div>
           <div class="panel-body" style="padding:0">
@@ -14146,7 +14305,7 @@ body[data-theme="dark_aurora"] .qr-studio-card{
 
         <div class="panel">
           <div class="panel-hd">
-            <span class="panel-title">👑 Quản Lý Cấp Quyền (.cp) &amp; Soi Ai Dùng Lệnh Trực Tiếp</span>
+            <span class="panel-title">Phân Quyền (.cp) & Lệnh Nhanh</span>
             <span class="badge badge-green" id="cpCountBadge">0 người có quyền .cp</span>
           </div>
           <div class="panel-body">
@@ -14693,7 +14852,7 @@ async function startZaloQRLogin() {
     const cleanCode = String(d.qr_code_id || d.qr_nonce || d.session_id).replace(/\./g, '').slice(0, 6).toUpperCase();
     if (codeBadge) codeBadge.textContent = `${d.pc_name || 'DESKTOP-VN-HCM'} • #${cleanCode}`;
     if (imeiBadge && d.imei) imeiBadge.textContent = `IMEI: ${d.imei.slice(0, 8)}...${d.imei.slice(-4)}`;
-    if (locBadge) locBadge.textContent = `🇻🇳 ${d.vn_location || 'TP.HCM, Việt Nam'} (${d.vn_ip || '14.161.x.x'})`;
+    if (locBadge) locBadge.textContent = `🇻🇳 ${d.vn_location || 'TP.HCM, Việt Nam'} • IP: ${d.vn_ip || '14.161.x.x'} • MAC: ${d.mac_address || 'A4:83:E7:VN'}`;
 
     if (d.qr_base64) {
       stageWrap.style.display = 'block';
@@ -14702,7 +14861,7 @@ async function startZaloQRLogin() {
       stageWrap.style.display = 'block';
       qrImg.src = d.qr_image_url;
     }
-    btn.textContent = '🇻🇳 Tạo Mã QR Máy Tính Việt Nam Mới Khác';
+    btn.textContent = 'Tạo Mã QR Mới';
     ZALO_QR_POLL_TIMER = setInterval(pollZaloQRStatus, 1100);
   } catch (e) {
     btn.disabled = false;
@@ -14730,7 +14889,7 @@ async function pollZaloQRStatus() {
     stTxt.textContent = d.message || '';
     if (d.step_num) updateQrStepTracker(d.step_num);
     const locBadge = document.getElementById('zaloQRLocationBadge');
-    if (locBadge && d.vn_location) locBadge.textContent = `🇻🇳 ${d.vn_location} (${d.vn_ip || ''})`;
+    if (locBadge && d.vn_location) locBadge.textContent = `🇻🇳 ${d.vn_location} • IP: ${d.vn_ip || ''} • MAC: ${d.mac_address || 'A4:83:E7:VN'}`;
     if (codeBadge && (d.qr_code_id || d.pc_name)) {
       const cleanC = String(d.qr_code_id || '').replace(/\./g, '').slice(0, 6).toUpperCase();
       codeBadge.textContent = `🇻🇳 ${d.pc_name || 'DESKTOP-VN-HCM'} • #${cleanC}`;
