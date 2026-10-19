@@ -16337,7 +16337,6 @@ def route_task_start():
             trigger_cmd=f"Web UI ({mode})",
             hide_tag_all=bool(data.get("hide_tag_all", True)),
             hide_tag_name=bool(data.get("hide_tag_name", False)) or (mode == "nhay_tag_ten_an"),
-            hide_tag_name=bool(data.get("hide_tag_name", True)),
             font_style=data.get("font_style", "big_bold" if bool(data.get("is_heading", True)) else "normal")
         )
         created_tids.append(tid)
