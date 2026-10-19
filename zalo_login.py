@@ -1,22 +1,32 @@
 """
-zalo_login.py — Module Đăng Nhập QR Máy Tính Zalo Chính Chủ & Giữ Phiên Sống Cố Định Trong Tài Khoản
-Tương thích 100% với:
-1. `from zalo_login import login_qr_with_unique_imei, LoginQRCallbackEventType` (async callback trong Bot Telegram `get ck im zalo.py`)
-2. `from zalo_login import login_qr_with_unique_imei` (sync `qr_callback` trong Web Control Panel `app.py`)
-3. Tự động thực hiện bắt tay `getServerInfo` + `getLoginInfo` (AES-CBC `ZaloParamsEncryptor` v2, `computer_name='Web'`)
-   để ghim cố định thiết bị Máy Tính vào mục "Thiết bị đang đăng nhập" trong tài khoản Zalo ngay sau khi quét QR!
+zalo_login.py — Module Đăng Nhập QR Máy Tính Zalo Chính Chủ & Khóa Phiên Trong Tài Khoản (v26)
+Tác giả: Phan Anh Khôi (Rike)
+Tính năng cốt lõi:
+1. Tạo mã QR Máy Tính Zalo chính chủ từ `id.zalo.me` (`continue=https://zalo.me/pc`).
+2. Sau khi người dùng quét mã QR và bấm "Đồng ý / Đăng nhập" trên điện thoại:
+   - Đi theo từng bước Redirect (`allow_redirects=False`) thu hoạch trọn vẹn Cookie `zpw_sek`.
+   - Khởi tạo phiên Máy Tính (`computer_name="Web"`, `client_version=645`, `type=30`) qua `getServerInfo` và `getLoginInfo` (AES-CBC `ZaloPCParamsEncryptor` v2).
+   - BẮT BUỘC KIỂM TRA XÁC THỰC (`verify_zalo_pc_device_logged_in_account`):
+     + Phải giải mã thành công khóa `zpw_enk` và `uid` thật.
+     + Phải gọi thử nghiệm thành công API nội bộ (`getlg/v4` hoặc `getServerInfo`) chứng minh thiết bị Máy Tính của mã QR đó ĐÃ NẰM TRONG TÀI KHOẢN ZALO của người dùng!
+     + Nếu thiết bị Máy Tính KHÔNG nằm trong tài khoản Zalo (hoặc thiếu `zpw_enk` / `zpw_sek`), TUYỆT ĐỐI KHÔNG TRẢ VỀ Cookie và IMEI ảo/die!
+3. Tự động khởi chạy luồng `ZaloPCSessionKeeper` (WebSocket `wss://ws1.chat.zalo.me` + nhịp tim Keep-Alive 24/7) để giữ chặt máy tính ở trong mục "Thiết bị đang đăng nhập" của tài khoản Zalo, không bao giờ tự chạy đi đâu hay tự thoát!
 """
 
 import os
 import re
+import ssl
 import time
 import uuid
 import json
 import base64
+import socket
+import struct
 import hashlib
 import secrets
 import inspect
 import asyncio
+import threading
 from urllib.parse import urlparse, unquote
 import requests
 from requests.adapters import HTTPAdapter
@@ -133,6 +143,191 @@ class ZaloPCParamsEncryptor:
         return parsed if isinstance(parsed, dict) else None
 
 
+class ZaloPCSessionKeeper:
+    """Bộ Giữ Phiên Máy Tính Zalo Cố Định 24/7 Trong Tài Khoản:
+    - Duy trì kết nối WebSocket (`wss://ws1.chat.zalo.me`) và nhịp tim HTTP `getServerInfo` định kỳ
+      để máy tính của mã QR luôn nằm trong mục 'Thiết bị đang đăng nhập' trên điện thoại Zalo,
+      không bao giờ bị văng hay làm die Cookie/IMEI!"""
+
+    _ACTIVE_KEEPERS = {}
+    _LOCK = threading.RLock()
+
+    @classmethod
+    def start_keeper(cls, uid, imei, cookies_dict, user_agent, zpw_enk="", ws_urls=None):
+        key = str(uid or imei).strip()
+        if not key:
+            return
+        with cls._LOCK:
+            old = cls._ACTIVE_KEEPERS.get(key)
+            if old and old.get("stop_ev"):
+                old["stop_ev"].set()
+            stop_ev = threading.Event()
+            st = {
+                "uid": str(uid or ""),
+                "imei": str(imei),
+                "cookies": dict(cookies_dict or {}),
+                "ua": user_agent,
+                "zpw_enk": str(zpw_enk or ""),
+                "ws_urls": list(ws_urls or ["wss://ws1.chat.zalo.me", "wss://ws2.chat.zalo.me"]),
+                "stop_ev": stop_ev,
+                "started_at": time.time(),
+            }
+            cls._ACTIVE_KEEPERS[key] = st
+            th = threading.Thread(target=cls._keeper_loop, args=(st,), daemon=True)
+            th.start()
+
+    @staticmethod
+    def _send_ws_ping(sock, payload_bytes, opcode=0x2):
+        mask_key = os.urandom(4)
+        length = len(payload_bytes)
+        header = bytearray([0x80 | (opcode & 0x0F)])
+        if length < 126:
+            header.append(0x80 | length)
+        elif length < 65536:
+            header.append(0x80 | 126)
+            header.extend(struct.pack(">H", length))
+        else:
+            header.append(0x80 | 127)
+            header.extend(struct.pack(">Q", length))
+        header.extend(mask_key)
+        masked = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload_bytes))
+        sock.sendall(bytes(header) + masked)
+
+    @classmethod
+    def _keeper_loop(cls, st):
+        stop_ev = st["stop_ev"]
+        imei = st["imei"]
+        ua = st["ua"]
+        cookies = st["cookies"]
+        ws_urls = st["ws_urls"]
+        s = requests.Session()
+        s.cookies.update(cookies)
+        s.headers.update({
+            "User-Agent": ua,
+            "Origin": "https://chat.zalo.me",
+            "Referer": "https://chat.zalo.me/",
+        })
+        ws_idx = 0
+        last_http_hb = 0.0
+
+        while not stop_ev.is_set():
+            now = time.time()
+            if now - last_http_hb >= 120.0:
+                last_http_hb = now
+                try:
+                    srv_sign = hashlib.md5(f"zsecuregetserverinfo645Web{imei}30".encode("utf-8")).hexdigest()
+                    s.get(
+                        "https://wpa.chat.zalo.me/api/login/getServerInfo",
+                        params={"imei": imei, "type": 30, "client_version": 645, "computer_name": "Web", "signkey": srv_sign},
+                        timeout=6,
+                    )
+                except Exception:
+                    pass
+
+            ws_url = ws_urls[ws_idx % len(ws_urls)]
+            ws_idx += 1
+            if "zpw_ver=" not in ws_url:
+                sep = "&" if "?" in ws_url else "?"
+                ws_url = f"{ws_url}{sep}zpw_ver=645&zpw_type=30&t={int(time.time() * 1000)}"
+
+            sock = None
+            try:
+                parsed = urlparse(ws_url)
+                host = parsed.hostname or "ws1.chat.zalo.me"
+                port = parsed.port or 443
+                path = (parsed.path or "/") + (("?" + parsed.query) if parsed.query else "")
+                raw_sock = socket.create_connection((host, port), timeout=10)
+                ctx = ssl.create_default_context()
+                sock = ctx.wrap_socket(raw_sock, server_hostname=host)
+                ws_key = base64.b64encode(os.urandom(16)).decode()
+                ck_str = "; ".join(f"{k}={v}" for k, v in cookies.items() if k and v is not None)
+                hs = (
+                    f"GET {path} HTTP/1.1\r\n"
+                    f"Host: {host}\r\n"
+                    f"Upgrade: websocket\r\n"
+                    f"Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Key: {ws_key}\r\n"
+                    f"Sec-WebSocket-Version: 13\r\n"
+                    f"Origin: https://chat.zalo.me\r\n"
+                    f"User-Agent: {ua}\r\n"
+                    f"Cookie: {ck_str}\r\n\r\n"
+                )
+                sock.sendall(hs.encode("utf-8"))
+                resp_b = sock.recv(1024)
+                if b"101" in resp_b:
+                    sock.settimeout(20.0)
+                    while not stop_ev.is_set():
+                        hb_pkt = struct.pack("<BHB", 1, 2, 1) + json.dumps({"eventId": int(time.time() * 1000)}).encode("utf-8")
+                        cls._send_ws_ping(sock, hb_pkt, opcode=0x2)
+                        if stop_ev.wait(18.0):
+                            break
+                        if time.time() - last_http_hb >= 120.0:
+                            last_http_hb = time.time()
+                            try:
+                                srv_sign = hashlib.md5(f"zsecuregetserverinfo645Web{imei}30".encode("utf-8")).hexdigest()
+                                s.get(
+                                    "https://wpa.chat.zalo.me/api/login/getServerInfo",
+                                    params={"imei": imei, "type": 30, "client_version": 645, "computer_name": "Web", "signkey": srv_sign},
+                                    timeout=6,
+                                )
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+            finally:
+                if sock:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+            stop_ev.wait(5.0)
+
+
+def verify_zalo_pc_device_logged_in_account(imei, cookies_dict, user_agent, zpw_enk=""):
+    """Kiểm tra nghiêm ngặt xem máy tính của mã QR đã thực sự đăng nhập và nằm trong tài khoản Zalo chưa:
+    - Bắt buộc có `zpw_sek` trong Cookie và `zpw_enk` hợp lệ.
+    - Bắt buộc gọi thành công API nhóm (`getlg/v4`) hoặc giải mã được dữ liệu tài khoản bằng khóa `zpw_enk`.
+    - Nếu máy tính không nằm trong tài khoản, trả về `(False, reason)` để hệ thống KHÔNG trả về Cookie/IMEI chết!"""
+    if not imei or not isinstance(cookies_dict, dict):
+        return False, "Thiếu thông tin IMEI hoặc Cookie phiên."
+    if not cookies_dict.get("zpw_sek"):
+        return False, "Máy tính chưa được cấp chứng chỉ phiên zpw_sek trong tài khoản Zalo."
+    if not zpw_enk:
+        return False, "Máy tính chưa kích hoạt được khóa phiên zpw_enk trong tài khoản Zalo."
+
+    try:
+        ck_str = "; ".join(f"{k}={v}" for k, v in cookies_dict.items() if k and v is not None)
+        hdrs = {
+            "User-Agent": user_agent,
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://chat.zalo.me",
+            "Referer": "https://chat.zalo.me/",
+            "Cookie": ck_str,
+        }
+        r = requests.get(
+            "https://tt-group-wpa.chat.zalo.me/api/group/getlg/v4",
+            params={"zpw_ver": 645, "zpw_type": 30},
+            headers=hdrs,
+            timeout=8,
+        )
+        rj = r.json() if r.content else {}
+        if rj.get("error_code") == 0 and rj.get("data"):
+            key_b = base64.b64decode(zpw_enk)
+            cipher = AES.new(key_b, AES.MODE_CBC, bytes(16))
+            raw = base64.b64decode(unquote(rj["data"]) if "%" in rj["data"] else rj["data"])
+            dec = cipher.decrypt(raw)
+            pad_len = dec[-1]
+            if 1 <= pad_len <= 16:
+                dec = dec[:-pad_len]
+            parsed = json.loads(dec.decode("utf-8", errors="ignore"))
+            if isinstance(parsed, dict):
+                return True, "Thiết bị máy tính đã nằm cố định trong tài khoản Zalo!"
+    except Exception as e:
+        return False, f"Không xác thực được phiên máy tính trong tài khoản: {e}"
+
+    return False, "Máy tính chưa vào được bên trong tài khoản Zalo."
+
+
 def generate_unique_zalo_pc_imei(user_agent="", salt=""):
     u = str(uuid.uuid4())
     ua_s = f"{user_agent}_{salt}_{time.time_ns()}_{secrets.token_hex(4)}"
@@ -165,12 +360,12 @@ def _harvest_cookies(resp, session_obj, jar_dict):
 
 
 def _execute_qr_login_sync(emit_event_fn, qr_callback=None, timeout=120, custom_pc_name=None):
-    """Thực thi luồng tạo QR và đăng nhập thẳng thiết bị Máy Tính vào trong tài khoản Zalo."""
+    """Thực thi luồng tạo QR, đăng nhập thẳng thiết bị Máy Tính vào trong tài khoản Zalo và xác thực nghiêm ngặt."""
     ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
     sec_ch_ua = '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"'
     sec_platform = '"Windows"'
     rnd_tag = secrets.token_hex(2).upper()
-    pc_name = custom_pc_name or f"DESKTOP-VN92K8M-{rnd_tag} (Windows 11 Pro)"
+    pc_name = custom_pc_name or f"ZALO-PC-RIKE-{rnd_tag} (Windows 11 Pro)"
     imei = generate_unique_zalo_pc_imei(ua, salt=pc_name)
 
     s = requests.Session()
@@ -388,7 +583,7 @@ def _execute_qr_login_sync(emit_event_fn, qr_callback=None, timeout=120, custom_
         emit_event_fn({"type": LoginQRCallbackEventType.QRCodeExpired, "data": {}})
         return None
 
-    # Bước quan trọng nhất: Nhận chứng chỉ zpw_sek và đăng ký phiên Máy Tính thẳng vào trong tài khoản Zalo!
+    # Bước 7: Nhận chứng chỉ zpw_sek qua từng chặng Redirect (không làm rớt cookie zpw_sek)
     cookie_jar_dict["z_uuid"] = imei
 
     def _follow_redirect_hops(start_url, initial_ref):
@@ -437,7 +632,7 @@ def _execute_qr_login_sync(emit_event_fn, qr_callback=None, timeout=120, custom_
             login_referer
         )
 
-    # Khởi tạo phiên Máy Tính chính thức trên wpa.chat.zalo.me để thiết bị nằm cố định trong tài khoản
+    # Bước 8: Đăng ký thiết bị Máy Tính vào trong tài khoản Zalo (`wpa.chat.zalo.me`)
     user_info_got = {}
     ck_final_str = "; ".join(f"{k}={v}" for k, v in cookie_jar_dict.items() if k and v is not None)
     wpa_headers = {
@@ -473,32 +668,61 @@ def _execute_qr_login_sync(emit_event_fn, qr_callback=None, timeout=120, custom_
     except Exception:
         pass
 
-    try:
-        ck_final_str = "; ".join(f"{k}={v}" for k, v in cookie_jar_dict.items() if k and v is not None)
-        wpa_headers["Cookie"] = ck_final_str
-        enc_q, enc_key = ZaloPCParamsEncryptor.build_encrypted_login_query(
-            imei, computer_name="Web", language="vi", ztype=30, client_version=645
-        )
-        r_enc_login = s.get(
-            "https://wpa.chat.zalo.me/api/login/getLoginInfo",
-            params=enc_q,
-            headers=wpa_headers,
-            timeout=10,
-        )
-        _harvest_cookies(r_enc_login, s, cookie_jar_dict)
-        j_enc = r_enc_login.json() if r_enc_login.content else {}
-        raw_d = j_enc.get("data")
-        if isinstance(raw_d, str) and raw_d:
-            dec_info = ZaloPCParamsEncryptor.decrypt_login_data(raw_d, enc_key)
-            if isinstance(dec_info, dict) and dec_info.get("zpw_enk"):
-                user_info_got = dec_info
-        elif isinstance(raw_d, dict) and raw_d.get("zpw_enk"):
-            user_info_got = raw_d
-    except Exception:
-        pass
+    for zt_try in (30, 24):
+        if user_info_got.get("zpw_enk"):
+            break
+        try:
+            ck_final_str = "; ".join(f"{k}={v}" for k, v in cookie_jar_dict.items() if k and v is not None)
+            wpa_headers["Cookie"] = ck_final_str
+            enc_q, enc_key = ZaloPCParamsEncryptor.build_encrypted_login_query(
+                imei, computer_name="Web", language="vi", ztype=zt_try, client_version=645
+            )
+            r_enc_login = s.get(
+                "https://wpa.chat.zalo.me/api/login/getLoginInfo",
+                params=enc_q,
+                headers=wpa_headers,
+                timeout=10,
+            )
+            _harvest_cookies(r_enc_login, s, cookie_jar_dict)
+            j_enc = r_enc_login.json() if r_enc_login.content else {}
+            raw_d = j_enc.get("data")
+            if isinstance(raw_d, str) and raw_d:
+                dec_info = ZaloPCParamsEncryptor.decrypt_login_data(raw_d, enc_key)
+                if isinstance(dec_info, dict) and dec_info.get("zpw_enk"):
+                    user_info_got = dec_info
+            elif isinstance(raw_d, dict) and raw_d.get("zpw_enk"):
+                user_info_got = raw_d
+        except Exception:
+            pass
 
     uid = str(user_info_got.get("uid") or user_info_got.get("userId") or user_info_got.get("send2me_id") or "")
     zpw_enk = str(user_info_got.get("zpw_enk") or "")
+
+    # BẮT BUỘC KIỂM TRA: Máy tính của QR đó PHẢI nằm trong tài khoản Zalo thì mới trả về Cookie & IMEI!
+    verified_in_acc, verify_msg = verify_zalo_pc_device_logged_in_account(
+        imei=imei, cookies_dict=cookie_jar_dict, user_agent=ua, zpw_enk=zpw_enk
+    )
+    if not verified_in_acc or not zpw_enk or not uid:
+        emit_event_fn({
+            "type": LoginQRCallbackEventType.QRCodeDeclined,
+            "data": {"error": verify_msg or "Thiết bị máy tính chưa vào được trong tài khoản Zalo!"},
+        })
+        return None
+
+    ws_list = []
+    for k_ws in ("zpw_ws", "ws", "websocket"):
+        v_ws = user_info_got.get(k_ws)
+        if isinstance(v_ws, list):
+            ws_list.extend(v_ws)
+        elif isinstance(v_ws, str) and v_ws:
+            ws_list.append(v_ws)
+
+    # Khởi chạy bộ giữ phiên máy tính cố định 24/7 trong tài khoản Zalo (không chạy đi đâu hết!)
+    ZaloPCSessionKeeper.start_keeper(
+        uid=uid, imei=imei, cookies_dict=cookie_jar_dict,
+        user_agent=ua, zpw_enk=zpw_enk, ws_urls=ws_list
+    )
+
     pf = user_info_got.get("profile") if isinstance(user_info_got.get("profile"), dict) else {}
     final_name = (
         user_info_got.get("displayName")
@@ -513,6 +737,8 @@ def _execute_qr_login_sync(emit_event_fn, qr_callback=None, timeout=120, custom_
     user_info_out.setdefault("displayName", final_name)
     user_info_out.setdefault("phoneNumber", phone_num)
     user_info_out.setdefault("zpw_enk", zpw_enk)
+    user_info_out["verified_in_account"] = True
+    user_info_out["pc_name"] = pc_name
 
     result_payload = {
         "cookies": cookie_jar_dict,
@@ -522,6 +748,7 @@ def _execute_qr_login_sync(emit_event_fn, qr_callback=None, timeout=120, custom_
         "uid": uid,
         "display_name": final_name,
         "pc_name": pc_name,
+        "verified_in_account": True,
         "user_info": user_info_out,
     }
 
@@ -557,8 +784,8 @@ async def _login_qr_async_runner(callback=None, qr_callback=None, timeout=120, c
 
 def login_qr_with_unique_imei(callback=None, qr_callback=None, timeout=120, custom_pc_name=None):
     """Hàm đa năng tương thích cả 2 chế độ:
-    - Chế độ Async (`await login_qr_with_unique_imei(callback=callback)` trong `get ck im zalo.py`)
-    - Chế độ Sync (`login_qr_with_unique_imei(qr_callback=...)` trong `app.py`)"""
+    - Chế độ Async (`await login_qr_with_unique_imei(callback=callback)` trong Bot Telegram `get_ck_im_zalo.py`)
+    - Chế độ Sync (`login_qr_with_unique_imei(qr_callback=...)` trong Web Control Panel `app.py`)"""
     try:
         asyncio.get_running_loop()
         is_in_async_loop = True
