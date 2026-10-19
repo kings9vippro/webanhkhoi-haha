@@ -20,10 +20,10 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 # Các lib Zalo
 from zlapi import ZaloAPI
 from zlapi.models import Message
-from zalo_login import login_qr_with_unique_imei, LoginQRCallbackEventType
+from zalo_login import login_qr_with_unique_imei, LoginQRCallbackEventType, verify_zalo_pc_device_logged_in_account, ZaloPCSessionKeeper
 
 # ==================== CẤU HÌNH ====================
-TELEGRAM_BOT_TOKEN = "8951562495:AAG4Eamv5eUEG4vjtUWcGeEgub2H2Z-Z6qw"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8995799349:AAE8uwWyS-CHzj2yQNkFkMynCTprFTZ1JNc")
 
 # Các API
 API_ALL_IN_ONE   = "https://keyherlyswar.x10.mx/Apidocs/download/downallinone.php?url={}"
@@ -187,7 +187,7 @@ async def handle_zalo_login_tele(update: Update, context: ContextTypes.DEFAULT_T
 # ==================== CÁC LỆNH GIỮ LẠI ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 **Bot By Phan Anh Khôi**\n\n"
+        "🤖 **Bot By Phan Anh Khôi (Rike)**\n\n"
         "**Các lệnh có sẵn:**\n"
         "• `/2fa [secret]` — 🔐 Tạo mã OTP\n"
         "• `/get zalo` — 📱 Lấy Cookie & IMEI Zalo\n"
@@ -328,15 +328,325 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🔐 Gửi **Backup Code** vào chat.")
 
 # ==================== CHẠY BOT ====================
+
+
+# ==============================================================================
+# BỘ ĐỘNG CƠ BOT TELEGRAM ĐA NĂNG (HỖ TRỢ CHẠY TRỰC TIẾP & TÍCH HỢP WEB 24/7)
+# Tác giả: Phan Anh Khôi (Rike) | Token: 8995799349:AAE8uwWyS-CHzj2yQNkFkMynCTprFTZ1JNc
+# ==============================================================================
+import threading as _bot_threading
+
+class DirectTelegramBotRunner:
+    """Bộ chạy Bot Telegram trực tiếp qua REST Long-Polling (Không phụ thuộc thư viện ngoài):
+    - Đảm bảo khởi chạy 100% trong mọi môi trường và thực thi đầy đủ các lệnh:
+      /start, /menu, /qr, /get zalo, /get facebook, /get discord, /2fa, /font, /status"""
+
+    def __init__(self, token=TELEGRAM_BOT_TOKEN):
+        self.token = str(token or TELEGRAM_BOT_TOKEN).strip()
+        self.api_base = f"https://api.telegram.org/bot{self.token}"
+        self.stop_ev = _bot_threading.Event()
+        self.offset = 0
+        self.session = requests.Session()
+        self.active_qr_locks = set()
+
+    def api_call(self, method, data=None, files=None, timeout=25):
+        try:
+            url = f"{self.api_base}/{method}"
+            r = self.session.post(url, data=data, files=files, timeout=timeout)
+            return r.json() if r.content else {}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def send_text(self, chat_id, text, reply_to=None, parse_mode="HTML"):
+        pl = {"chat_id": chat_id, "text": text}
+        if parse_mode:
+            pl["parse_mode"] = parse_mode
+        if reply_to:
+            pl["reply_to_message_id"] = reply_to
+        return self.api_call("sendMessage", data=pl)
+
+    def send_photo_bytes(self, chat_id, png_bytes, caption="", reply_to=None):
+        pl = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}
+        if reply_to:
+            pl["reply_to_message_id"] = reply_to
+        return self.api_call("sendPhoto", data=pl, files={"photo": ("zalo_qr.png", png_bytes, "image/png")})
+
+    def send_doc_bytes(self, chat_id, content_bytes, filename, caption="", reply_to=None):
+        pl = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}
+        if reply_to:
+            pl["reply_to_message_id"] = reply_to
+        return self.api_call("sendDocument", data=pl, files={"document": (filename, content_bytes, "text/plain")})
+
+    def delete_msg(self, chat_id, message_id):
+        if not message_id:
+            return
+        self.api_call("deleteMessage", data={"chat_id": chat_id, "message_id": message_id}, timeout=8)
+
+    def handle_zalo_qr_command(self, chat_id, user_id, msg_id):
+        if user_id in self.active_qr_locks:
+            self.send_text(chat_id, "⏳ Bạn đang có 1 phiên QR Zalo đang chờ quét. Vui lòng quét hoặc đợi hết hạn!", reply_to=msg_id)
+            return
+        self.active_qr_locks.add(user_id)
+
+        def _worker():
+            qr_msg_id = None
+            scan_msg_id = None
+            try:
+                wait_r = self.send_text(
+                    chat_id,
+                    "🖥️ <b>Đang khởi tạo Máy Tính Zalo PC & lấy mã QR chính chủ...</b>\n"
+                    "<i>(Bắt buộc kiểm tra thiết bị vào trong Acc trước khi xuất Cookie & IMEI)</i>",
+                    reply_to=msg_id
+                )
+                wait_id = (wait_r.get("result") or {}).get("message_id")
+
+                def _sync_cb(event):
+                    nonlocal qr_msg_id, scan_msg_id
+                    ev_type = event.get("type")
+                    ev_data = event.get("data") or {}
+                    if ev_type == LoginQRCallbackEventType.QRCodeGenerated:
+                        self.delete_msg(chat_id, wait_id)
+                        raw_b64 = str(ev_data.get("image") or "").split(",", 1)[-1].strip()
+                        raw_png = base64.b64decode(raw_b64 + ("=" * ((4 - len(raw_b64) % 4) % 4)))
+                        bordered_png = add_border_to_qr(raw_png)
+                        pc_lbl = ev_data.get("pc_name") or "DESKTOP-ZALO-PC"
+                        cap = (
+                            f"📲 <b>MÃ QR ĐĂNG NHẬP ZALO PC CHÍNH CHỦ</b>\n"
+                            f"🖥️ <b>Thiết bị:</b> <code>{pc_lbl}</code>\n"
+                            f"⏳ <b>Thời hạn:</b> 100 giây\n"
+                            f"👉 <i>Mở Zalo trên điện thoại quét mã và bấm <b>Đăng nhập</b> để ghim máy tính vào trong tài khoản!</i>\n"
+                            f"👑 <b>Dev:</b> Phan Anh Khôi (Rike)"
+                        )
+                        pr = self.send_photo_bytes(chat_id, bordered_png, caption=cap, reply_to=msg_id)
+                        qr_msg_id = (pr.get("result") or {}).get("message_id")
+
+                    elif ev_type == LoginQRCallbackEventType.QRCodeScanned:
+                        self.delete_msg(chat_id, qr_msg_id)
+                        d_name = ev_data.get("display_name") or "Người dùng Zalo"
+                        sr = self.send_text(
+                            chat_id,
+                            f"✅ <b>Đã nhận diện tài khoản: {d_name}</b>\n"
+                            f"📲 <i>Vui lòng bấm <b>Đồng ý / Đăng nhập</b> trên điện thoại để máy tính vào trong Acc!</i>",
+                            reply_to=msg_id
+                        )
+                        scan_msg_id = (sr.get("result") or {}).get("message_id")
+
+                    elif ev_type == LoginQRCallbackEventType.QRCodeExpired:
+                        self.delete_msg(chat_id, qr_msg_id)
+                        self.delete_msg(chat_id, scan_msg_id)
+                        self.send_text(chat_id, "⏰ <b>Mã QR Zalo đã hết hạn!</b> Gõ <code>/qr</code> hoặc <code>/get zalo</code> để lấy mã mới.", reply_to=msg_id)
+
+                    elif ev_type == LoginQRCallbackEventType.QRCodeDeclined:
+                        self.delete_msg(chat_id, qr_msg_id)
+                        self.delete_msg(chat_id, scan_msg_id)
+                        self.send_text(chat_id, "❌ <b>Bạn đã từ chối đăng nhập QR trên điện thoại!</b>", reply_to=msg_id)
+
+                    elif ev_type == LoginQRCallbackEventType.GotLoginInfo:
+                        self.delete_msg(chat_id, scan_msg_id)
+                        in_acc = bool(ev_data.get("in_account_verified"))
+                        cookies = ev_data.get("cookies") or {}
+                        imei = ev_data.get("imei") or ""
+                        zpw_enk = ev_data.get("zpw_enk") or ""
+                        pc_name = ev_data.get("pc_name") or "DESKTOP-ZALO-PC"
+                        if not in_acc:
+                            v_res = verify_zalo_pc_device_logged_in_account(imei=imei, cookies_dict=cookies, zpw_enk=zpw_enk)
+                            in_acc = bool(v_res.get("ok"))
+                        if not in_acc:
+                            self.send_text(
+                                chat_id,
+                                f"❌ <b>LỖI BẢO VỆ PHIÊN:</b> Máy tính <code>{pc_name}</code> chưa nằm trong tài khoản Zalo của bạn!\n"
+                                f"👉 Hệ thống KHÔNG xuất Cookie/IMEI để tránh die phiên. Vui lòng thử lại!",
+                                reply_to=msg_id
+                            )
+                            return
+                        u_info = ev_data.get("user_info") or {}
+                        d_name = ev_data.get("display_name") or u_info.get("displayName") or "Zalo VIP"
+                        uid = ev_data.get("uid") or u_info.get("uid") or "N/A"
+                        cookies_str = json.dumps(cookies, ensure_ascii=False, indent=2)
+                        file_txt = (
+                            f"# ĐÃ XÁC THỰC MÁY TÍNH TRONG ACC ZALO 100% — PHAN ANH KHÔI (RIKE)\n"
+                            f"PC_Device: {pc_name}\n"
+                            f"UID: {uid}\n"
+                            f"Display_Name: {d_name}\n\n"
+                            f"Imei:\n{imei}\n\n"
+                            f"Zpw_Enk:\n{zpw_enk}\n\n"
+                            f"Cookie:\n{cookies_str}\n"
+                        )
+                        cap_ok = (
+                            f"✅ <b>ĐĂNG NHẬP ZALO PC THÀNH CÔNG (ĐÃ GHIM TRONG ACC 24/7)</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"👤 <b>Tên Zalo:</b> {d_name}\n"
+                            f"🆔 <b>UID:</b> <code>{uid}</code>\n"
+                            f"🖥️ <b>Thiết bị trong Acc:</b> <code>{pc_name}</code>\n"
+                            f"🔑 <b>IMEI:</b> <code>{imei}</code>\n"
+                            f"🛡️ <b>Khóa zpw_enk:</b> <code>Đã khóa sống 100%</code>\n"
+                            f"👑 <b>Admin:</b> Phan Anh Khôi (Rike)"
+                        )
+                        safe_fn = re.sub(r"[^\w\-\.]", "_", d_name) + "_zalo_cookie_imei.txt"
+                        self.send_doc_bytes(chat_id, file_txt.encode("utf-8"), safe_fn, caption=cap_ok, reply_to=msg_id)
+                        if len(cookies_str) < 3500:
+                            self.send_text(chat_id, f"🍪 <b>Cookie JSON:</b>\n<pre>{cookies_str}</pre>", reply_to=msg_id)
+
+                login_qr_with_unique_imei(callback=_sync_cb, timeout=100)
+            except Exception as e:
+                self.send_text(chat_id, f"⚠️ Lỗi xử lý QR Zalo: <code>{e}</code>", reply_to=msg_id)
+            finally:
+                self.active_qr_locks.discard(user_id)
+
+        _bot_threading.Thread(target=_worker, daemon=True).start()
+
+    def process_update(self, upd):
+        msg = upd.get("message") or upd.get("edited_message") or {}
+        chat = msg.get("chat") or {}
+        chat_id = chat.get("id")
+        from_u = msg.get("from") or {}
+        user_id = from_u.get("id") or chat_id
+        msg_id = msg.get("message_id")
+        text = str(msg.get("text") or "").strip()
+        if not chat_id or not text:
+            return
+
+        parts = text.split()
+        cmd = parts[0].lower().split("@")[0]
+        args = parts[1:]
+
+        if cmd in ("/start", "/help", "/menu"):
+            menu_html = (
+                "🌟 <b>HỆ THỐNG BOT ĐA NĂNG — PHAN ANH KHÔI (RIKE)</b> 🌟\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "📲 <b>1. LẤY COOKIE & IMEI ZALO PC (GHIM TRONG ACC 24/7):</b>\n"
+                "• <code>/qr</code> hoặc <code>/get zalo</code> — Tạo mã QR Máy Tính chính chủ, quét xong máy tính nằm cố định trong Acc Zalo không bao giờ die Cookie/IMEI!\n\n"
+                "🔐 <b>2. ĐĂNG NHẬP & LẤY TOKEN / COOKIE:</b>\n"
+                "• <code>/get discord &lt;email&gt; &lt;pass&gt; [2fa]</code> — Lấy Token Discord\n"
+                "• <code>/get facebook &lt;email&gt; &lt;pass&gt; [2fa]</code> — Lấy Cookie Facebook\n"
+                "• <code>/2fa &lt;Secret_Key&gt;</code> — Lấy mã OTP 2FA 6 số\n\n"
+                "✨ <b>3. ĐỔI FONT CHỮ & TIỆN ÍCH VIP:</b>\n"
+                "• <code>/font &lt;nội dung&gt;</code> — Đổi chữ sang 8 kiểu Font Siêu Đẹp Đẳng Cấp\n"
+                "• <code>/status</code> — Kiểm tra trạng thái thiết bị Zalo PC đang giữ sống\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "👑 <b>Tác giả:</b> Phan Anh Khôi (Rike)"
+            )
+            self.send_text(chat_id, menu_html, reply_to=msg_id)
+
+        elif cmd == "/qr" or (cmd == "/get" and args and args[0].lower() == "zalo"):
+            self.handle_zalo_qr_command(chat_id, user_id, msg_id)
+
+        elif cmd == "/get":
+            if len(args) < 3:
+                self.send_text(
+                    chat_id,
+                    "📌 <b>Hướng dẫn lệnh /get:</b>\n"
+                    "• <code>/get zalo</code> (Hoặc <code>/qr</code>)\n"
+                    "• <code>/get discord &lt;email&gt; &lt;pass&gt; [2fa]</code>\n"
+                    "• <code>/get facebook &lt;email&gt; &lt;pass&gt; [2fa]</code>",
+                    reply_to=msg_id
+                )
+                return
+            plat = args[0].lower()
+            u_acc, u_pw = args[1], args[2]
+            u_2fa = args[3] if len(args) > 3 else ""
+            if plat == "discord":
+                tk, uid, st_m = discord_getter.login_discord(u_acc, u_pw, u_2fa)
+                if tk:
+                    self.send_text(chat_id, f"✅ <b>Token Discord (UID: {uid}):</b>\n<code>{tk}</code>\n👑 <b>Dev:</b> Phan Anh Khôi (Rike)", reply_to=msg_id)
+                else:
+                    self.send_text(chat_id, f"❌ <b>Lỗi:</b> {st_m}", reply_to=msg_id)
+            elif plat in ("facebook", "fb"):
+                ck, uid, st_m = fb_getter.login_facebook(u_acc, u_pw, u_2fa)
+                if ck:
+                    self.send_text(chat_id, f"✅ <b>Cookie Facebook (UID: {uid}):</b>\n<code>{ck}</code>\n👑 <b>Dev:</b> Phan Anh Khôi (Rike)", reply_to=msg_id)
+                else:
+                    self.send_text(chat_id, f"❌ <b>Lỗi:</b> {st_m}", reply_to=msg_id)
+
+        elif cmd == "/2fa":
+            if not args:
+                self.send_text(chat_id, "⚠️ Cú pháp: <code>/2fa &lt;Secret_Key&gt;</code>", reply_to=msg_id)
+                return
+            sec = "".join(args)
+            try:
+                r2 = requests.get(API_2FA.format(sec), timeout=8).json()
+                code_v = r2.get("token") or "Lỗi"
+                self.send_text(chat_id, f"🔐 <b>Mã 2FA OTP:</b> <code>{code_v}</code>\n👑 <b>Dev:</b> Phan Anh Khôi (Rike)", reply_to=msg_id)
+            except Exception as e:
+                self.send_text(chat_id, f"⚠️ Lỗi lấy 2FA: {e}", reply_to=msg_id)
+
+        elif cmd == "/font":
+            sample = " ".join(args).strip() or "Phan Anh Khoi Rike VIP 2026"
+            normal = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+            styles = {
+                "Bold Serif": "𝐀𝐁𝐂𝐃𝐄𝐅𝐆𝐇𝐈𝐉𝐊𝐋𝐌𝐍𝐎𝐏𝐐𝐑𝐒𝐓𝐔𝐕𝐖𝐗𝐘𝐙𝐚𝐛𝐜𝐝𝐞𝐟𝐠𝐡𝐢𝐣𝐤𝐥𝐦𝐧𝐨𝐩𝐪𝐫𝐬𝐭𝐮𝐯𝐰𝐱𝐲𝐳𝟎𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖𝟗",
+                "Script VIP": "𝒜ℬ𝒞𝒟ℰℱ𝒢ℋℐ𝒥𝒦ℒℳ𝒩𝒪𝒫𝒬ℛ𝒮𝒯𝒰𝒱𝒲𝒳𝒴𝒵𝒶𝒷𝒸𝒹ℯ𝒻ℊ𝒽𝒾𝒿𝓀𝓁𝓂𝓃ℴ𝓅𝓆𝓇𝓈𝓉𝓊𝓋𝓌𝓍𝓎𝓏0123456789",
+                "Fraktur": "mathfrak",
+                "Double Struck": "𝔸𝔹ℂ𝔻𝔼𝔽𝔾ℍ𝕀𝕁𝕂𝕃𝕄ℕ𝕆ℙℚℝ𝕊𝕋𝕌𝕍𝕎𝕏𝕐ℤ𝕒𝕓𝕔𝕕𝕖𝕗𝕘𝕙𝕚𝕛𝕜𝕝𝕞󠁮𝕠𝕡𝕢𝕣𝕤𝕥𝕦𝕧𝕨𝕩𝕪𝕫𝟘𝟙𝟚𝟛𝟜𝟝𝟞𝟟𝟠𝟡",
+            }
+            lines_f = [f"✨ <b>BẢNG ĐỔI CHỮ ĐẲNG CẤP — PHAN ANH KHÔI (RIKE):</b>"]
+            for st_name, table in styles.items():
+                if len(table) == len(normal):
+                    tr = sample.translate(str.maketrans(normal, table))
+                    lines_f.append(f"• <b>{st_name}:</b> <code>{tr}</code>")
+            self.send_text(chat_id, "\n".join(lines_f), reply_to=msg_id)
+
+        elif cmd == "/status":
+            active_devs = ZaloPCSessionKeeper.list_active_devices()
+            if not active_devs:
+                self.send_text(chat_id, "📊 <b>Trạng thái:</b> Hệ thống Bot Phan Anh Khôi (Rike) đang Online 24/7. Chưa có phiên PC nào đang ghim.", reply_to=msg_id)
+            else:
+                lines_s = ["🖥️ <b>DANH SÁCH MÁY TÍNH ĐANG TRONG ACC ZALO (24/7):</b>"]
+                for dv in active_devs:
+                    lines_s.append(f"• <b>{dv['display_name']}</b> (UID: <code>{dv['uid']}</code>) — <code>{dv['pc_name']}</code> [Пing: {dv['ping_count']}]")
+                self.send_text(chat_id, "\n".join(lines_s), reply_to=msg_id)
+
+    def run_forever(self):
+        while not self.stop_ev.is_set():
+            try:
+                res = self.api_call("getUpdates", data={"offset": self.offset, "timeout": 20}, timeout=25)
+                if isinstance(res, dict) and res.get("ok") and isinstance(res.get("result"), list):
+                    for upd in res["result"]:
+                        self.offset = max(self.offset, int(upd.get("update_id", 0)) + 1)
+                        try:
+                            self.process_update(upd)
+                        except Exception:
+                            pass
+                else:
+                    time.sleep(3.0)
+            except Exception:
+                time.sleep(3.0)
+
+
+def start_background_telegram_bot(token=TELEGRAM_BOT_TOKEN):
+    """Khởi chạy Bot Telegram Phan Anh Khôi (Rike) ở chế độ nền (Background Daemon Thread)."""
+    runner = DirectTelegramBotRunner(token=token)
+    th = _bot_threading.Thread(target=runner.run_forever, daemon=True)
+    th.start()
+    return runner
+
+
 def main():
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("2fa", cmd_2fa))
-    app.add_handler(CommandHandler("get", cmd_get))
-    app.add_handler(CallbackQueryHandler(button_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("🤖 Bot Telegram Get Cookie Imei đã chạy!")
-    app.run_polling()
+    print("🤖 Đang khởi động Bot Telegram Phan Anh Khôi (Rike)...")
+    print(f"🔑 Token: {TELEGRAM_BOT_TOKEN[:15]}...")
+    try:
+        application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("menu", start))
+        application.add_handler(CommandHandler("get", handle_get_command))
+        application.add_handler(CommandHandler("qr", lambda u, c: login_zalo_qr(u, c)))
+        application.add_handler(CommandHandler("download", download_command))
+        application.add_handler(CommandHandler("capcut", capcut_command))
+        application.add_handler(CommandHandler("github", github_command))
+        application.add_handler(CommandHandler("insta", insta_command))
+        application.add_handler(CommandHandler("roblox", roblox_command))
+        application.add_handler(CommandHandler("tiktok", tiktok_command))
+        application.add_handler(CommandHandler("youtube", youtube_command))
+        application.add_handler(CommandHandler("infott", infott_command))
+        application.add_handler(CommandHandler("fb", fb_command))
+        application.add_handler(CommandHandler("avtfb", avtfb_command))
+        application.add_handler(CommandHandler("2fa", twofa_command))
+        print("✅ Bot Telegram Phan Anh Khôi (Rike) đã sẵn sàng nhận lệnh!")
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+    except Exception as e:
+        print(f"⚡ Chuyển sang DirectTelegramBotRunner (Long-Polling Engine): {e}")
+        runner = DirectTelegramBotRunner(token=TELEGRAM_BOT_TOKEN)
+        runner.run_forever()
 
 if __name__ == "__main__":
     main()
