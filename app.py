@@ -12099,6 +12099,77 @@ threading.Thread(target=_listener_watchdog_loop, daemon=True).start()
 
 # GIAO DIỆN WEB CHÍNH: NOEL (100% VECTOR SVG HIỆN ĐẠI, CHỐNG TRÀN VIỀN TUYỆT ĐỐI,
 # THANH TAB NGANG DƯỚI NHỎ GỌN HIỆN ĐẠI, NÚT BẤM CÓ HÌNH ẢNH DESIGN NOEL)
+
+# ============================================================
+# DISCORD ULTRA SPEED ENGINE v30 - Batch + Preload + Soi dump
+# ============================================================
+class DiscordUltraSpeedEngine:
+    """Engine siêu tốc: preload boxes, hang nhiều nhóm song song, lệnh soi dump full + tag."""
+    def __init__(self, discord_client):
+        self.client = discord_client
+        self.executor = ThreadPoolExecutor(max_workers=24)
+        self.box_cache = {}
+        self.lock = threading.Lock()
+
+    def preload_boxes(self, token_key, force=False):
+        with self.lock:
+            if not force and token_key in self.box_cache:
+                return self.box_cache[token_key]
+            try:
+                boxes = self.client.scan_full_conversations(platform="discord", force_refresh=force) if hasattr(self.client, "scan_full_conversations") else []
+            except Exception:
+                boxes = []
+            self.box_cache[token_key] = boxes
+            return boxes
+
+    def hang_groups_parallel(self, group_ids, message, tag_all=True, max_workers=16):
+        """Gửi đồng thời nhiều nhóm."""
+        ids = list(group_ids)[:max_workers]
+        futs = [self.executor.submit(self._safe_send, gid, message, tag_all) for gid in ids]
+        out = []
+        for f in futs:
+            try:
+                out.append(f.result(timeout=10))
+            except Exception as e:
+                out.append({"ok": False, "error": str(e)})
+        return out
+
+    def _safe_send(self, gid, msg, tag_all):
+        try:
+            if hasattr(self.client, "send_message_discord"):
+                return self.client.send_message_discord(gid, msg, tag_all=tag_all)
+            return {"ok": False, "error": "no send method"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def soi_dump(self, box_id, full_tag=True, limit=150):
+        """Lệnh soi: lấy full tin nhắn gần + tag thành viên nếu có."""
+        msgs = []
+        try:
+            if hasattr(self.client, "get_recent_group_messages"):
+                msgs = self.client.get_recent_group_messages(box_id, limit=limit) or []
+        except Exception:
+            pass
+        members = []
+        try:
+            if hasattr(self.client, "get_group_members"):
+                members = self.client.get_group_members(box_id) or []
+        except Exception:
+            pass
+        tag_line = ""
+        if full_tag and members:
+            tag_line = " ".join([f"<@{m.get('id') or m.get('user',{}).get('id','')}>" for m in members if m])
+        dump_lines = []
+        for m in msgs:
+            author = m.get("author", {})
+            name = author.get("username") or author.get("global_name") or "?"
+            content = m.get("content") or ""
+            dump_lines.append(f"[{name}] {content}")
+        body = "\n".join(dump_lines[-limit:])
+        final = f"**SOI {box_id}**\n{tag_line}\n\n{body}"
+        return self._safe_send(box_id, final, tag_all=False)
+
+
 LOGIN_HTML = r"""<!DOCTYPE html>
 <html lang="vi">
 <head>
@@ -12176,6 +12247,50 @@ html,body{
   background-attachment:fixed !important;
   color:var(--txt) !important;
 }
+
+/* === LIQUID GLASS & MODERN COMPONENTS (v30) === */
+.glass, .header-bar, .card, .panel, .box-card {
+  background: var(--glass) !important;
+  backdrop-filter: blur(var(--blur));
+  -webkit-backdrop-filter: blur(var(--blur));
+  border: 1px solid var(--border) !important;
+  border-radius: var(--radius) !important;
+  box-shadow: var(--shadow);
+}
+.btn, button.btn, .action-btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  padding: 8px 16px; border-radius: 10px; font-weight: 500; font-size: 13px;
+  border: none; cursor: pointer; transition: all 0.18s ease;
+  background: var(--blue); color: #fff;
+}
+.btn:hover, button.btn:hover { filter: brightness(1.12); transform: translateY(-1px); }
+.btn-ghost { background: transparent; border: 1px solid var(--border); color: var(--txt); }
+.btn-ghost:hover { background: var(--surface); }
+.btn-pill { border-radius: 999px; }
+.btn-success { background: var(--green); }
+.btn-danger { background: var(--red); }
+.btn-icon { width: 36px; height: 36px; padding: 0; border-radius: 10px; }
+.tab-bar, .nav-tabs {
+  display: flex; gap: 4px; padding: 4px; background: var(--surface-sub);
+  border-radius: 12px; border: 1px solid var(--border);
+}
+.tab, .nav-tab {
+  padding: 7px 14px; border-radius: 9px; cursor: pointer; color: var(--txt-muted);
+  transition: all 0.15s; font-weight: 500;
+}
+.tab.active, .nav-tab.active { background: var(--blue); color: #fff; }
+.input-glass, input[type=text], input[type=password], select, textarea {
+  background: var(--surface) !important; border: 1px solid var(--border) !important;
+  border-radius: 10px !important; padding: 9px 12px; color: var(--txt) !important;
+  outline: none; transition: border 0.15s, box-shadow 0.15s;
+}
+.input-glass:focus, input:focus, select:focus, textarea:focus {
+  border-color: var(--blue) !important;
+  box-shadow: 0 0 0 3px rgba(59,130,246,0.25);
+}
+body { background: radial-gradient(ellipse at 20% 0%, #1e293b 0%, #0b0f19 55%) !important; }
+.header-bar { margin-bottom: 14px; }
+
 input,textarea,code,pre{
   -webkit-user-select:text;
   user-select:text;
@@ -12604,19 +12719,23 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <title>{{ custom_title if custom_title else 'Bảng Điều Khiển Đa Tài Khoản' }}</title>
 <style>
 :root{
-  --bg:#f1f5f9;
-  --surface:#ffffff;
-  --surface-sub:#f8fafc;
-  --border:#cbd5e1;
-  --border-light:#e2e8f0;
-  --txt:#0f172a;
-  --txt-muted:#475569;
-  --blue:#2563eb;
-  --blue-hover:#1d4ed8;
-  --green:#16a34a;
-  --red:#dc2626;
-  --amber:#d97706;
-  --indigo:#4f46e5;
+  --bg:#0b0f19;
+  --surface:rgba(255,255,255,0.07);
+  --surface-sub:rgba(255,255,255,0.04);
+  --border:rgba(255,255,255,0.12);
+  --border-light:rgba(255,255,255,0.08);
+  --txt:#f1f5f9;
+  --txt-muted:#94a3b8;
+  --blue:#3b82f6;
+  --blue-hover:#2563eb;
+  --green:#22c55e;
+  --red:#ef4444;
+  --amber:#f59e0b;
+  --indigo:#6366f1;
+  --glass:rgba(255,255,255,0.08);
+  --blur:18px;
+  --radius:12px;
+  --shadow:0 8px 32px rgba(0,0,0,0.35);
 }
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{
