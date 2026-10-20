@@ -1,5 +1,5 @@
 """
-get_ck_im_zalo.py — Hệ Thống Bot Telegram Gửi Ảnh Banner Nằm Ngang Kèm Menu & Quét QR Zalo Việt Nam / Singapore (v28)
+get_ck_im_zalo.py — Hệ Thống Bot Telegram Gửi Ảnh Banner Nằm Ngang Kèm Menu & Quét QR Zalo Việt Nam / Singapore ()
 Tác giả: Phan Anh Khôi (Rike) — Developer Bot (helloword2102)
 Tính năng nổi bật:
 1. GỬI ẢNH BANNER NẰM NGANG KÈM MENU (`menu_banner.png` tỉ lệ 16:9 ngang bằng chiều dài Menu):
@@ -8,7 +8,7 @@ Tính năng nổi bật:
      kẹp chung với Caption Menu và Bàn phím nút bấm Inline Keyboard!
    - Bộ nhớ đệm `file_id` của Telegram giúp từ lần gửi thứ 2 trở đi ảnh + menu bật lên trong 0.05 giây!
 2. QUÉT QR ZALO MÁY TÍNH TẠI VIỆT NAM & SINGAPORE (KHÔNG Ở MỸ) — ẤN ĐĂNG NHẬP LÀ VÀO THẲNG ACC:
-   - Tích hợp `zalo_login.py` v28 (`continue=https://chat.zalo.me/`), thu hoạch trọn vẹn `zpw_sek` + `zpw_enk`,
+   - Tích hợp `zalo_login.py`  (`continue=https://zalo.me/pc`), thu hoạch trọn vẹn `zpw_sek` + `zpw_enk`,
      không bao giờ còn lỗi "Máy tính chưa kích hoạt được khóa phiên zpw_enk"!
    - Hỗ trợ chọn nhanh khu vực **Singapore (Firefox - Windows Siêu Bền)**, **TP. Hồ Chí Minh**, **Hà Nội**, **Đà Nẵng** hoặc **MacBook Pro (VN/SG)**.
    - Tự động giữ thiết bị sống 24/7 trong mục "Thiết bị đang đăng nhập" và đồng bộ thẳng lên Web Dashboard (`database.db`).
