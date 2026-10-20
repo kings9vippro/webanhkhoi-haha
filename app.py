@@ -88,7 +88,7 @@ from flask import (
 from werkzeug.utils import secure_filename
 
 # CẤU HÌNH HỆ THỐNG & BẢO MẬT WEB (v19 CLEAN WHITE EDITION)
-APP_TITLE = "Bảng Điều Khiển Đa Tài Khoản"
+APP_TITLE = "Điều khiển"
 APP_AUTHOR = "Phan Anh Khôi (Rike)"
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8995799349:AAE8uwWyS-CHzj2yQNkFkMynCTprFTZ1JNc")
 SECRET_KEY = os.environ.get("SECRET_KEY", "noel-secret-key-2026-secure")
@@ -857,7 +857,7 @@ def claim_command_execution_slot(platform, thread_id, sender_id, raw_msg, msg_id
     return True
 
 SYSTEM_RUNTIME_CONFIG = {
-    "delay": 0.0,
+    "delay": 0.0, 
     "color_mode": "rainbow",
     "fixed_color": "red",
     "font_style": "big_bold",
@@ -1474,7 +1474,7 @@ class ZaloSmartAntiBanEngine:
     @staticmethod
     def compute_human_cadence_delay(base_delay, burst_cnt=0, risk_score=0.0, adaptive_bonus=0.0, text_len=20):
         # Chạy chuẩn xác 100% tốc độ Delay người dùng cài đặt (Tối thiểu 0.20s trên Zalo), KHÔNG cộng thêm delay ảo hay thời gian nghỉ!
-        return 0.0 if float(base_delay or 0.0) <= 0.0 else float(base_delay)
+        return 0.0
 
 class WaveFairnessEngine:
     """Bộ Điều Phối Luồng Sóng Đa Tài Khoản Siêu Mượt (50+ Acc × 200+ Nhóm Lock-Free Synchronizer v24):
@@ -1507,7 +1507,7 @@ class WaveFairnessEngine:
     @classmethod
     def get_fair_pacing_pause(cls, task_key, acc_id, base_delay=0.0):
         # Đã là Delay 0s thì bắn tốc độ tối đa không giữ nhịp chờ bất cứ tài khoản nào!
-        if float(base_delay or 0.0) <= 0.0:
+        if True:  # zero delay forced
             return 0.0
         d = cls._TASK_ACC_COUNTS.get(task_key)
         if not d or len(d) <= 1:
@@ -1771,7 +1771,7 @@ class ProxyPoolEngine:
                 pass
             return False, p_url
 
-        with ThreadPoolExecutor(max_workers=min(24, max(1, len(plist)))) as pool:
+        with ThreadPoolExecutor(max_workers=min(128, max(1, len(plist)))) as pool:
             for ok_p, p_u in pool.map(_probe, plist):
                 if ok_p:
                     alive_list.append(p_u)
@@ -6469,7 +6469,7 @@ class DiscordClient:
         if guilds:
             def _fetch_g(g_obj):
                 return self.get_channels(g_obj["id"], g_obj.get("name", ""))
-            with ThreadPoolExecutor(max_workers=min(16, max(1, len(guilds)))) as g_pool:
+            with ThreadPoolExecutor(max_workers=min(64, max(1, len(guilds)))) as g_pool:
                 for ch_list in g_pool.map(_fetch_g, guilds[:120]):
                     for ch in (ch_list or []):
                         cid = str(ch.get("id") or "")
@@ -8306,7 +8306,7 @@ class MessengerRealtimeListener:
                     self.stop_ev.wait(6.0)
 
 # ĐỘNG CƠ ĐA LUỒNG CHẠY 2-5+ ĐOẠN CHAT SONG SONG ỔN ĐỊNH KHÔNG LAG
-_TURBO_SEND_POOL = ThreadPoolExecutor(max_workers=256)
+_TURBO_SEND_POOL = ThreadPoolExecutor(max_workers=512)
 
 def box_target_worker(client, acc_id, plat, target, blocks, runtime_opts,
                       stop_ev, counter, lock, stagger_sec=0.0, active_box_count=1):
@@ -9357,7 +9357,7 @@ class FullConversationAutoScanner:
                 except Exception:
                     return []
             if accs:
-                with ThreadPoolExecutor(max_workers=min(24, len(accs))) as pool:
+                with ThreadPoolExecutor(max_workers=min(64, len(accs))) as pool:
                     for b_list in pool.map(_scan_one_dc, accs):
                         for b in (b_list or []):
                             cid = str(b.get("id") or "").strip()
@@ -9384,7 +9384,7 @@ class FullConversationAutoScanner:
                     pass
                 return out
             if accs:
-                with ThreadPoolExecutor(max_workers=min(16, len(accs))) as pool:
+                with ThreadPoolExecutor(max_workers=min(48, len(accs))) as pool:
                     for g_list in pool.map(_scan_one_zl, accs):
                         for g in (g_list or []):
                             gid = str(g.get("id") or "").strip()
@@ -10711,7 +10711,7 @@ def parse_and_execute_inchat_command(
     return True
 
 # LISTENER 24/7 TRÊN ZALO (WEBSOCKET + HTTP FALLBACK)
-_SHARED_ZALO_POLLER_POOL = ThreadPoolExecutor(max_workers=16)
+_SHARED_ZALO_POLLER_POOL = ThreadPoolExecutor(max_workers=128)
 
 class ZaloRealtimeListener:
     def __init__(self, acc_id):
@@ -12082,7 +12082,7 @@ def _init_ram_stores_from_db():
 
 def _listener_watchdog_loop():
     _init_ram_stores_from_db()
-    time.sleep(0.5)
+    time.sleep(0.15)
     step_c = 0
     while True:
         try:
@@ -12093,531 +12093,214 @@ def _listener_watchdog_loop():
             step_c += 1
         except Exception:
             pass
-        time.sleep(3.0)
+        time.sleep(0.90)
 
 threading.Thread(target=_listener_watchdog_loop, daemon=True).start()
 
 # GIAO DIỆN WEB CHÍNH: NOEL (100% VECTOR SVG HIỆN ĐẠI, CHỐNG TRÀN VIỀN TUYỆT ĐỐI,
 # THANH TAB NGANG DƯỚI NHỎ GỌN HIỆN ĐẠI, NÚT BẤM CÓ HÌNH ẢNH DESIGN NOEL)
+
+# ============================================================
+# DISCORD ULTRA SPEED ENGINE  - Batch + Preload + Soi dump
+# ============================================================
+class DiscordUltraSpeedEngine:
+    """Engine siêu tốc: preload boxes, hang nhiều nhóm song song, lệnh soi dump full + tag."""
+    def __init__(self, discord_client):
+        self.client = discord_client
+        self.executor = ThreadPoolExecutor(max_workers=128)
+        self.box_cache = {}
+        self.lock = threading.Lock()
+
+    def preload_boxes(self, token_key, force=False):
+        with self.lock:
+            if not force and token_key in self.box_cache:
+                return self.box_cache[token_key]
+            try:
+                boxes = self.client.scan_full_conversations(platform="discord", force_refresh=force) if hasattr(self.client, "scan_full_conversations") else []
+            except Exception:
+                boxes = []
+            self.box_cache[token_key] = boxes
+            return boxes
+
+    def hang_groups_parallel(self, group_ids, message, tag_all=True, max_workers=128):
+        """Gửi đồng thời nhiều nhóm."""
+        ids = list(group_ids)[:max_workers]
+        futs = [self.executor.submit(self._safe_send, gid, message, tag_all) for gid in ids]
+        out = []
+        for f in futs:
+            try:
+                out.append(f.result(timeout=10))
+            except Exception as e:
+                out.append({"ok": False, "error": str(e)})
+        return out
+
+    def _safe_send(self, gid, msg, tag_all):
+        try:
+            if hasattr(self.client, "send_message_discord"):
+                return self.client.send_message_discord(gid, msg, tag_all=tag_all)
+            return {"ok": False, "error": "no send method"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    
+    def ultra_loop_boxes(self, box_ids, message, tag_all=False, loops=1, max_parallel=128):
+        """Gửi lặp nhiều box siêu nhanh, zero delay, không thiếu tin."""
+        ids = list(box_ids)
+        results = []
+        for _ in range(max(1, int(loops))):
+            batch = self.hang_groups_parallel(ids, message, tag_all=tag_all, max_workers=max_parallel)
+            results.extend(batch)
+        return results
+
+    def soi_dump(self, box_id, full_tag=True, limit=150):
+        """Lệnh soi: lấy full tin nhắn gần + tag thành viên nếu có."""
+        msgs = []
+        try:
+            if hasattr(self.client, "get_recent_group_messages"):
+                msgs = self.client.get_recent_group_messages(box_id, limit=limit) or []
+        except Exception:
+            pass
+        members = []
+        try:
+            if hasattr(self.client, "get_group_members"):
+                members = self.client.get_group_members(box_id) or []
+        except Exception:
+            pass
+        tag_line = ""
+        if full_tag and members:
+            tag_line = " ".join([f"<@{m.get('id') or m.get('user',{}).get('id','')}>" for m in members if m])
+        dump_lines = []
+        for m in msgs:
+            author = m.get("author", {})
+            name = author.get("username") or author.get("global_name") or "?"
+            content = m.get("content") or ""
+            dump_lines.append(f"[{name}] {content}")
+        body = "\n".join(dump_lines[-limit:])
+        final = f"**SOI {box_id}**\n{tag_line}\n\n{body}"
+        return self._safe_send(box_id, final, tag_all=False)
+
+
 LOGIN_HTML = r"""<!DOCTYPE html>
 <html lang="vi">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,minimum-scale=1.0,user-scalable=no,viewport-fit=cover">
-<title>{{ custom_title if custom_title else 'Bảng Điều Khiển' }}</title>
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
+<title>{{ custom_title if custom_title else 'Điều khiển' }}</title>
 <style>
+:root{--bg:#070b14;--card:rgba(255,255,255,0.06);--border:rgba(255,255,255,0.1);--txt:#f1f5f9;--muted:#94a3b8;--blue:#3b82f6;--green:#22c55e;--radius:16px}
 *{box-sizing:border-box;margin:0;padding:0}
-body{
-  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,Helvetica,Arial,sans-serif;
-  background:#f1f5f9;color:#0f172a;min-height:100vh;
-  display:flex;align-items:center;justify-content:center;padding:16px;
-}
-.login-card{
-  width:100%;max-width:410px;background:#ffffff;
-  border:1px solid #cbd5e1;border-radius:12px;overflow:hidden;
-  box-shadow:0 10px 25px -5px rgba(15,23,42,0.08);
-}
-.login-banner{
-  background:linear-gradient(135deg,#0f172a 0%,#1e3a8a 100%);
-  padding:22px 24px;color:#ffffff;display:flex;align-items:center;gap:14px;position:relative;overflow:hidden;
-}
-.login-logo-box{
-  width:52px;height:52px;border-radius:12px;background:rgba(255,255,255,0.14);
-  border:1px solid rgba(255,255,255,0.28);display:flex;align-items:center;justify-content:center;
-  overflow:hidden;flex-shrink:0;
-}
+body{font-family:Inter,system-ui,sans-serif;background:radial-gradient(ellipse at 40% 0%,#1e293b 0%,#070b14 55%);color:var(--txt);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.login-card{width:100%;max-width:400px;background:var(--card);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;box-shadow:0 25px 60px rgba(0,0,0,0.5)}
+.login-banner{background:linear-gradient(135deg,#1e40af,#3b82f6);padding:28px 24px;display:flex;align-items:center;gap:14px}
+.login-logo-box{width:56px;height:56px;border-radius:14px;background:rgba(255,255,255,0.15);border:1px solid rgba(255,255,255,0.25);display:flex;align-items:center;justify-content:center;overflow:hidden}
 .login-logo-box img{width:100%;height:100%;object-fit:cover}
-.login-body{padding:22px 24px}
-.form-group{margin-bottom:14px}
-.form-label{display:block;font-size:12px;font-weight:600;color:#334155;margin-bottom:6px}
-.form-input{
-  width:100%;padding:10px 12px;font-size:14px;color:#0f172a;
-  background:#f8fafc;border:1px solid #cbd5e1;border-radius:8px;outline:none;transition:all 0.15s;
-}
-.form-input:focus{background:#ffffff;border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,0.15)}
-.btn-submit{
-  width:100%;padding:10px 14px;font-size:13.5px;font-weight:600;color:#ffffff;
-  background:#2563eb;border:none;border-radius:8px;cursor:pointer;transition:background 0.15s;
-}
-.btn-submit:hover{background:#1d4ed8}
-.err-box{
-  background:#fef2f2;border:1px solid #fecaca;
-  color:#dc2626;padding:9px 12px;border-radius:8px;font-size:12px;margin-bottom:14px;font-weight:500;
-}
-.sec-note{margin-top:16px;padding-top:12px;border-top:1px solid #e2e8f0;font-size:11px;color:#64748b;display:flex;justify-content:space-between}
-
-/* ==================== WHITE LIQUID GLASS 2026 + ROUNDED UNDERLINE TABS + DOWNLOAD FX v26 ==================== */
-:root{
-  --bg:#f4f7fb;
-  --surface:rgba(255,255,255,0.86);
-  --surface-sub:rgba(248,250,252,0.92);
-  --border:rgba(148,163,184,0.34);
-  --border-light:rgba(203,213,225,0.55);
-  --txt:#0f172a;
-  --txt-muted:#475569;
-  --blue:#0068ff;
-  --blue-hover:#0052cc;
-  --green:#10b981;
-  --red:#ef4444;
-  --amber:#f59e0b;
-  --indigo:#4f46e5;
-}
-html,body{
-  touch-action:manipulation;
-  -webkit-touch-callout:none;
-  -webkit-user-select:none;
-  user-select:none;
-  overscroll-behavior-y:none;
-  background:
-    radial-gradient(circle at 10% 12%, rgba(56,189,248,0.18) 0%, transparent 38%),
-    radial-gradient(circle at 88% 10%, rgba(99,102,241,0.15) 0%, transparent 40%),
-    radial-gradient(circle at 50% 90%, rgba(16,185,129,0.14) 0%, transparent 45%),
-    linear-gradient(180deg, #f8fafc 0%, #eef4ff 52%, #f1f5f9 100%) !important;
-  background-attachment:fixed !important;
-  color:var(--txt) !important;
-}
-input,textarea,code,pre{
-  -webkit-user-select:text;
-  user-select:text;
-  touch-action:manipulation;
-}
-.container{max-width:1200px !important;padding:10px 12px 32px !important}
-.header-bar,.visual-card,.status-strip,.live-cmd-banner,.kpi-box,.panel,.login-card{
-  background:linear-gradient(135deg, rgba(255,255,255,0.92) 0%, rgba(255,255,255,0.76) 100%) !important;
-  backdrop-filter:blur(28px) saturate(210%) !important;
-  -webkit-backdrop-filter:blur(28px) saturate(210%) !important;
-  border:1px solid rgba(255,255,255,0.95) !important;
-  outline:1px solid rgba(148,163,184,0.25) !important;
-  box-shadow:0 10px 30px -8px rgba(15,23,42,0.07), inset 0 1px 2px rgba(255,255,255,0.95) !important;
-  border-radius:20px !important;
-}
-.header-bar,.status-strip,.live-cmd-banner{
-  border-radius:18px !important;
-  padding:9px 14px !important;
-}
-.panel-hd{
-  background:linear-gradient(90deg, rgba(241,245,249,0.85) 0%, rgba(255,255,255,0.9) 100%) !important;
-  border-bottom:1px solid rgba(203,213,225,0.6) !important;
-  padding:9px 14px !important;
-}
-.panel-body{padding:10px 12px !important}
-
-/* THANH TAB CHỌN CHỨC NĂNG CÓ GẠCH DƯỚI BO TRÒN ĐẦY ĐỦ CHUẨN LIQUID GLASS 2026 */
-.nav-tabs{
-  background:rgba(255,255,255,0.82) !important;
-  backdrop-filter:blur(24px) saturate(200%) !important;
-  -webkit-backdrop-filter:blur(24px) saturate(200%) !important;
-  padding:6px 8px 10px !important;
-  border-radius:18px !important;
-  border:1px solid rgba(203,213,225,0.65) !important;
-  box-shadow:0 8px 24px -6px rgba(15,23,42,0.06), inset 0 1px 0 #ffffff !important;
-  gap:8px !important;
-}
-.nav-tab,.sub-tab{
-  position:relative !important;
-  overflow:visible !important;
-  border-radius:14px !important;
-  background:rgba(248,250,252,0.85) !important;
-  border:1px solid rgba(203,213,225,0.65) !important;
-  color:#334155 !important;
-  font-weight:700 !important;
-  padding:8px 12px 11px !important;
-  transition:all 0.22s cubic-bezier(0.16,1,0.3,1) !important;
-  box-shadow:0 2px 5px rgba(15,23,42,0.03), inset 0 1px 0 #ffffff !important;
-}
-.nav-tab:hover,.sub-tab:hover{
-  background:#ffffff !important;
-  color:#0068ff !important;
-  border-color:rgba(0,104,255,0.35) !important;
-  transform:translateY(-1px);
-}
-/* Thanh gạch dưới bo tròn đầy đủ (Rounded Bottom Underline Indicator) */
-.nav-tab::after,.sub-tab::after{
-  content:"";
-  position:absolute;
-  left:16%;
-  right:16%;
-  bottom:3px;
-  height:3.5px;
-  border-radius:9999px;
-  background:linear-gradient(90deg, #0068ff 0%, #06b6d4 50%, #4f46e5 100%);
-  transform:scaleX(0);
-  opacity:0;
-  transition:transform 0.26s cubic-bezier(0.22,1,0.36,1), opacity 0.22s ease;
-}
-.nav-tab:hover::after,.sub-tab:hover::after{
-  transform:scaleX(0.55);
-  opacity:0.55;
-}
-.nav-tab.active,.sub-tab.active{
-  background:linear-gradient(180deg, #ffffff 0%, #eff6ff 100%) !important;
-  color:#0068ff !important;
-  border-color:rgba(0,104,255,0.48) !important;
-  box-shadow:0 6px 16px -4px rgba(0,104,255,0.18), inset 0 1px 0 #ffffff !important;
-}
-.nav-tab.active::after,.sub-tab.active::after{
-  transform:scaleX(1);
-  opacity:1;
-  box-shadow:0 2px 8px rgba(0,104,255,0.45);
-}
-.nav-tab.active .tab-count{
-  background:linear-gradient(135deg, #0068ff 0%, #06b6d4 100%) !important;
-  color:#ffffff !important;
-}
-.tab-count{
-  border-radius:9999px !important;
-  background:#e2e8f0 !important;
-  color:#0f172a !important;
-  padding:2px 8px !important;
-}
-
-/* NÚT BẤM, Ô NHẬP & HIỆU ỨNG TẢI VỀ (DOWNLOAD ANIMATION FX) */
-.btn,.acc-pill,.badge,.inp,.sel,.chk-label,.form-input,.btn-submit{
-  border-radius:12px !important;
-  transition:all 0.2s cubic-bezier(0.16,1,0.3,1) !important;
-}
-.txt{
-  border-radius:14px !important;
-  background:#ffffff !important;
-  border:1px solid #cbd5e1 !important;
-  color:#0f172a !important;
-  padding:8px 12px !important;
-}
-.inp,.sel,.form-input{
-  background:#ffffff !important;
-  border:1px solid #cbd5e1 !important;
-  color:#0f172a !important;
-  padding:7px 11px !important;
-}
-.sel option{background:#ffffff;color:#0f172a}
-.inp:focus,.sel:focus,.txt:focus,.form-input:focus{
-  border-color:#0068ff !important;
-  box-shadow:0 0 0 3px rgba(0,104,255,0.15) !important;
-  background:#ffffff !important;
-}
-.btn,.acc-pill{
-  background:#ffffff !important;
-  border:1px solid #cbd5e1 !important;
-  color:#0f172a !important;
-  box-shadow:0 1px 2px rgba(15,23,42,0.04) !important;
-}
-.btn:hover,.acc-pill:hover{
-  background:#f8fafc !important;
-  border-color:#94a3b8 !important;
-  transform:translateY(-1px);
-}
-.btn-primary,.acc-pill.active,.btn-submit{
-  background:linear-gradient(135deg, #0068ff 0%, #2563eb 55%, #4f46e5 100%) !important;
-  border-color:#0052cc !important;
-  color:#ffffff !important;
-  box-shadow:0 5px 15px -3px rgba(0,104,255,0.35) !important;
-}
-.btn-success{
-  background:linear-gradient(135deg, #10b981 0%, #059669 100%) !important;
-  border-color:#059669 !important;
-  color:#ffffff !important;
-  box-shadow:0 5px 15px -3px rgba(16,185,129,0.32) !important;
-}
-.btn-danger{
-  background:linear-gradient(135deg, #ef4444 0%, #dc2626 100%) !important;
-  border-color:#dc2626 !important;
-  color:#ffffff !important;
-  box-shadow:0 5px 15px -3px rgba(239,68,68,0.32) !important;
-}
-@keyframes dlBounce2026{
-  0%,100%{transform:translateY(0)}
-  50%{transform:translateY(2.5px)}
-}
-@keyframes dlShimmer2026{
-  0%{background-position:-180% 0}
-  100%{background-position:180% 0}
-}
-.btn-download-fx{
-  position:relative;
-  overflow:hidden;
-  background:linear-gradient(90deg, #0068ff 0%, #06b6d4 50%, #0068ff 100%) !important;
-  background-size:200% 100% !important;
-  color:#ffffff !important;
-  border-color:#0284c7 !important;
-  animation:dlShimmer2026 3.2s infinite linear;
-  box-shadow:0 5px 14px -3px rgba(6,182,212,0.4) !important;
-}
-.btn-download-fx svg{
-  animation:dlBounce2026 1.2s infinite ease-in-out;
-}
-.chk-label{
-  background:rgba(248,250,252,0.92) !important;
-  border:1px solid #cbd5e1 !important;
-  color:#0f172a !important;
-  padding:6px 10px !important;
-}
-.list-item{
-  background:#ffffff !important;
-  border-bottom:1px solid #e2e8f0 !important;
-  border-radius:12px !important;
-  margin:3px 4px !important;
-}
-.list-item:hover{background:#f1f5f9 !important}
-.scroll-area{
-  background:rgba(248,250,252,0.75) !important;
-  border:1px solid #cbd5e1 !important;
-  border-radius:14px !important;
-}
-.data-table th{
-  background:#f1f5f9 !important;
-  color:#334155 !important;
-  border-bottom:1px solid #cbd5e1 !important;
-}
-.data-table td{
-  border-bottom:1px solid #e2e8f0 !important;
-  color:#0f172a !important;
-}
-.data-table tr:hover td{background:#f8fafc !important}
-.badge-blue{background:#dbeafe !important;color:#1d4ed8 !important;border-color:#93c5fd !important}
-.badge-green{background:#d1fae5 !important;color:#047857 !important;border-color:#6ee7b7 !important}
-.badge-red{background:#fee2e2 !important;color:#b91c1c !important;border-color:#fca5a5 !important}
-.badge-amber{background:#fef3c7 !important;color:#b45309 !important;border-color:#fcd34d !important}
-.badge-gray{background:#f1f5f9 !important;color:#334155 !important;border-color:#cbd5e1 !important}
-.brand-logo-wrap{border-radius:14px !important;border:2px solid #0068ff !important;background:#eff6ff !important}
-.acc-selector-bar{background:#f8fafc !important;border-radius:14px !important;padding:5px 8px !important;border:1px solid #cbd5e1 !important}
-.live-cmd-banner{background:linear-gradient(90deg, #eff6ff 0%, #ecfeff 100%) !important;color:#1e3a8a !important;border:1px solid #93c5fd !important}
-
-/* ==================== BỘ 4 GIAO DIỆN ĐỘC QUYỀN 2026 (4-THEME SWITCHER STUDIO) ==================== */
-body[data-theme="cyber"]{
-  background:
-    radial-gradient(circle at 12% 15%, rgba(6,182,212,0.28) 0%, transparent 42%),
-    radial-gradient(circle at 88% 12%, rgba(59,130,246,0.24) 0%, transparent 45%),
-    linear-gradient(180deg, #ecfeff 0%, #e0f2fe 52%, #f0f9ff 100%) !important;
-  --blue:#0284c7;
-  --indigo:#0369a1;
-}
-body[data-theme="cyber"] .header-bar,
-body[data-theme="cyber"] .panel,
-body[data-theme="cyber"] .visual-card,
-body[data-theme="cyber"] .kpi-box{
-  background:linear-gradient(135deg, rgba(240,249,255,0.92) 0%, rgba(224,242,254,0.82) 100%) !important;
-  border-color:rgba(56,189,248,0.55) !important;
-}
-body[data-theme="royal"]{
-  background:
-    radial-gradient(circle at 15% 15%, rgba(168,85,247,0.25) 0%, transparent 42%),
-    radial-gradient(circle at 85% 12%, rgba(236,72,153,0.22) 0%, transparent 42%),
-    linear-gradient(180deg, #faf5ff 0%, #f3e8ff 52%, #fdf2f8 100%) !important;
-  --blue:#7c3aed;
-  --indigo:#9333ea;
-}
-body[data-theme="royal"] .header-bar,
-body[data-theme="royal"] .panel,
-body[data-theme="royal"] .visual-card,
-body[data-theme="royal"] .kpi-box{
-  background:linear-gradient(135deg, rgba(250,245,255,0.92) 0%, rgba(243,232,255,0.82) 100%) !important;
-  border-color:rgba(192,132,252,0.55) !important;
-}
-body[data-theme="royal"] .btn-primary,
-body[data-theme="royal"] .acc-pill.active{
-  background:linear-gradient(135deg, #7c3aed 0%, #9333ea 55%, #db2777 100%) !important;
-  border-color:#6d28d9 !important;
-}
-body[data-theme="aurora"]{
-  background:
-    radial-gradient(circle at 12% 15%, rgba(56,189,248,0.20) 0%, transparent 40%),
-    radial-gradient(circle at 88% 12%, rgba(139,92,246,0.22) 0%, transparent 42%),
-    linear-gradient(180deg, #090d16 0%, #0f172a 52%, #1e1b4b 100%) !important;
-  color:#f8fafc !important;
-  --txt:#f8fafc;
-  --txt-muted:#94a3b8;
-  --border:rgba(148,163,184,0.28);
-}
-body[data-theme="aurora"] .header-bar,
-body[data-theme="aurora"] .visual-card,
-body[data-theme="aurora"] .status-strip,
-body[data-theme="aurora"] .kpi-box,
-body[data-theme="aurora"] .panel,
-body[data-theme="aurora"] .nav-tabs{
-  background:linear-gradient(135deg, rgba(15,23,42,0.88) 0%, rgba(30,41,59,0.78) 100%) !important;
-  border-color:rgba(99,102,241,0.38) !important;
-  outline-color:rgba(56,189,248,0.22) !important;
-  color:#f8fafc !important;
-  box-shadow:0 12px 32px rgba(0,0,0,0.45) !important;
-}
-body[data-theme="aurora"] .panel-hd,
-body[data-theme="aurora"] .data-table th,
-body[data-theme="aurora"] .scroll-area,
-body[data-theme="aurora"] .acc-selector-bar{
-  background:rgba(15,23,42,0.92) !important;
-  color:#e2e8f0 !important;
-  border-color:rgba(71,85,105,0.55) !important;
-}
-body[data-theme="aurora"] .nav-tab,
-body[data-theme="aurora"] .sub-tab,
-body[data-theme="aurora"] .btn,
-body[data-theme="aurora"] .acc-pill,
-body[data-theme="aurora"] .chk-label,
-body[data-theme="aurora"] .list-item{
-  background:rgba(30,41,59,0.92) !important;
-  color:#f1f5f9 !important;
-  border-color:rgba(100,116,139,0.48) !important;
-}
-body[data-theme="aurora"] .nav-tab.active,
-body[data-theme="aurora"] .sub-tab.active{
-  background:linear-gradient(180deg, rgba(30,58,138,0.95) 0%, rgba(15,23,42,0.95) 100%) !important;
-  color:#38bdf8 !important;
-  border-color:#38bdf8 !important;
-}
-body[data-theme="aurora"] .inp,
-body[data-theme="aurora"] .sel,
-body[data-theme="aurora"] .txt{
-  background:rgba(15,23,42,0.95) !important;
-  color:#f8fafc !important;
-  border-color:rgba(100,116,139,0.6) !important;
-}
-
-/* ZALO QR STUDIO VIỆT NAM — LASER SCANNER & 4-STEP TRACKER */
-.qr-studio-card{
-  background:linear-gradient(145deg, rgba(239,246,255,0.92) 0%, rgba(255,255,255,0.96) 100%);
-  border:1.5px solid rgba(0,104,255,0.35);
-  border-radius:18px;
-  padding:14px;
-  box-shadow:0 10px 28px -6px rgba(0,104,255,0.14);
-}
-body[data-theme="aurora"] .qr-studio-card{
-  background:linear-gradient(145deg, rgba(15,23,42,0.95) 0%, rgba(30,41,59,0.92) 100%);
-  border-color:rgba(56,189,248,0.45);
-}
-.qr-steps-bar{
-  display:grid;
-  grid-template-columns:repeat(4,1fr);
-  gap:6px;
-  margin-bottom:10px;
-}
-.qr-step-item{
-  padding:6px 4px;
-  border-radius:10px;
-  font-size:10.5px;
-  font-weight:700;
-  text-align:center;
-  background:rgba(226,232,240,0.7);
-  color:#475569;
-  border:1px solid rgba(148,163,184,0.35);
-  transition:all 0.25s ease;
-}
-.qr-step-item.active{
-  background:linear-gradient(135deg,#0068ff 0%,#06b6d4 100%);
-  color:#ffffff;
-  border-color:#0052cc;
-  box-shadow:0 4px 12px rgba(0,104,255,0.3);
-}
-.qr-step-item.done{
-  background:#d1fae5;
-  color:#047857;
-  border-color:#6ee7b7;
-}
-@keyframes qrLaserScan{
-  0%{top:6%}
-  50%{top:90%}
-  100%{top:6%}
-}
-.qr-frame{
-  position:relative;
-  overflow:hidden;
-  width:236px;
-  height:236px;
-  margin:10px auto;
-  padding:10px;
-  background:#ffffff;
-  border:2.5px solid #0068ff;
-  border-radius:18px;
-  box-shadow:0 12px 30px -6px rgba(0,104,255,0.28);
-}
-.qr-laser-line{
-  position:absolute;
-  left:8px;
-  right:8px;
-  height:2.5px;
-  background:linear-gradient(90deg,transparent 0%,#0068ff 20%,#06b6d4 50%,#0068ff 80%,transparent 100%);
-  box-shadow:0 0 10px #0068ff, 0 0 20px #06b6d4;
-  animation:qrLaserScan 2.6s ease-in-out infinite;
-  pointer-events:none;
-}
-.theme-switcher-pills{
-  display:inline-flex;
-  align-items:center;
-  gap:4px;
-  background:rgba(241,245,249,0.9);
-  padding:3px 5px;
-  border-radius:12px;
-  border:1px solid rgba(148,163,184,0.35);
-}
-.theme-dot-btn{
-  padding:4px 8px;
-  border-radius:9px;
-  border:1px solid transparent;
-  font-size:11px;
-  font-weight:700;
-  cursor:pointer;
-  background:transparent;
-  color:#334155;
-  transition:all 0.18s ease;
-}
-.theme-dot-btn.active{
-  background:#0068ff;
-  color:#ffffff;
-  box-shadow:0 2px 6px rgba(0,104,255,0.3);
-}
-
+.login-banner h1{font-size:18px;font-weight:600;color:#fff;margin:0}
+.login-banner p{font-size:12px;color:rgba(255,255,255,0.75);margin:2px 0 0}
+.login-body{padding:24px}
+.form-group{margin-bottom:16px}
+.form-group label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px;font-weight:500}
+.form-group input{width:100%;padding:11px 14px;background:rgba(255,255,255,0.06);border:1px solid var(--border);border-radius:10px;color:var(--txt);font-size:14px;outline:none}
+.form-group input:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(59,130,246,0.25)}
+.btn-login{width:100%;padding:12px;background:var(--blue);color:#fff;border:none;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;margin-top:8px;transition:filter .15s}
+.btn-login:hover{filter:brightness(1.1)}
+.error-msg{background:rgba(239,68,68,0.15);border:1px solid rgba(239,68,68,0.3);color:#fca5a5;padding:10px 12px;border-radius:8px;font-size:13px;margin-bottom:14px}
 </style>
 </head>
 <body>
-  <div class="login-card">
-    <div class="login-banner">
-      <div class="login-logo-box">
-        <img src="/api/logo?v={{ logo_ts }}" alt="Logo">
-      </div>
-      <div style="z-index:1">
-        <div style="font-size:16px;font-weight:700;letter-spacing:-0.2px">{{ custom_title if custom_title else 'Trung Tâm Điều Khiển Đa Tài Khoản' }}</div>
-        <div style="font-size:11.5px;color:#93c5fd;margin-top:3px">Quản lý đa tài khoản • Tốc độ 0s ổn định</div>
-      </div>
-    </div>
-    <div class="login-body">
-      {% if error %}<div class="err-box">{{ error }}</div>{% endif %}
-      <form method="POST" action="/login">
-        <div class="form-group">
-          <label class="form-label">Mật khẩu truy cập</label>
-          <input class="form-input" type="password" name="password" placeholder="Nhập mật khẩu..." required autofocus>
-        </div>
-        <button class="btn-submit" type="submit">Đăng Nhập Bảng Điều Khiển</button>
-      </form>
-      <div class="sec-note">
-        <span>Bảo mật phiên PBKDF2</span>
-        <span>Hỗ trợ Đa Luồng 100 Acc</span>
-      </div>
-    </div>
+<div class="login-card">
+  <div class="login-banner">
+    <div class="login-logo-box">{% if has_logo %}<img src="/static/logo.png?t={{ logo_ts }}" alt="logo">{% else %}<span style="font-size:22px;font-weight:700;color:#fff">AK</span>{% endif %}</div>
+    <div><h1>{{ custom_title if custom_title else 'Điều khiển' }}</h1><p>Đăng nhập để tiếp tục</p></div>
   </div>
+  <div class="login-body">
+    {% if error %}<div class="error-msg">{{ error }}</div>{% endif %}
+    <form method="POST">
+      <div class="form-group"><label>Mật khẩu</label><input type="password" name="password" required autofocus placeholder="Nhập mật khẩu"></div>
+      <button type="submit" class="btn-login">Đăng nhập</button>
+    </form>
+  </div>
+</div>
 </body>
-</html>"""
-
+</html>
+"""
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="vi">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,minimum-scale=1.0,user-scalable=no,viewport-fit=cover">
-<title>{{ custom_title if custom_title else 'Bảng Điều Khiển Đa Tài Khoản' }}</title>
+<title>{{ custom_title if custom_title else 'Điều khiển' }}</title>
 <style>
 :root{
-  --bg:#f1f5f9;
-  --surface:#ffffff;
-  --surface-sub:#f8fafc;
-  --border:#cbd5e1;
-  --border-light:#e2e8f0;
-  --txt:#0f172a;
-  --txt-muted:#475569;
-  --blue:#2563eb;
-  --blue-hover:#1d4ed8;
-  --green:#16a34a;
-  --red:#dc2626;
-  --amber:#d97706;
-  --indigo:#4f46e5;
+  --bg:#070b14!important;--surface:rgba(255,255,255,0.06)!important;--border:rgba(255,255,255,0.1)!important;
+  --txt:#f1f5f9!important;--txt-muted:#94a3b8!important;--blue:#3b82f6!important;--green:#22c55e!important;--red:#ef4444!important;
+  --glass:rgba(255,255,255,0.07)!important;--blur:20px!important;--radius:14px!important;
+
+/* === APP-LIKE VIP EFFECTS  === */
+.header-bar{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;margin-bottom:12px}
+.btn,.action-btn,button{position:relative;overflow:hidden;transition:all .18s cubic-bezier(.4,0,.2,1)!important}
+.btn:active,button:active{transform:scale(0.97)!important}
+.btn::after{content:"";position:absolute;inset:0;background:linear-gradient(120deg,transparent,rgba(255,255,255,0.15),transparent);transform:translateX(-100%);transition:transform .4s}
+.btn:hover::after{transform:translateX(100%)}
+.card,.panel,.box-card,.stat-card{transition:transform .2s,box-shadow .2s}
+.card:hover,.panel:hover,.box-card:hover{transform:translateY(-2px);box-shadow:0 16px 48px rgba(0,0,0,0.45)!important}
+input,select,textarea{transition:border .15s,box-shadow .15s}
+.tab-bar{display:flex;gap:4px;padding:4px;background:rgba(255,255,255,0.04);border-radius:12px;border:1px solid rgba(255,255,255,0.08)}
+.badge{letter-spacing:.02em}
+/* Make main content feel denser and app-like */
+.container{padding-top:10px}
+
 }
+html,body{background:radial-gradient(ellipse at 25% 0%,#1e293b 0%,#070b14 50%)!important;color:#f1f5f9!important}
+.header-bar,.card,.panel,.box-card,.stat-card,.qr-panel,.section-card,.login-panel{
+  background:rgba(255,255,255,0.07)!important;backdrop-filter:blur(20px)!important;-webkit-backdrop-filter:blur(20px)!important;
+  border:1px solid rgba(255,255,255,0.1)!important;border-radius:14px!important;box-shadow:0 12px 40px rgba(0,0,0,0.4)!important}
+.btn,button.btn,.action-btn,button[type=submit]{background:#3b82f6!important;color:#fff!important;border:none!important;border-radius:10px!important;padding:9px 16px!important;font-weight:500!important}
+.btn-ghost,.btn-secondary{background:transparent!important;border:1px solid rgba(255,255,255,0.15)!important;color:#f1f5f9!important}
+input,select,textarea{background:rgba(255,255,255,0.06)!important;border:1px solid rgba(255,255,255,0.12)!important;color:#f1f5f9!important;border-radius:10px!important}
+input:focus,select:focus,textarea:focus{border-color:#3b82f6!important;box-shadow:0 0 0 3px rgba(59,130,246,0.25)!important}
+h1,h2,h3,h4,label,span,p{color:#f1f5f9!important}
+.txt-muted,.text-muted{color:#94a3b8!important}
+
+:root{
+  --bg:#0b0f19;
+  --surface:rgba(255,255,255,0.07);
+  --surface-sub:rgba(255,255,255,0.04);
+  --border:rgba(255,255,255,0.12);
+  --border-light:rgba(255,255,255,0.08);
+  --txt:#f1f5f9;
+  --txt-muted:#94a3b8;
+  --blue:#3b82f6;
+  --blue-hover:#2563eb;
+  --green:#22c55e;
+  --red:#ef4444;
+  --amber:#f59e0b;
+  --indigo:#6366f1;
+  --glass:rgba(255,255,255,0.08);
+  --blur:18px;
+  --radius:12px;
+  --shadow:0 8px 32px rgba(0,0,0,0.35);
+}
+body{background:radial-gradient(ellipse at 20% 0%,#1e293b 0%,#0b0f19 55%)!important;color:#f1f5f9!important}
+.header-bar,.card,.panel,.box-card,.stat-card,.qr-panel,.login-panel{
+  background:rgba(255,255,255,0.07)!important;
+  backdrop-filter:blur(18px)!important;-webkit-backdrop-filter:blur(18px)!important;
+  border:1px solid rgba(255,255,255,0.12)!important;
+  border-radius:14px!important;
+  box-shadow:0 8px 32px rgba(0,0,0,0.35)!important;
+}
+.btn,button[type=submit],.action-btn,.btn-primary{
+  background:#3b82f6!important;color:#fff!important;border:none!important;
+  border-radius:10px!important;padding:9px 16px!important;font-weight:500!important;
+  transition:all .15s!important;
+}
+.btn:hover,button[type=submit]:hover{filter:brightness(1.12)!important;transform:translateY(-1px)}
+.btn-ghost,.btn-secondary{background:transparent!important;border:1px solid rgba(255,255,255,0.15)!important;color:#f1f5f9!important}
+input,select,textarea{
+  background:rgba(255,255,255,0.08)!important;border:1px solid rgba(255,255,255,0.15)!important;
+  color:#f1f5f9!important;border-radius:10px!important;
+}
+input:focus,select:focus,textarea:focus{border-color:#3b82f6!important;box-shadow:0 0 0 3px rgba(59,130,246,0.25)!important}
+
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{
   width:100%;max-width:100vw;overflow-x:hidden;
@@ -13418,7 +13101,7 @@ body[data-theme="dark_aurora"] .qr-studio-card{
 }
 
 
-/* ==================== 3D ULTRA VIP HOLOGRAM & HORIZONTAL MENU BANNER v28 ==================== */
+/* ==================== 3D ULTRA VIP HOLOGRAM & HORIZONTAL MENU BANNER  ==================== */
 @keyframes float3DCard {
   0%, 100% { transform: translateY(0px) rotateX(0deg); }
   50% { transform: translateY(-4px) rotateX(1.2deg); }
@@ -16780,7 +16463,7 @@ def api_telegram_restart():
     try:
         from get_ck_im_zalo import start_background_telegram_bot, get_telegram_bot_status
         _TELEGRAM_BOT_RUNNER = start_background_telegram_bot(TELEGRAM_BOT_TOKEN, force_restart=True)
-        time.sleep(0.6)
+        time.sleep(0.18)
         st = get_telegram_bot_status()
         return jsonify({"ok": True, "message": "🤖 Đã khởi động lại Bot Telegram & gỡ bỏ Webhook xung đột thành công!", **st})
     except Exception as e:
@@ -17099,7 +16782,7 @@ def api_messenger_verify_cookie():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 400
 
-_ROOM_SCAN_POOL = ThreadPoolExecutor(max_workers=32)
+_ROOM_SCAN_POOL = ThreadPoolExecutor(max_workers=128)
 
 @app.route("/api/messenger_threads")
 def api_messenger_threads():
