@@ -1,6 +1,6 @@
 """
-zalo_login.py — Module Đăng Nhập QR Zalo PC & Duy Trì Phiên Thiết Bị (v30)
-- Hỗ trợ 13+ cấu hình máy tính Việt Nam (Mac M3/M4, Surface, Fedora, Windows 11, ROG, MSI...) (Mac OS Việt Nam, MacBook Pro/Air/Studio, Windows 11 Pro, Linux, Firefox).
+zalo_login.py — Module Đăng Nhập QR Zalo PC & Duy Trì Phiên Thiết Bị (v29)
+- Hỗ trợ 12 cấu hình máy tính (Mac OS Việt Nam, MacBook Pro/Air/Studio, Windows 11 Pro, Linux, Firefox).
 - Tạo địa chỉ MAC chuẩn OUI (Apple, Intel, ASUS, Dell, MSI) định vị tại Việt Nam.
 - Đồng bộ CookieJar tự nhiên của requests.Session giúp quét QR hiện ngay yêu cầu đăng nhập trên điện thoại.
 - Khóa nhất quán computer_name giữa bước xác nhận QR, getServerInfo, getLoginInfo và bộ giữ kết nối WebSocket 24/7,
@@ -302,58 +302,6 @@ REGION_ALIAS_MAP = {
     "singapore": "sg_vip",
     "sg_vip": "sg_vip",
     "sg_firefox": "sg_vip",
-
-    "vn_mac_pro_m4": {
-        "region_code": "vn_mac_pro_m4",
-        "region": "MAC_PRO_M4_VN",
-        "region_label": "MacBook Pro 16 M4 Max — Hà Nội, Việt Nam",
-        "vn_location": "Hà Nội, Việt Nam",
-        "vn_isp": "FPT / VNPT Fiber",
-        "pc_prefix": "MacBook-Pro-M4-VN",
-        "computer_name": "MacBook Pro M4 Max (macOS Sequoia VN)",
-        "os_label": "macOS Sequoia 15.2 VN",
-        "vendor": "apple",
-        "tz": "Asia/Ho_Chi_Minh",
-        "country": "VN",
-        "ip_prefixes": ["14.231", "171.224", "27.67", "113.185"],
-        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_1_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15",
-        "sec_ch_ua": '"Not_A Brand";v="24"',
-        "sec_platform": '"macOS"',
-    },
-    "vn_surface": {
-        "region_code": "vn_surface",
-        "region": "SURFACE_VN",
-        "region_label": "Microsoft Surface Laptop 7 — TP.HCM, Việt Nam",
-        "vn_location": "TP. Hồ Chí Minh, Việt Nam",
-        "vn_isp": "Viettel Fiber",
-        "pc_prefix": "SURFACE-LAPTOP-VN",
-        "computer_name": "Surface Laptop 7 (Windows 11 VN)",
-        "os_label": "Windows 11 Pro 24H2 VN",
-        "vendor": "intel",
-        "tz": "Asia/Ho_Chi_Minh",
-        "country": "VN",
-        "ip_prefixes": ["14.161", "115.79", "27.75"],
-        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
-        "sec_ch_ua": '"Microsoft Edge";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-        "sec_platform": '"Windows"',
-    },
-    "vn_linux_fedora": {
-        "region_code": "vn_fedora",
-        "region": "FEDORA_VN",
-        "region_label": "Fedora 41 Workstation — Đà Nẵng, Việt Nam",
-        "vn_location": "Đà Nẵng, Việt Nam",
-        "vn_isp": "VNPT",
-        "pc_prefix": "fedora-vn",
-        "computer_name": "Fedora-41-Workstation-VN",
-        "os_label": "Fedora Linux 41",
-        "vendor": "intel",
-        "tz": "Asia/Ho_Chi_Minh",
-        "country": "VN",
-        "ip_prefixes": ["113.176", "14.177"],
-        "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-        "sec_platform": '"Linux"',
-    },
 }
 
 
@@ -830,7 +778,7 @@ def _execute_qr_login_sync(emit_event_fn, qr_callback=None, timeout=110, custom_
     """Thực thi luồng tạo & quét QR Zalo chuẩn xác:
     - Để `requests.Session` tự quản lý CookieJar tự nhiên trong suốt quá trình `logininfo` -> `verify-client` -> `qr/generate` -> `waiting-scan` -> `waiting-confirm`
       giúp khi điện thoại quét QR là hiện ngay thông báo yêu cầu đăng nhập thiết bị mới!
-    - Sau khi bấm 'Đăng nhập' trên điện thoại: kích hoạt phiên máy tính NGAY, ghim vào 'Thiết bị đang đăng nhập' (trên mục đã đăng xuất), KHÔNG extract cookie rồi logout PC. SessionKeeper giữ sống 24/7 với computer_name + MAC cố định."""
+    - Sau khi bấm 'Đăng nhập' trên điện thoại, kích hoạt phiên máy tính và ghim trực tiếp vào 'Thiết bị đang đăng nhập'."""
     eff_reg = vn_region or region_code or "vn_mac"
     eff_proxy = proxy_vn or vn_proxy or ""
     vn_id = build_vietnam_pc_identity(region_code=eff_reg, vn_region=eff_reg, custom_pc_name=custom_pc_name or "")
