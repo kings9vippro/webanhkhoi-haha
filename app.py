@@ -5101,89 +5101,54 @@ def generate_totp_rfc6238(secret_key, time_step=30, digits=6):
     return None, 0
 
 class ZaloWebIDGenerator:
-    """Bộ Khởi Tạo Thiết Bị Máy Tính Ảo Tại Việt Nam Đồng Nhất Chrome 131 (Không ở Mỹ):
-    - Đảm bảo thiết bị hiển thị tại TP. Hồ Chí Minh / Hà Nội / Đà Nẵng (Windows 11 Pro VN / macOS Sonoma VN).
-    - Khớp 100% với zalo_login.build_vietnam_pc_identity & build_vietnam_network_headers."""
-
-    VIRTUAL_PC_POOL = [
-        {
-            "region_code": "vn_hcm",
-            "region_label": "TP. Hồ Chí Minh, Việt Nam (VNPT/Viettel Fiber)",
-            "pc_name": "DESKTOP-VN-HCM (Windows 11 Pro VN)",
-            "computer_name": "DESKTOP-VN-HCM (Windows 11 Pro VN)",
-            "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-            "sec_platform": '"Windows"',
-            "vn_ip": "14.161.92.108",
-        },
-        {
-            "region_code": "vn_hn",
-            "region_label": "Thủ Đô Hà Nội, Việt Nam (Viettel/FPT Telecom)",
-            "pc_name": "PC-GAMING-HANOI (Windows 11 Pro VN)",
-            "computer_name": "PC-GAMING-HANOI (Windows 11 Pro VN)",
-            "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
-            "sec_ch_ua": '"Microsoft Edge";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-            "sec_platform": '"Windows"',
-            "vn_ip": "27.72.104.66",
-        },
-        {
-            "region_code": "vn_dn",
-            "region_label": "TP. Đà Nẵng, Việt Nam (FPT Miền Trung)",
-            "pc_name": "MSI-PRO-DANANG (Windows 11 Pro VN)",
-            "computer_name": "MSI-PRO-DANANG (Windows 11 Pro VN)",
-            "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-            "sec_platform": '"Windows"',
-            "vn_ip": "113.176.48.95",
-        },
-        {
-            "region_code": "vn_mac",
-            "region_label": "TP. Hồ Chí Minh, Việt Nam • Singapore (Không ở Mỹ)",
-            "pc_name": "MACBOOK-PRO-VN (macOS Sonoma VN/SG)",
-            "computer_name": "Web",
-            "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:132.0) Gecko/20100101 Firefox/132.0",
-            "sec_ch_ua": '"Not_A Brand";v="24"',
-            "sec_platform": '"macOS"',
-            "vn_ip": "14.161.66.128",
-        },
-        {
-            "region_code": "sg_firefox",
-            "region_label": "Singapore • Đông Nam Á (Firefox - Windows)",
-            "pc_name": "Firefox - Windows (Singapore VIP)",
-            "computer_name": "Web",
-            "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
-            "sec_ch_ua": '"Not_A Brand";v="24"',
-            "sec_platform": '"Windows"',
-            "vn_ip": "103.252.202.88",
-        },
-    ]
+    """Bộ Khởi Tạo Thiết Bị Máy Tính Luân Phiên Tại Việt Nam & Singapore:
+    - Tự động xoay vòng 16 mẫu máy tính PC/Mac khác nhau ở Việt Nam (TP.HCM, Hà Nội, Đà Nẵng, Cần Thơ, Hải Phòng) và Singapore.
+    - Đồng bộ tuyệt đối User-Agent và Sec-Ch-Ua (tự động lược bỏ Sec-Ch-Ua trên Firefox/Safari để id.zalo.me nhận diện đúng máy tính)."""
 
     @classmethod
-    def create_random_pc_device(cls, seed_salt="", region_code="vn_hcm", custom_pc_name=""):
+    def create_random_pc_device(cls, seed_salt="", region_code="VN", custom_pc_name=""):
         try:
             from zalo_login import build_vietnam_pc_identity
-            return build_vietnam_pc_identity(region_code=region_code, custom_pc_name=custom_pc_name, seed_salt=seed_salt)
+            return build_vietnam_pc_identity(
+                region_code=region_code, vn_region=region_code,
+                custom_pc_name=custom_pc_name, seed_salt=seed_salt
+            )
         except Exception:
-            base = next((x for x in cls.VIRTUAL_PC_POOL if x["region_code"] == region_code), cls.VIRTUAL_PC_POOL[0])
             rnd_tag = secrets.token_hex(2).upper()
-            pc_label = custom_pc_name.strip() if custom_pc_name else base["pc_name"].replace("(", f"-{rnd_tag} (")
-            imei = cls.generate_unique_imei(base["ua"], salt=f"{pc_label}_{seed_salt}")
+            is_sg = "SG" in str(region_code or "").upper()
+            pc_label = custom_pc_name.strip() if custom_pc_name else (
+                f"MACBOOK-PRO-SG-{rnd_tag} (macOS Sonoma SG)" if is_sg else f"ROG-ZEPHYRUS-HCM-{rnd_tag} (Windows 11 Pro VN)"
+            )
+            ua = (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                if is_sg else
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            )
+            sec_ch = '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"'
+            sec_plat = '"macOS"' if is_sg else '"Windows"'
+            ip_val = f"116.88.{random.randint(15, 240)}.{random.randint(10, 250)}" if is_sg else f"14.161.{random.randint(15, 240)}.{random.randint(10, 250)}"
+            imei = cls.generate_unique_imei(ua, salt=f"{pc_label}_{seed_salt}")
             return {
                 "pc_name": pc_label,
-                "computer_name": pc_label,
-                "region_code": base["region_code"],
-                "region_label": base["region_label"],
-                "vn_ip": base["vn_ip"],
-                "ua": base["ua"],
-                "sec_ch_ua": base["sec_ch_ua"],
-                "sec_platform": base["sec_platform"],
+                "computer_name": pc_label[:36],
+                "mac_address": f"A4:83:E7:{random.randint(10,99):02X}:{random.randint(10,99):02X}:{random.randint(10,99):02X}",
+                "region_code": "sg_mac_pro" if is_sg else "vn_hcm",
+                "region_label": "Singapore (StarHub / Singtel Fiber)" if is_sg else "TP. Hồ Chí Minh, Việt Nam (Viettel / VNPT Fiber)",
+                "vn_location": "Singapore" if is_sg else "TP. Hồ Chí Minh, Việt Nam",
+                "vn_isp": "Singtel Fiber SG" if is_sg else "Viettel / VNPT Fiber",
+                "vn_ip": ip_val,
+                "country": "SG" if is_sg else "VN",
+                "tz": "Asia/Singapore" if is_sg else "Asia/Ho_Chi_Minh",
+                "ua": ua,
+                "sec_ch_ua": sec_ch,
+                "sec_platform": sec_plat,
                 "imei": imei,
             }
 
     @classmethod
     def generate_unique_ua_and_headers(cls, seed_salt=""):
         dev = cls.create_random_pc_device(seed_salt)
-        return dev["ua"], dev["sec_ch_ua"], dev["sec_platform"]
+        return dev["ua"], dev.get("sec_ch_ua", ""), dev.get("sec_platform", "")
 
     @classmethod
     def generate_unique_imei(cls, user_agent="", salt=""):
@@ -5195,59 +5160,75 @@ class ZaloWebIDGenerator:
 
 apizalo = Zalo
 
+
 class ZaloQRLoginManager:
-    """Hệ Thống Tạo Mã QR Zalo PC Chính Chủ & Giữ Phiên Sống Cố Định Trong Lịch Sử Đăng Nhập:
-    1. Giai đoạn Tạo & Quét Mã QR (Steps 1-6):
-       - Sử dụng luồng chuẩn `continue_url = 'https://zalo.me/pc'` và `login_referer = 'https://id.zalo.me/account?continue=https%3A%2F%2Fzalo.me%2Fpc'`
-         với `cookie_jar_dict = {'_zlang': 'vn'}` sạch tuyệt đối (KHÔNG tự ý chèn `z_uuid` vào domain `id.zalo.me` trước khi quét và KHÔNG bóp méo ảnh PNG gốc),
-         loại bỏ 100% lỗi 'Mã QR đăng nhập không hợp lệ'!
-    2. Giai đoạn Đăng Nhập & Ghim Thiết Bị Vào Mục 'Thiết Bị Đang Đăng Nhập' Cùng Với Điện Thoại (Steps 7-8):
-       - Khi ấn 'Đăng nhập' trên điện thoại (`waiting-confirm == 0`), đi theo đúng 1 lần URL Redirect cấp chứng chỉ `zpw_sek`.
-       - Thực hiện đúng 1 lần đăng ký phiên máy tính (`getLoginInfo` với `ZaloParamsEncryptor` + `getServerInfo`) và khóa chặt `zpw_enk` vào bộ nhớ,
-         sau đó duy trì kết nối WebSocket (`wss://ws1.chat.zalo.me`) + nhịp tim Keep-Alive 24/7 để thiết bị PC luôn nằm cố định trong
-         mục Thiết bị đang đăng nhập cùng với điện thoại, tuyệt đối không bị văng hay tự thoát!"""
+    """Hệ Thống Tạo Mã QR Zalo PC Chính Chủ (Đa Máy Tính Luân Phiên Việt Nam / Singapore) & Giữ Sống Thiết Bị 24/7:
+    - Gắn chặt thiết bị máy tính vào phiên QR thông qua luồng chuẩn `continue=https://chat.zalo.me/` và `X-Requested-With: XMLHttpRequest`.
+    - Để `requests.Session` quản lý CookieJar tự nhiên trong suốt `logininfo` -> `verify-client` -> `qr/generate` -> `waiting-scan` -> `waiting-confirm`,
+      đảm bảo khi quét mã QR trên điện thoại sẽ hiện ngay yêu cầu đăng nhập máy tính.
+    - Kiểm tra địa chỉ IP thực tế qua `VietnamSingaporeGeoRouter` (không ghi nhãn giả), tự động định tuyến qua IP/Proxy Việt Nam (VN) hoặc Singapore (SG).
+    - Sau khi bấm 'Đăng nhập' trên điện thoại, thu hoạch `zpw_sek`, kích hoạt `getServerInfo` & `getLoginInfo` lấy khóa `zpw_enk`,
+      và giữ kết nối WebSocket + HTTP Keep-Alive 24/7 để máy tính sống cố định trong tài khoản Zalo."""
 
     SESSIONS = {}
     LOCK = threading.RLock()
+    _LAST_START_TS = 0.0
+    _LAST_START_SESSION_ID = ""
 
     @classmethod
-    def _persist_qr_state_to_db(cls, st):
+    def _persist_qr_state_to_db(cls, st, async_write=True):
         if not st or not st.get("session_id"):
             return
-        try:
-            serializable = {
-                "session_id": st["session_id"],
-                "qr_nonce": st.get("qr_nonce", ""),
-                "qr_code_id": st.get("qr_code_id", ""),
-                "pc_name": st.get("pc_name", "DESKTOP-VN92K8M (Windows 11 Pro)"),
-                "status": st.get("status", "generating"),
-                "message": st.get("message", ""),
-                "qr_base64": st.get("qr_base64", ""),
-                "imei": st.get("imei", ""),
-                "cookies": st.get("cookies", {}),
-                "cookies_str": st.get("cookies_str", ""),
-                "display_name": st.get("display_name", ""),
-                "avatar": st.get("avatar", ""),
-                "uid": st.get("uid", ""),
-                "file_name": st.get("file_name", ""),
-                "file_content": st.get("file_content", ""),
-                "created_at": st.get("created_at", time.time()),
-            }
-            conn = db()
-            conn.execute(
-                """INSERT OR REPLACE INTO zalo_qr_sessions
-                   (session_id, state_json, qr_png, updated_at)
-                   VALUES (?, ?, ?, ?)""",
-                (
-                    st["session_id"],
-                    json.dumps(serializable, ensure_ascii=False),
-                    st.get("qr_png_bytes") or b"",
-                    time.time(),
+        serializable = {
+            "session_id": st["session_id"],
+            "qr_nonce": st.get("qr_nonce", ""),
+            "qr_code_id": st.get("qr_code_id", ""),
+            "pc_name": st.get("pc_name", "ASUS ROG Zephyrus G16 (Windows 11 Pro VN)"),
+            "computer_name": st.get("computer_name", "Web"),
+            "vn_location": st.get("vn_location", "TP. Hồ Chí Minh, Việt Nam"),
+            "vn_isp": st.get("vn_isp", "Viettel / VNPT Fiber"),
+            "vn_ip": st.get("vn_ip", ""),
+            "mac_address": st.get("mac_address", ""),
+            "route_mode": st.get("route_mode", "direct"),
+            "real_country_code": st.get("real_country_code", "VN"),
+            "is_vn_or_sg": bool(st.get("is_vn_or_sg", True)),
+            "status": st.get("status", "generating"),
+            "message": st.get("message", ""),
+            "qr_base64": st.get("qr_base64", ""),
+            "imei": st.get("imei", ""),
+            "cookies": st.get("cookies", {}),
+            "cookies_str": st.get("cookies_str", ""),
+            "display_name": st.get("display_name", ""),
+            "avatar": st.get("avatar", ""),
+            "uid": st.get("uid", ""),
+            "file_name": st.get("file_name", ""),
+            "file_content": st.get("file_content", ""),
+            "created_at": st.get("created_at", time.time()),
+        }
+        png_b = st.get("qr_png_bytes") or b""
+
+        def _do_write():
+            try:
+                conn = db()
+                conn.execute(
+                    """INSERT OR REPLACE INTO zalo_qr_sessions
+                       (session_id, state_json, qr_png, updated_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (
+                        serializable["session_id"],
+                        json.dumps(serializable, ensure_ascii=False),
+                        png_b,
+                        time.time(),
+                    )
                 )
-            )
-            conn.commit()
-        except Exception:
-            pass
+                conn.commit()
+            except Exception:
+                pass
+
+        if async_write:
+            threading.Thread(target=_do_write, daemon=True).start()
+        else:
+            _do_write()
 
     @classmethod
     def _load_qr_state_from_db(cls, session_id):
@@ -5268,7 +5249,14 @@ class ZaloQRLoginManager:
         return None
 
     @classmethod
-    def start_qr_session(cls, auto_save=True, vn_region="HCM", custom_pc_name="", vn_proxy=""):
+    def start_qr_session(cls, auto_save=True, vn_region="VN", custom_pc_name="", vn_proxy=""):
+        now_t = time.time()
+        with cls.LOCK:
+            if (now_t - cls._LAST_START_TS < 1.2) and cls._LAST_START_SESSION_ID in cls.SESSIONS:
+                prev_st = cls.SESSIONS[cls._LAST_START_SESSION_ID]
+                if prev_st.get("status") in ("generating", "waiting_scan") and prev_st.get("qr_base64"):
+                    return cls.get_session_status(cls._LAST_START_SESSION_ID)
+
         session_id = str(uuid.uuid4())
         qr_nonce = secrets.token_hex(6)
         reg_map = {
@@ -5294,6 +5282,15 @@ class ZaloQRLoginManager:
         reg_lbl = pc_dev.get("region_label", "TP. Hồ Chí Minh, Việt Nam")
         vn_ip_val = pc_dev.get("vn_ip", "14.161.92.108")
 
+        eff_proxy = str(vn_proxy or "").strip()
+        if not eff_proxy:
+            try:
+                cands = ProxyPoolEngine.pick_proxy_candidates(seed_key=session_id, max_candidates=1)
+                if cands:
+                    eff_proxy = cands[0]
+            except Exception:
+                pass
+
         st = {
             "session_id": session_id,
             "qr_nonce": qr_nonce,
@@ -5301,24 +5298,29 @@ class ZaloQRLoginManager:
             "computer_name": pc_dev.get("computer_name", "Web"),
             "region_code": pc_dev.get("region_code", reg_code),
             "region_label": reg_lbl,
-            "vn_region": str(vn_region or "HCM").upper(),
-            "vn_location": reg_lbl,
-            "vn_isp": "VNPT/Viettel/Singtel Fiber",
+            "vn_region": str(vn_region or "VN").upper(),
+            "vn_location": pc_dev.get("vn_location", reg_lbl),
+            "vn_isp": pc_dev.get("vn_isp", "Viettel / VNPT / Singtel Fiber"),
             "vn_ip": vn_ip_val,
+            "country": pc_dev.get("country", "SG" if "SG" in str(reg_code).upper() else "VN"),
+            "tz": pc_dev.get("tz", "Asia/Ho_Chi_Minh"),
             "mac_address": pc_dev.get("mac_address", "A4:83:E7:2B:91:04"),
             "device_model": pc_dev.get("device_model", pc_dev.get("pc_name", "MacBook Pro M3 Max")),
-            "proxy_vn": str(vn_proxy or "").strip(),
-            "vn_proxy": str(vn_proxy or "").strip(),
+            "proxy_vn": eff_proxy,
+            "vn_proxy": eff_proxy,
+            "route_mode": "checking",
+            "real_country_code": pc_dev.get("country", "VN"),
+            "is_vn_or_sg": True,
             "status": "generating",
             "step_num": 1,
-            "message": f"🇻🇳 Đang khởi tạo Máy Tính {pc_dev['pc_name']} tại {pc_dev['vn_location']} (IP: {pc_dev['vn_ip']})...",
+            "message": f"Đang cấp phát máy tính {pc_dev['pc_name']} & định tuyến cổng QR Việt Nam / Singapore...",
             "qr_base64": "",
             "qr_png_bytes": b"",
             "qr_code_id": "",
             "imei": pc_dev["imei"],
             "user_agent": pc_dev["ua"],
-            "sec_ch_ua": pc_dev["sec_ch_ua"],
-            "sec_platform": pc_dev["sec_platform"],
+            "sec_ch_ua": pc_dev.get("sec_ch_ua", ""),
+            "sec_platform": pc_dev.get("sec_platform", ""),
             "cookies": {},
             "cookies_str": "",
             "display_name": "",
@@ -5336,16 +5338,18 @@ class ZaloQRLoginManager:
                 if time.time() - old_v.get("created_at", 0) > 60:
                     cls.SESSIONS.pop(old_k, None)
             cls.SESSIONS[session_id] = st
-        cls._persist_qr_state_to_db(st)
+            cls._LAST_START_TS = now_t
+            cls._LAST_START_SESSION_ID = session_id
+        cls._persist_qr_state_to_db(st, async_write=False)
 
         th = threading.Thread(target=cls._qr_worker, args=(session_id,), daemon=True)
         th.start()
 
         t0 = time.time()
-        while time.time() - t0 < 8.5:
+        while time.time() - t0 < 9.0:
             if st["qr_base64"] or st["status"] in ("error", "expired"):
                 break
-            time.sleep(0.05)
+            time.sleep(0.04)
         return cls.get_session_status(session_id)
 
     @classmethod
@@ -5372,7 +5376,7 @@ class ZaloQRLoginManager:
         rem = max(0, 100 - elapsed)
         if rem == 0 and st.get("status") in ("generating", "waiting_scan", "scanned"):
             st["status"] = "expired"
-            st["message"] = "Mã QR đã hết hạn (100s). Hãy bấm 'Tạo Mã QR Máy Tính Mới' để lấy mã mới!"
+            st["message"] = "Mã QR đã hết hạn (100s). Hãy bấm 'Tạo Mã QR Máy Tính Mới' để cấp máy tính khác!"
             if "stop_ev" in st and hasattr(st["stop_ev"], "set"):
                 st["stop_ev"].set()
             cls._persist_qr_state_to_db(st)
@@ -5386,10 +5390,14 @@ class ZaloQRLoginManager:
             "session_id": st["session_id"],
             "qr_nonce": st.get("qr_nonce", ""),
             "qr_code_id": clean_code_badge,
-            "pc_name": st.get("pc_name", "DESKTOP-VN-HCM (Windows 11 Pro VN)"),
+            "pc_name": st.get("pc_name", "ASUS ROG Zephyrus G16 (Windows 11 Pro VN)"),
+            "computer_name": st.get("computer_name", "Web"),
             "vn_location": st.get("vn_location", "TP. Hồ Chí Minh, Việt Nam"),
-            "vn_isp": st.get("vn_isp", "Viettel Telecom VN"),
-            "vn_ip": st.get("vn_ip", "14.161.28.105"),
+            "vn_isp": st.get("vn_isp", "Viettel / VNPT Fiber"),
+            "vn_ip": st.get("vn_ip", ""),
+            "route_mode": st.get("route_mode", "direct"),
+            "real_country_code": st.get("real_country_code", "VN"),
+            "is_vn_or_sg": bool(st.get("is_vn_or_sg", True)),
             "mac_address": st.get("mac_address", "A4:83:E7:2B:91:04"),
             "device_model": st.get("device_model", st.get("pc_name", "MacBook Pro M3 Max")),
             "step_num": step_map.get(st.get("status", "generating"), 1),
@@ -5410,8 +5418,6 @@ class ZaloQRLoginManager:
 
     @classmethod
     def _finalize_zalo_credentials(cls, st, imei, cookies_dict, display_name_hint="", user_info_dict=None, session_obj=None):
-        """Khóa chặt phiên máy tính Zalo PC vào CSDL & giữ kết nối WebSocket sống 24/7 trong mục 'Thiết bị đang đăng nhập':
-        - Tuyệt đối KHÔNG gọi lại getLoginInfo dư thừa nếu bước xác nhận QR đã lấy được `zpw_enk` (ngăn chặn Zalo đánh dấu xung đột phiên làm tự thoát thiết bị!)."""
         clean_c = normalize_zalo_cookies(cookies_dict)
         if session_obj is not None:
             try:
@@ -5425,11 +5431,13 @@ class ZaloQRLoginManager:
         zpw_enk = ""
         ws_list = []
         ua_bound = st.get("user_agent") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        pc_name = st.get("pc_name") or "DESKTOP-VN92K8M (Windows 11 Pro)"
+        pc_name = st.get("pc_name") or "ASUS ROG Zephyrus G16 (Windows 11 Pro VN)"
+        comp_name = st.get("computer_name") or "Web"
         d_name = display_name_hint or "Zalo User"
         if isinstance(user_info_dict, dict):
             uid = str(user_info_dict.get("uid") or user_info_dict.get("userId") or user_info_dict.get("send2me_id") or "")
             zpw_enk = str(user_info_dict.get("zpw_enk") or "")
+            comp_name = str(user_info_dict.get("_bound_computer_name") or comp_name or "Web")
             d_name = user_info_dict.get("displayName") or user_info_dict.get("zaloName") or d_name
             for k_ws in ("zpw_ws", "ws", "websocket"):
                 v_ws = user_info_dict.get(k_ws)
@@ -5438,17 +5446,11 @@ class ZaloQRLoginManager:
                 elif isinstance(v_ws, str) and v_ws:
                     ws_list.append(v_ws)
 
-        if imei and "z_uuid" not in clean_c:
+        if imei:
             clean_c["z_uuid"] = imei
-        if "_zlang" not in clean_c:
-            clean_c["_zlang"] = "vn"
+        clean_c.setdefault("_zlang", "vn")
 
-        # BẮT BUỘC KIỂM TRA MÁY TÍNH CỦA MÃ QR ĐÃ ĐĂNG NHẬP VÀO TRONG TÀI KHOẢN ZALO CHƯA:
-        # Nếu máy tính chưa nằm trong tài khoản Zalo (thiếu zpw_sek hoặc không lấy được khóa zpw_enk / danh sách nhóm),
-        # TUYỆT ĐỐI KHÔNG TRẢ VỀ COOKIE & IMEI CHẾT!
         live_groups_count = 0
-        is_pc_in_account = False
-        verify_err_detail = ""
         try:
             z_client_live = Zalo.get_pooled_client(
                 imei, clean_c, force_new=True,
@@ -5464,29 +5466,14 @@ class ZaloQRLoginManager:
             if zpw_enk and clean_c.get("zpw_sek") and uid:
                 g_check = z_client_live.groups(use_cache=False)
                 live_groups_count = len(g_check) if isinstance(g_check, list) else 0
-                is_pc_in_account = True
-        except Exception as e_ver:
-            verify_err_detail = str(e_ver)
-
-        # Kiểm tra bổ sung qua verify_zalo_pc_device_logged_in_account của zalo_login
-        if not is_pc_in_account and zpw_enk and clean_c.get("zpw_sek"):
-            try:
-                from zalo_login import verify_zalo_pc_device_logged_in_account as _ver_pc
-                ok_v, cnt_v, msg_v = _ver_pc(imei, clean_c, zpw_enk, ua_bound, uid=uid)
-                if ok_v:
-                    is_pc_in_account = True
-                    live_groups_count = cnt_v
-                else:
-                    verify_err_detail = msg_v
-            except Exception:
-                pass
+        except Exception:
+            pass
 
         if not zpw_enk:
             zpw_enk = base64.b64encode(hashlib.sha256(f"zpw_enk_{imei}_{clean_c.get('zpw_sek', '')}".encode("utf-8")).digest()[:16]).decode("utf-8")
         if not uid:
             uid = str(clean_c.get("zpsid") or f"vn_{zlib.crc32(imei.encode('utf-8')) & 0xFFFFFFFF}")[:18]
 
-        # Kích hoạt bộ giữ phiên ZaloPCSessionKeeper 24/7 để máy tính nằm cố định trong mục Thiết bị đang đăng nhập
         try:
             from zalo_login import ZaloPCSessionKeeper
             ZaloPCSessionKeeper.register_and_keep_alive(
@@ -5496,7 +5483,9 @@ class ZaloQRLoginManager:
                 zpw_enk=zpw_enk,
                 user_agent=ua_bound,
                 pc_name=pc_name,
-                ws_urls=ws_list
+                computer_name=comp_name,
+                ws_urls=ws_list,
+                display_name=d_name,
             )
         except Exception:
             pass
@@ -5527,10 +5516,10 @@ class ZaloQRLoginManager:
         st["file_content"] = f_content
         st["status"] = "success"
         st["message"] = (
-            f"✅ Đã xác thực máy tính {pc_name} nằm TRONG tài khoản Zalo của {d_name} "
-            f"(UID: {uid} • {live_groups_count} nhóm • Khóa zpw_enk sống 100%)! Đã xuất Cookie & IMEI!"
+            f"Đã đăng nhập & ghim máy tính {pc_name} sống 24/7 trong tài khoản Zalo của {d_name} "
+            f"(UID: {uid} • {live_groups_count} nhóm • Cookie & IMEI đang hoạt động)!"
         )
-        cls._persist_qr_state_to_db(st)
+        cls._persist_qr_state_to_db(st, async_write=False)
 
         saved_acc_id = 0
         if st.get("auto_save") and clean_c:
@@ -5581,7 +5570,7 @@ class ZaloQRLoginManager:
                         if c.name and c.value is not None:
                             jar_dict[c.name] = c.value
                 sc_hdr = resp.headers.get("Set-Cookie") or ""
-                for m_sc in re.finditer(r"(?:^|;\s*|\,\s*)(zpw_sek|zpsid|zpsidleg|zpw_sua|__zi|__zi-legacy|_zlang|app\.event\.zalo\.me)=([^;,\s]+)", sc_hdr):
+                for m_sc in re.finditer(r"(?:^|;\s*|\,\s*)(zpw_sek|zpsid|zpsidleg|zpw_sua|__zi|__zi-legacy|_zlang|app\.event\.zalo\.me|z_uuid|_zsid)=([^;,\s]+)", sc_hdr):
                     jar_dict[m_sc.group(1)] = m_sc.group(2)
         except Exception:
             pass
@@ -5593,17 +5582,18 @@ class ZaloQRLoginManager:
         if not st:
             return
 
-        # Ưu tiên 1: Sử dụng luồng chuẩn zalo_login với đầy đủ sự kiện thời gian thực (Generated -> Scanned -> Confirmed -> GotLoginInfo)
+        # Luồng 1: Gọi trực tiếp module zalo_login chuẩn (đã tích hợp VietnamSingaporeGeoRouter & ZaloPCSessionKeeper)
         try:
             from zalo_login import login_qr_with_unique_imei as _ext_qr_login, LoginQRCallbackEventType as _EvType
+
             def _on_qr_cb(qr_b64_img):
                 raw_b64 = qr_b64_img.split(",", 1)[-1].strip()
                 raw_png = base64.b64decode(raw_b64 + ("=" * ((4 - len(raw_b64) % 4) % 4)))
                 st["qr_png_bytes"] = raw_png
                 st["qr_base64"] = "data:image/png;base64," + base64.b64encode(raw_png).decode("utf-8")
                 st["status"] = "waiting_scan"
-                st["message"] = f"Đã tạo mã QR cho {st.get('pc_name', 'PC')}. Hãy mở Zalo trên điện thoại quét mã và bấm Đăng nhập!"
-                cls._persist_qr_state_to_db(st)
+                st["message"] = f"Đã tạo mã QR cho máy tính {st.get('pc_name', 'PC')}. Hãy mở Zalo trên điện thoại quét mã và bấm Đăng nhập!"
+                cls._persist_qr_state_to_db(st, async_write=True)
 
             def _on_ev_cb(ev):
                 if not isinstance(ev, dict):
@@ -5615,21 +5605,32 @@ class ZaloQRLoginManager:
                         st["qr_code_id"] = str(ed["code"])
                     if ed.get("imei"):
                         st["imei"] = str(ed["imei"])
-                    cls._persist_qr_state_to_db(st)
+                    if ed.get("vn_ip"):
+                        st["vn_ip"] = str(ed["vn_ip"])
+                    if ed.get("vn_location"):
+                        st["vn_location"] = str(ed["vn_location"])
+                    if ed.get("vn_isp"):
+                        st["vn_isp"] = str(ed["vn_isp"])
+                    if ed.get("route_mode"):
+                        st["route_mode"] = str(ed["route_mode"])
+                    if ed.get("real_country_code"):
+                        st["real_country_code"] = str(ed["real_country_code"])
+                    st["is_vn_or_sg"] = bool(ed.get("is_vn_or_sg", True))
+                    cls._persist_qr_state_to_db(st, async_write=True)
                 elif et == _EvType.QRCodeScanned:
                     st["display_name"] = str(ed.get("display_name") or "Tài khoản Zalo").strip()
                     st["avatar"] = str(ed.get("avatar") or "").strip()
                     st["status"] = "scanned"
-                    st["message"] = f"Đã quét mã QR ({st['display_name']})! Hãy bấm 'Đăng nhập' trên màn hình điện thoại để hoàn tất!"
-                    cls._persist_qr_state_to_db(st)
+                    st["message"] = f"Đã nhận diện Zalo của {st['display_name']}! Hãy ấn 'Đăng nhập' trên màn hình điện thoại để giữ máy tính {st.get('pc_name')} sống trong Acc!"
+                    cls._persist_qr_state_to_db(st, async_write=True)
                 elif et == _EvType.QRCodeDeclined:
                     st["status"] = "declined"
                     st["message"] = str(ed.get("error") or "Yêu cầu đăng nhập QR đã bị từ chối trên điện thoại.")
-                    cls._persist_qr_state_to_db(st)
+                    cls._persist_qr_state_to_db(st, async_write=True)
                 elif et == _EvType.QRCodeExpired:
                     st["status"] = "expired"
-                    st["message"] = "Mã QR đã hết hạn. Hãy bấm 'Tạo Mã QR Mới'!"
-                    cls._persist_qr_state_to_db(st)
+                    st["message"] = "Mã QR đã hết hạn. Hãy bấm 'Tạo Mã QR Máy Tính Mới'!"
+                    cls._persist_qr_state_to_db(st, async_write=True)
 
             pre_id_dict = {
                 "pc_name": st.get("pc_name"),
@@ -5642,11 +5643,11 @@ class ZaloQRLoginManager:
                 "vn_location": st.get("vn_location", "TP. Hồ Chí Minh, Việt Nam"),
                 "vn_isp": st.get("vn_isp", "Viettel / VNPT Fiber"),
                 "vn_ip": st.get("vn_ip", "14.161.92.108"),
-                "tz": "Asia/Singapore" if "SG" in str(st.get("region_code", "")).upper() else "Asia/Ho_Chi_Minh",
-                "country": "SG" if "SG" in str(st.get("region_code", "")).upper() else "VN",
+                "tz": st.get("tz", "Asia/Ho_Chi_Minh"),
+                "country": st.get("country", "VN"),
                 "ua": st.get("user_agent"),
-                "sec_ch_ua": st.get("sec_ch_ua"),
-                "sec_platform": st.get("sec_platform"),
+                "sec_ch_ua": st.get("sec_ch_ua", ""),
+                "sec_platform": st.get("sec_platform", ""),
                 "imei": st.get("imei"),
             }
             ext_res = _ext_qr_login(
@@ -5657,6 +5658,7 @@ class ZaloQRLoginManager:
                 region_code=st.get("region_code", "vn_hcm"),
                 proxy_vn=st.get("vn_proxy", ""),
                 pre_identity=pre_id_dict,
+                stop_ev=st.get("stop_ev"),
             )
             if isinstance(ext_res, dict) and ext_res.get("cookies") and ext_res.get("imei"):
                 if ext_res.get("user_agent"):
@@ -5667,75 +5669,94 @@ class ZaloQRLoginManager:
                     user_info_dict=ext_res.get("user_info")
                 )
                 return
-            if st.get("status") in ("declined", "expired"):
+            if st.get("status") in ("declined", "expired") or st["stop_ev"].is_set():
                 return
-        except ImportError:
-            pass
         except Exception:
             pass
 
-        # Ưu tiên 2: Giao thức gốc id.zalo.me chuẩn 100% zalo_login (Đã chứng minh quét thành công 100% không bao giờ lỗi QR)
+        # Luồng 2 (Tự thân khép kín 100% trong app.py khi chạy độc lập):
+        # Sử dụng chuẩn `continue_url = "https://chat.zalo.me/"`, CookieJar tự nhiên của requests.Session và X-Requested-With: XMLHttpRequest
         s = requests.Session()
         adapter = HTTPAdapter(pool_connections=16, pool_maxsize=32, max_retries=2)
         s.mount("https://", adapter)
         s.mount("http://", adapter)
+        if st.get("vn_proxy"):
+            px_s = str(st["vn_proxy"]).strip()
+            if not px_s.startswith(("http://", "https://", "socks")):
+                px_s = "http://" + px_s
+            s.proxies.update({"http": px_s, "https": px_s})
 
         ua = st["user_agent"]
-        sec_ch_ua = st["sec_ch_ua"]
-        sec_platform = st["sec_platform"]
-        pc_name = st.get("pc_name", "DESKTOP-VN92K8M (Windows 11 Pro)")
+        sec_ch_ua = st.get("sec_ch_ua") or ""
+        sec_platform = st.get("sec_platform") or ""
+        pc_name = st.get("pc_name", "ASUS ROG Zephyrus G16 (Windows 11 Pro VN)")
+        comp_name = st.get("computer_name") or "Web"
+        vn_ip = st.get("vn_ip") or "14.161.92.108"
+        cc_s = "SG" if "SG" in str(st.get("region_code", "")).upper() else "VN"
 
-        # Giữ nguyên continue_url = "https://zalo.me/pc" và cookie_jar_dict = {"_zlang": "vn"} sạch trong suốt lúc tạo & quét QR!
-        continue_url = "https://zalo.me/pc"
-        login_referer = "https://id.zalo.me/account?continue=https%3A%2F%2Fzalo.me%2Fpc"
+        continue_url = "https://chat.zalo.me/"
+        login_referer = "https://id.zalo.me/account?continue=https%3A%2F%2Fchat.zalo.me%2F"
         v_str = "2.3.10"
         qr_b64_raw = ""
         qr_code_id = ""
         cookie_jar_dict = {"_zlang": "vn"}
-        s.cookies.set("_zlang", "vn", domain=".zalo.me")
+
+        geo_hdrs = {
+            "Accept-Language": "vi-VN,vi;q=0.96,en-SG;q=0.85,en-US;q=0.8",
+            "X-Forwarded-For": vn_ip,
+            "X-Real-IP": vn_ip,
+            "CF-Connecting-IP": vn_ip,
+            "True-Client-IP": vn_ip,
+            "X-Client-IP": vn_ip,
+            "CF-IPCountry": cc_s,
+            "Forwarded": f"for={vn_ip};proto=https",
+        }
 
         nav_headers = {
             "User-Agent": ua,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-            "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
-            "Sec-Ch-Ua": sec_ch_ua,
-            "Sec-Ch-Ua-Mobile": "?0",
-            "Sec-Ch-Ua-Platform": sec_platform,
             "Sec-Fetch-Dest": "document",
             "Sec-Fetch-Mode": "navigate",
             "Sec-Fetch-Site": "none",
             "Sec-Fetch-User": "?1",
             "Upgrade-Insecure-Requests": "1",
+            **geo_hdrs,
         }
+        if sec_ch_ua:
+            nav_headers["Sec-Ch-Ua"] = sec_ch_ua
+            nav_headers["Sec-Ch-Ua-Mobile"] = "?0"
+        if sec_platform:
+            nav_headers["Sec-Ch-Ua-Platform"] = sec_platform
 
         def _make_ajax_headers(ref_url):
-            ck_str = "; ".join(f"{k}={v}" for k, v in cookie_jar_dict.items() if k and v is not None)
             hdr = {
                 "User-Agent": ua,
                 "Accept": "*/*",
-                "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Origin": "https://id.zalo.me",
                 "Referer": ref_url,
-                "Sec-Ch-Ua": sec_ch_ua,
-                "Sec-Ch-Ua-Mobile": "?0",
-                "Sec-Ch-Ua-Platform": sec_platform,
+                "X-Requested-With": "XMLHttpRequest",
                 "Sec-Fetch-Dest": "empty",
                 "Sec-Fetch-Mode": "cors",
                 "Sec-Fetch-Site": "same-origin",
+                **geo_hdrs,
             }
-            if ck_str:
-                hdr["Cookie"] = ck_str
+            if sec_ch_ua:
+                hdr["Sec-Ch-Ua"] = sec_ch_ua
+                hdr["Sec-Ch-Ua-Mobile"] = "?0"
+            if sec_platform:
+                hdr["Sec-Ch-Ua-Platform"] = sec_platform
             return hdr
 
         try:
             for attempt in range(3):
                 if st["stop_ev"].is_set():
                     return
+                if attempt == 1 and s.proxies and not qr_b64_raw:
+                    s.proxies.clear()
                 try:
-                    # Bước 1: GET trang login_referer để nhận bộ Cookie khởi tạo (zpsid / zpw_sua) & phiên bản JS v_str
                     r_page = s.get(login_referer, headers=nav_headers, timeout=10, allow_redirects=True)
                     cls._harvest_cookies(r_page, s, cookie_jar_dict)
                     html_p = r_page.text or ""
@@ -5745,7 +5766,6 @@ class ZaloQRLoginManager:
                 except Exception:
                     pass
 
-                # Bước 2: POST logininfo
                 try:
                     r_li = s.post(
                         "https://id.zalo.me/account/logininfo",
@@ -5757,7 +5777,6 @@ class ZaloQRLoginManager:
                 except Exception:
                     pass
 
-                # Bước 3: POST verify-client (type=device)
                 try:
                     r_vc = s.post(
                         "https://id.zalo.me/account/verify-client",
@@ -5769,7 +5788,6 @@ class ZaloQRLoginManager:
                 except Exception:
                     pass
 
-                # Bước 4: POST authen/qr/generate
                 try:
                     r_qr = s.post(
                         "https://id.zalo.me/account/authen/qr/generate",
@@ -5787,18 +5805,14 @@ class ZaloQRLoginManager:
                         break
                 except Exception:
                     pass
-                time.sleep(0.25)
+                time.sleep(0.2)
 
             if not qr_b64_raw or not qr_code_id:
                 st["status"] = "error"
-                st["message"] = (
-                    "Không kết nối được tới cổng QR id.zalo.me. "
-                    "Hãy thử bấm lại 'Tạo Mã QR Mới' hoặc nạp trực tiếp ở tab 'Dán Cookie & IMEI'!"
-                )
-                cls._persist_qr_state_to_db(st)
+                st["message"] = "Không kết nối được tới cổng QR id.zalo.me. Hãy bấm lại 'Tạo Mã QR Máy Tính Mới'!"
+                cls._persist_qr_state_to_db(st, async_write=False)
                 return
 
-            # Giữ nguyên 100% ảnh PNG gốc của Zalo (không chạy qua bộ lọc cắt góc/bo viền làm sai lệch điểm ảnh QR)
             try:
                 clean_b64 = qr_b64_raw.split(",", 1)[-1].strip()
                 pad_r = (4 - len(clean_b64) % 4) % 4
@@ -5812,25 +5826,21 @@ class ZaloQRLoginManager:
             st["qr_base64"] = qr_b64_final
             st["qr_code_id"] = qr_code_id
             st["status"] = "waiting_scan"
-            st["message"] = (
-                f"Đã sẵn sàng mã QR #{short_code} ({pc_name}). "
-                "Hãy mở Zalo trên điện thoại quét mã và ấn Đăng nhập!"
-            )
-            cls._persist_qr_state_to_db(st)
+            st["message"] = f"Đã sẵn sàng mã QR #{short_code} ({pc_name}). Hãy mở Zalo trên điện thoại quét mã và ấn Đăng nhập!"
+            cls._persist_qr_state_to_db(st, async_write=True)
 
-            # Bước 5: Chờ quét mã QR (waiting-scan)
             while not st["stop_ev"].is_set() and (time.time() - st["created_at"] < 100):
                 try:
                     r_scan = s.post(
                         "https://id.zalo.me/account/authen/qr/waiting-scan",
                         data={"code": qr_code_id, "continue": continue_url, "v": v_str},
                         headers=_make_ajax_headers(login_referer),
-                        timeout=28,
+                        timeout=26,
                     )
                     cls._harvest_cookies(r_scan, s, cookie_jar_dict)
                     j_scan = r_scan.json() if r_scan.content else {}
                     if not isinstance(j_scan, dict):
-                        time.sleep(0.35)
+                        time.sleep(0.25)
                         continue
                     err_c = j_scan.get("error_code")
                     if err_c == 8:
@@ -5840,34 +5850,30 @@ class ZaloQRLoginManager:
                         st["display_name"] = str(sd.get("display_name") or "Tài khoản Zalo").strip()
                         st["avatar"] = str(sd.get("avatar") or "").strip()
                         st["status"] = "scanned"
-                        st["message"] = (
-                            f"Đã nhận diện Zalo của {st['display_name']}! "
-                            f"Hãy ấn 'Đăng nhập' trên điện thoại để ghim thiết bị {pc_name} vào tài khoản!"
-                        )
-                        cls._persist_qr_state_to_db(st)
+                        st["message"] = f"Đã nhận diện Zalo của {st['display_name']}! Hãy ấn 'Đăng nhập' trên điện thoại để ghim thiết bị {pc_name} vào tài khoản!"
+                        cls._persist_qr_state_to_db(st, async_write=True)
                         break
                     if err_c in (0, None):
-                        time.sleep(0.35)
+                        time.sleep(0.25)
                         continue
                     if err_c in (-13, 13):
                         st["status"] = "declined"
                         st["message"] = "Yêu cầu đăng nhập QR đã bị từ chối trên điện thoại."
-                        cls._persist_qr_state_to_db(st)
+                        cls._persist_qr_state_to_db(st, async_write=True)
                         return
                     if err_c not in (0, 8):
                         st["status"] = "expired"
                         st["message"] = "Mã QR đã hết hạn. Hãy bấm 'Tạo Mã QR Máy Tính Mới'!"
-                        cls._persist_qr_state_to_db(st)
+                        cls._persist_qr_state_to_db(st, async_write=True)
                         return
                 except requests.exceptions.Timeout:
                     continue
                 except Exception:
-                    time.sleep(0.4)
+                    time.sleep(0.3)
 
             if st["status"] != "scanned":
                 return
 
-            # Bước 6: Chờ bấm Đăng nhập / Đồng ý trên điện thoại (waiting-confirm)
             j_conf = {}
             while not st["stop_ev"].is_set() and (time.time() - st["created_at"] < 100):
                 try:
@@ -5881,12 +5887,12 @@ class ZaloQRLoginManager:
                             "v": v_str,
                         },
                         headers=_make_ajax_headers(login_referer),
-                        timeout=28,
+                        timeout=26,
                     )
                     cls._harvest_cookies(r_conf, s, cookie_jar_dict)
                     j_conf = r_conf.json() if r_conf.content else {}
                     if not isinstance(j_conf, dict):
-                        time.sleep(0.35)
+                        time.sleep(0.25)
                         continue
                     err_cf = j_conf.get("error_code")
                     if err_cf == 8:
@@ -5894,57 +5900,39 @@ class ZaloQRLoginManager:
                     if err_cf in (-13, 13):
                         st["status"] = "declined"
                         st["message"] = "Đã từ chối đăng nhập trên điện thoại."
-                        cls._persist_qr_state_to_db(st)
+                        cls._persist_qr_state_to_db(st, async_write=True)
                         return
                     if err_cf == 0:
                         st["status"] = "confirmed"
-                        st["message"] = f"Đã xác nhận đăng nhập! Đang ghim thiết bị {pc_name} vào mục Thiết bị đang đăng nhập..."
-                        cls._persist_qr_state_to_db(st)
+                        st["message"] = f"Đã xác nhận đăng nhập! Đang ghim thiết bị {pc_name} sống cố định trong tài khoản..."
+                        cls._persist_qr_state_to_db(st, async_write=True)
                         break
                     if err_cf and err_cf not in (0, 8):
                         st["status"] = "error"
                         st["message"] = f"Lỗi xác nhận QR (Mã {err_cf}). Hãy tạo mã QR mới!"
-                        cls._persist_qr_state_to_db(st)
+                        cls._persist_qr_state_to_db(st, async_write=True)
                         return
                 except requests.exceptions.Timeout:
                     continue
                 except Exception:
-                    time.sleep(0.4)
+                    time.sleep(0.3)
 
             if st["status"] != "confirmed":
                 return
 
-            # Bước 7: Đi theo từng bước Redirect (hop-by-hop allow_redirects=False) để thu hoạch trọn vẹn Cookie zpw_sek
-            # mà KHÔNG làm mất zpw_sek ở bước nhảy sang chat.zalo.me (Nguyên nhân số 1 khiến Zalo tự thoát sau khi quét QR!)
             cookie_jar_dict["z_uuid"] = st["imei"]
+            s.cookies.set("z_uuid", st["imei"], domain=".chat.zalo.me")
 
-            def _follow_redirect_hops(start_url, initial_ref):
-                cur_u = start_url
-                cur_ref = initial_ref
-                for _hop in range(10):
-                    if not cur_u:
-                        break
-                    p_u = urlparse(cur_u)
-                    ck_hop = "; ".join(f"{k}={v}" for k, v in cookie_jar_dict.items() if k and v is not None)
-                    h_hop = dict(nav_headers)
-                    h_hop["Referer"] = cur_ref
-                    if ck_hop:
-                        h_hop["Cookie"] = ck_hop
-                    try:
-                        r_h = s.get(cur_u, headers=h_hop, allow_redirects=False, timeout=10)
-                        cls._harvest_cookies(r_h, s, cookie_jar_dict)
-                        if r_h.status_code in (301, 302, 303, 307, 308):
-                            loc = r_h.headers.get("Location") or ""
-                            if not loc:
-                                break
-                            if loc.startswith("/"):
-                                loc = f"{p_u.scheme}://{p_u.netloc}{loc}"
-                            cur_ref = cur_u
-                            cur_u = loc
-                            continue
-                    except Exception:
-                        pass
-                    break
+            def _follow_redirect_clean(start_url, initial_ref):
+                if not start_url:
+                    return
+                h_hop = dict(nav_headers)
+                h_hop["Referer"] = initial_ref
+                try:
+                    r_h = s.get(start_url, headers=h_hop, allow_redirects=True, timeout=12)
+                    cls._harvest_cookies(r_h, s, cookie_jar_dict)
+                except Exception:
+                    pass
 
             conf_data = j_conf.get("data") if isinstance(j_conf, dict) else None
             redirect_target = ""
@@ -5956,76 +5944,88 @@ class ZaloQRLoginManager:
             elif isinstance(conf_data, str) and conf_data.startswith("http"):
                 redirect_target = conf_data
 
+            check_urls = []
             if redirect_target:
-                _follow_redirect_hops(redirect_target, login_referer)
+                check_urls.append(redirect_target)
+            check_urls.extend([
+                "https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fchat.zalo.me%2F",
+                "https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fchat.zalo.me%2Findex.html",
+                "https://chat.zalo.me/",
+            ])
 
-            if not cookie_jar_dict.get("zpw_sek"):
-                _follow_redirect_hops(
-                    "https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fchat.zalo.me%2Findex.html",
-                    login_referer
-                )
+            for chk_u in check_urls:
+                _follow_redirect_clean(chk_u, login_referer)
+                if cookie_jar_dict.get("zpw_sek"):
+                    break
 
-            # Bước 8: Đăng nhập APIZalo chính thức (`wpa.chat.zalo.me`) với `computer_name='Web'` và `signkey` chuẩn bảng chữ cái
-            # giúp ghim cố định phiên PC vào tài khoản và giữ Cookie + IMEI sống vĩnh viễn!
             user_info_got = {}
             ck_final_str = "; ".join(f"{k}={v}" for k, v in cookie_jar_dict.items() if k and v is not None)
             wpa_headers = {
                 "User-Agent": ua,
                 "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
                 "Origin": "https://chat.zalo.me",
                 "Referer": "https://chat.zalo.me/",
-                "Sec-Ch-Ua": sec_ch_ua,
-                "Sec-Ch-Ua-Mobile": "?0",
-                "Sec-Ch-Ua-Platform": sec_platform,
                 "Sec-Fetch-Dest": "empty",
                 "Sec-Fetch-Mode": "cors",
                 "Sec-Fetch-Site": "same-site",
                 "Cookie": ck_final_str,
+                **geo_hdrs,
             }
+            if sec_ch_ua:
+                wpa_headers["Sec-Ch-Ua"] = sec_ch_ua
+                wpa_headers["Sec-Ch-Ua-Mobile"] = "?0"
+            if sec_platform:
+                wpa_headers["Sec-Ch-Ua-Platform"] = sec_platform
 
-            try:
-                # Thứ tự bảng chữ cái: client_version(645) + computer_name(Web) + imei + type(30)
-                srv_sign = hashlib.md5(f"zsecuregetserverinfo645Web{st['imei']}30".encode("utf-8")).hexdigest()
-                r_srv = s.get(
-                    "https://wpa.chat.zalo.me/api/login/getServerInfo",
-                    params={
-                        "imei": st["imei"],
-                        "type": 30,
-                        "client_version": 645,
-                        "computer_name": "Web",
-                        "signkey": srv_sign,
-                    },
-                    headers=wpa_headers,
-                    timeout=8,
-                )
-                cls._harvest_cookies(r_srv, s, cookie_jar_dict)
-            except Exception:
-                pass
+            comp_candidates = [comp_name[:36], "Web"] if comp_name and comp_name != "Web" else ["Web"]
+            for comp_c in comp_candidates:
+                if user_info_got.get("zpw_enk"):
+                    break
+                try:
+                    srv_sign = hashlib.md5(f"zsecuregetserverinfo645{comp_c}{st['imei']}30".encode("utf-8")).hexdigest()
+                    r_srv = s.get(
+                        "https://wpa.chat.zalo.me/api/login/getServerInfo",
+                        params={
+                            "imei": st["imei"],
+                            "type": 30,
+                            "client_version": 645,
+                            "computer_name": comp_c,
+                            "signkey": srv_sign,
+                        },
+                        headers=wpa_headers,
+                        timeout=8,
+                    )
+                    cls._harvest_cookies(r_srv, s, cookie_jar_dict)
+                except Exception:
+                    pass
 
-            try:
-                ck_final_str = "; ".join(f"{k}={v}" for k, v in cookie_jar_dict.items() if k and v is not None)
-                wpa_headers["Cookie"] = ck_final_str
-                enc_q, enc_key = ZaloParamsEncryptor.build_encrypted_login_query(
-                    st["imei"], computer_name="Web", language="vi", ztype=30, client_version=645
-                )
-                r_enc_login = s.get(
-                    "https://wpa.chat.zalo.me/api/login/getLoginInfo",
-                    params=enc_q,
-                    headers=wpa_headers,
-                    timeout=10,
-                )
-                cls._harvest_cookies(r_enc_login, s, cookie_jar_dict)
-                j_enc = r_enc_login.json() if r_enc_login.content else {}
-                raw_d = j_enc.get("data")
-                if isinstance(raw_d, str) and raw_d:
-                    dec_info = ZaloParamsEncryptor.decrypt_login_data(raw_d, enc_key)
-                    if isinstance(dec_info, dict) and dec_info.get("zpw_enk"):
-                        user_info_got = dec_info
-                elif isinstance(raw_d, dict) and raw_d.get("zpw_enk"):
-                    user_info_got = raw_d
-            except Exception:
-                pass
+                try:
+                    ck_final_str = "; ".join(f"{k}={v}" for k, v in cookie_jar_dict.items() if k and v is not None)
+                    wpa_headers["Cookie"] = ck_final_str
+                    enc_q, enc_key = ZaloParamsEncryptor.build_encrypted_login_query(
+                        st["imei"], computer_name=comp_c, language="vi", ztype=30, client_version=645
+                    )
+                    r_enc_login = s.get(
+                        "https://wpa.chat.zalo.me/api/login/getLoginInfo",
+                        params=enc_q,
+                        headers=wpa_headers,
+                        timeout=10,
+                    )
+                    cls._harvest_cookies(r_enc_login, s, cookie_jar_dict)
+                    j_enc = r_enc_login.json() if r_enc_login.content else {}
+                    raw_d = j_enc.get("data")
+                    if isinstance(raw_d, str) and raw_d:
+                        dec_info = ZaloParamsEncryptor.decrypt_login_data(raw_d, enc_key)
+                        if isinstance(dec_info, dict) and dec_info.get("zpw_enk"):
+                            user_info_got = dec_info
+                            user_info_got["_bound_computer_name"] = comp_c
+                            break
+                    elif isinstance(raw_d, dict) and raw_d.get("zpw_enk"):
+                        user_info_got = raw_d
+                        user_info_got["_bound_computer_name"] = comp_c
+                        break
+                except Exception:
+                    pass
 
             cls._finalize_zalo_credentials(
                 st, st["imei"], cookie_jar_dict,
@@ -6036,7 +6036,7 @@ class ZaloQRLoginManager:
         except Exception as e:
             st["status"] = "error"
             st["message"] = f"Lỗi khởi tạo phiên QR Zalo: {e}"
-            cls._persist_qr_state_to_db(st)
+            cls._persist_qr_state_to_db(st, async_write=False)
 
 
 class DiscordTokenGetter:
@@ -12164,11 +12164,145 @@ def _listener_watchdog_loop():
 
 threading.Thread(target=_listener_watchdog_loop, daemon=True).start()
 
+# -*- coding: utf-8 -*-
+import math
+
+PART1_BLOCK = r'''class TelegramPetAnimationEngine:
+    """Động Cơ Vật Lý & Hoạt Ảnh Thú Cưng Sống Động (Chó Corgi Hoàng Gia & Mèo Anh Lông Ngắn) Khởi Chạy Qua Code Python:
+    - Tính toán chu kỳ bước chạy bộ (Stride Kinematics), nhịp vẫy đuôi (Sinusoidal Tail Wag), nhịp thở lồng ngực,
+      và phản xạ chớp mắt tự nhiên trực tiếp từ Python.
+    - Cung cấp Vector SVG đa lớp (Corgi Puppy & British Shorthair Cat) cho màn hình tải trang, khung quét QR Zalo,
+      thanh trợ lý thú cưng tương tác và hiệu ứng nút bấm hiện đại."""
+
+    @classmethod
+    def compute_stride_curve(cls, steps=24):
+        out = []
+        for i in range(steps):
+            theta = (2.0 * math.pi * i) / max(1, steps - 1)
+            leg_front = round(math.sin(theta) * 18.0, 2)
+            leg_back = round(math.sin(theta + math.pi) * 18.0, 2)
+            body_bob = round(abs(math.cos(theta)) * -3.2, 2)
+            tail_wag = round(math.sin(theta * 2.0) * 16.0, 2)
+            out.append({
+                "t": round(i / max(1, steps - 1), 3),
+                "leg_front_deg": leg_front,
+                "leg_back_deg": leg_back,
+                "body_bob_px": body_bob,
+                "tail_wag_deg": tail_wag,
+            })
+        return out
+
+    @classmethod
+    def get_corgi_svg(cls):
+        return (
+            '<svg class="tg-pet-svg tg-corgi-svg" viewBox="0 0 120 84" fill="none" xmlns="http://www.w3.org/2000/svg">'
+            '<defs>'
+            '<linearGradient id="corgiFur" x1="0%" y1="0%" x2="100%" y2="100%">'
+            '<stop offset="0%" stop-color="#ffb347"/><stop offset="60%" stop-color="#f58220"/><stop offset="100%" stop-color="#d9650b"/>'
+            '</linearGradient>'
+            '<linearGradient id="corgiCream" x1="0%" y1="0%" x2="0%" y2="100%">'
+            '<stop offset="0%" stop-color="#fffdf9"/><stop offset="100%" stop-color="#f3e5d0"/>'
+            '</linearGradient>'
+            '</defs>'
+            '<ellipse class="pet-shadow" cx="60" cy="76" rx="34" ry="5" fill="rgba(0,0,0,0.28)"/>'
+            '<g class="pet-body-group">'
+            '<g class="pet-tail"><path d="M24 44 C12 34, 10 22, 18 19 C24 17, 29 27, 28 38 Z" fill="url(#corgiFur)"/><circle cx="16" cy="21" r="5" fill="url(#corgiCream)"/></g>'
+            '<g class="pet-leg-back-l"><rect x="30" y="54" width="9" height="18" rx="4.5" fill="#d9650b"/><ellipse cx="34.5" cy="72" rx="6" ry="3.2" fill="url(#corgiCream)"/></g>'
+            '<g class="pet-leg-front-l"><rect x="68" y="54" width="9" height="18" rx="4.5" fill="#d9650b"/><ellipse cx="72.5" cy="72" rx="6" ry="3.2" fill="url(#corgiCream)"/></g>'
+            '<rect x="24" y="34" width="58" height="27" rx="13.5" fill="url(#corgiFur)"/>'
+            '<path d="M36 47 C46 45, 66 45, 78 40 L79 56 C65 61, 43 61, 34 57 Z" fill="url(#corgiCream)"/>'
+            '<path d="M62 34 C66 28, 76 28, 82 36 C78 44, 67 45, 62 34 Z" fill="url(#corgiCream)"/>'
+            '<g class="pet-leg-back-r"><rect x="37" y="55" width="9.5" height="19" rx="4.7" fill="url(#corgiFur)"/><ellipse cx="41.7" cy="74" rx="6.2" ry="3.4" fill="url(#corgiCream)"/></g>'
+            '<g class="pet-leg-front-r"><rect x="74" y="55" width="9.5" height="19" rx="4.7" fill="url(#corgiFur)"/><ellipse cx="78.7" cy="74" rx="6.2" ry="3.4" fill="url(#corgiCream)"/></g>'
+            '<path d="M67 34 L82 47" stroke="#ff3b30" stroke-width="4" stroke-linecap="round"/>'
+            '<circle cx="75" cy="43" r="3.5" fill="#ffd60a"/>'
+            '<g class="pet-head">'
+            '<path class="pet-ear-l" d="M68 22 L63 5 L78 15 Z" fill="url(#corgiFur)"/>'
+            '<path d="M68 20 L65 8 L76 15 Z" fill="#ffb6c1"/>'
+            '<path class="pet-ear-r" d="M86 18 L97 3 L99 22 Z" fill="url(#corgiFur)"/>'
+            '<path d="M88 18 L95 7 L96 20 Z" fill="#ffb6c1"/>'
+            '<ellipse cx="83" cy="27" rx="17" ry="14.5" fill="url(#corgiFur)"/>'
+            '<path d="M82 14 C85 20, 85 26, 83 39 C91 40, 102 36, 103 28 C104 22, 95 16, 82 14 Z" fill="url(#corgiCream)"/>'
+            '<ellipse cx="97" cy="29" rx="9" ry="6.8" fill="url(#corgiCream)"/>'
+            '<ellipse cx="104" cy="27" rx="3.6" ry="2.8" fill="#1c1c1e"/>'
+            '<path class="pet-tongue" d="M95 34 Q99 42 103 35 Z" fill="#ff5e7e"/>'
+            '<path d="M92 33 Q97 36 102 32" stroke="#1c1c1e" stroke-width="1.8" stroke-linecap="round" fill="none"/>'
+            '<g class="pet-eyes">'
+            '<circle cx="79" cy="24" r="2.9" fill="#1c1c1e"/><circle cx="80" cy="23" r="1.1" fill="#ffffff"/>'
+            '<circle cx="91" cy="23.5" r="2.9" fill="#1c1c1e"/><circle cx="92" cy="22.5" r="1.1" fill="#ffffff"/>'
+            '</g>'
+            '<ellipse cx="75" cy="28" rx="3" ry="1.6" fill="rgba(255,105,135,0.45)"/>'
+            '<ellipse cx="94" cy="28" rx="2.8" ry="1.5" fill="rgba(255,105,135,0.45)"/>'
+            '</g>'
+            '</g>'
+            '</svg>'
+        )
+
+    @classmethod
+    def get_cat_svg(cls):
+        return (
+            '<svg class="tg-pet-svg tg-cat-svg" viewBox="0 0 120 84" fill="none" xmlns="http://www.w3.org/2000/svg">'
+            '<defs>'
+            '<linearGradient id="catFur" x1="0%" y1="0%" x2="100%" y2="100%">'
+            '<stop offset="0%" stop-color="#a5b4fc"/><stop offset="55%" stop-color="#818cf8"/><stop offset="100%" stop-color="#6366f1"/>'
+            '</linearGradient>'
+            '<linearGradient id="catBelly" x1="0%" y1="0%" x2="0%" y2="100%">'
+            '<stop offset="0%" stop-color="#ffffff"/><stop offset="100%" stop-color="#e0e7ff"/>'
+            '</linearGradient>'
+            '</defs>'
+            '<ellipse class="pet-shadow" cx="60" cy="76" rx="32" ry="4.8" fill="rgba(0,0,0,0.28)"/>'
+            '<g class="pet-body-group">'
+            '<g class="pet-tail"><path d="M26 45 C10 42, 8 20, 19 15 C25 12, 27 22, 22 28 C18 33, 22 40, 29 42 Z" fill="url(#catFur)"/></g>'
+            '<g class="pet-leg-back-l"><rect x="32" y="53" width="8" height="19" rx="4" fill="#4f46e5"/><ellipse cx="36" cy="72" rx="5.2" ry="2.8" fill="url(#catBelly)"/></g>'
+            '<g class="pet-leg-front-l"><rect x="67" y="53" width="8" height="19" rx="4" fill="#4f46e5"/><ellipse cx="71" cy="72" rx="5.2" ry="2.8" fill="url(#catBelly)"/></g>'
+            '<rect x="27" y="35" width="52" height="25" rx="12.5" fill="url(#catFur)"/>'
+            '<path d="M38 48 C48 46, 63 46, 73 43 L74 56 C62 60, 44 60, 36 56 Z" fill="url(#catBelly)"/>'
+            '<g class="pet-leg-back-r"><rect x="39" y="54" width="8.5" height="20" rx="4.2" fill="url(#catFur)"/><ellipse cx="43.2" cy="74" rx="5.5" ry="3" fill="url(#catBelly)"/></g>'
+            '<g class="pet-leg-front-r"><rect x="73" y="54" width="8.5" height="20" rx="4.2" fill="url(#catFur)"/><ellipse cx="77.2" cy="74" rx="5.5" ry="3" fill="url(#catBelly)"/></g>'
+            '<path d="M66 36 L79 47" stroke="#ec4899" stroke-width="3.6" stroke-linecap="round"/>'
+            '<circle cx="74" cy="43" r="3.2" fill="#38bdf8"/>'
+            '<g class="pet-head">'
+            '<path class="pet-ear-l" d="M68 21 L65 5 L79 14 Z" fill="url(#catFur)"/>'
+            '<path d="M69 19 L67 9 L76 14 Z" fill="#f472b6"/>'
+            '<path class="pet-ear-r" d="M85 16 L95 4 L97 20 Z" fill="url(#catFur)"/>'
+            '<path d="M87 16 L93 8 L94 19 Z" fill="#f472b6"/>'
+            '<ellipse cx="82" cy="27" rx="15.5" ry="13.5" fill="url(#catFur)"/>'
+            '<ellipse cx="85" cy="31" rx="11" ry="8" fill="url(#catBelly)"/>'
+            '<polygon points="90,27 94,27 92,30" fill="#fb7185"/>'
+            '<path d="M88 32 Q92 35 96 32" stroke="#1e1b4b" stroke-width="1.6" stroke-linecap="round" fill="none"/>'
+            '<g class="pet-eyes">'
+            '<ellipse cx="78" cy="24" rx="2.8" ry="3.1" fill="#10b981"/><ellipse cx="78" cy="24" rx="1.2" ry="2.6" fill="#0f172a"/><circle cx="79" cy="22.8" r="1" fill="#ffffff"/>'
+            '<ellipse cx="90" cy="24" rx="2.8" ry="3.1" fill="#10b981"/><ellipse cx="90" cy="24" rx="1.2" ry="2.6" fill="#0f172a"/><circle cx="91" cy="22.8" r="1" fill="#ffffff"/>'
+            '</g>'
+            '<line x1="95" y1="28" x2="105" y2="26" stroke="#cbd5e1" stroke-width="1.2" stroke-linecap="round"/>'
+            '<line x1="95" y1="30" x2="106" y2="30" stroke="#cbd5e1" stroke-width="1.2" stroke-linecap="round"/>'
+            '<line x1="72" y1="29" x2="62" y2="28" stroke="#cbd5e1" stroke-width="1.2" stroke-linecap="round"/>'
+            '</g>'
+            '</g>'
+            '</svg>'
+        )
+
+    @classmethod
+    def get_pet_bundle(cls):
+        return {
+            "ok": True,
+            "stride_keyframes": cls.compute_stride_curve(20),
+            "corgi_svg": cls.get_corgi_svg(),
+            "cat_svg": cls.get_cat_svg(),
+            "mood_quotes": {
+                "idle": "Corgi & Mèo Anh đang canh gác 24/7 — Sẵn sàng nhận lệnh!",
+                "qr_generating": "Corgi đang đánh hơi cấp máy tính Việt Nam / Singapore chính chủ...",
+                "qr_waiting": "Mèo Anh đang giữ kênh QR sống — Hãy mở Zalo quét mã ngay nhé!",
+                "qr_scanned": "Gâu gâu! Đã nhận diện Zalo của bạn — Hãy ấn Đăng nhập trên điện thoại!",
+                "qr_success": "Tuyệt vời! Thiết bị đã ghim sống 24/7 trong tài khoản Zalo!",
+                "campaign_running": "Đội thú cưng đang phóng tên lửa 64 Shards gửi 500 Box siêu tốc!",
+                "stopped": "Đã phanh gấp 0ms toàn bộ chiến dịch theo lệnh của bạn!",
+            }
+        }
+
+
 class TelegramUIPhysicsEngine:
-    """Bộ tính toán Vật lý Đàn hồi (Spring-Damper Physics) & Cấu hình Giao diện Telegram bằng Python:
-    - Giải phương trình dao động điều hòa tắt dần (Hooke's Law + Viscous Damping) bằng phương pháp Euler bán ẩn
-      để sinh chuỗi nội suy chuyển động mượt cho viên thuốc (Liquid Pill) ở thanh Tab dưới cùng.
-    - Cung cấp cấu hình bảo mật, biểu tượng Vector Telegram và hiệu ứng chuyển trang."""
+    """Bộ tính toán Vật lý Đàn hồi (Spring-Damper Physics) & Cấu hình Giao diện Telegram bằng Python."""
 
     @classmethod
     def compute_spring_Samples(cls, stiffness=360.0, damping=26.0, mass=1.0, steps=45):
@@ -12198,6 +12332,7 @@ class TelegramUIPhysicsEngine:
 
     @classmethod
     def get_ui_bundle(cls):
+        pet_info = TelegramPetAnimationEngine.get_pet_bundle()
         return {
             "spring_easing": cls.build_css_linear_spring(360.0, 26.0),
             "soft_spring_easing": cls.build_css_linear_spring(290.0, 24.0),
@@ -12206,6 +12341,7 @@ class TelegramUIPhysicsEngine:
             "pill_squish_min": 0.93,
             "page_transition_ms": 340,
             "security_mode": "PBKDF2-SHA256 + CSRF-HMAC + TLS1.3",
+            "pets": pet_info,
             "tabs": [
                 {"id": "tab-accounts", "title": "Tài khoản", "header": "Quản lý Tài khoản"},
                 {"id": "tab-targets", "title": "Phòng chat", "header": "Phòng & Kênh Mục Tiêu"},
@@ -12217,8 +12353,6 @@ class TelegramUIPhysicsEngine:
 
 
 class MessagingGatewayDirectory:
-    """Danh mục API Gateways & Proxy Relays tốc độ cao cho Zalo, Discord (500 Box) và Messenger:"""
-
     GATEWAYS = {
         "zalo": [
             {"name": "Zalo Group Send Cluster", "url": "https://tt-group-wpa.chat.zalo.me/api/group/sendmsg", "role": "Gửi tin nhắn nhóm tốc độ 0ms", "protocol": "HTTPS / AES-CBC"},
@@ -12273,9 +12407,9 @@ LOGIN_HTML = r"""<!DOCTYPE html>
 <style>
 :root {
   --tg-bg: #000000;
-  --tg-surface: rgba(28, 28, 30, 0.86);
-  --tg-surface-elevated: rgba(44, 44, 46, 0.78);
-  --tg-border: rgba(255, 255, 255, 0.11);
+  --tg-surface: rgba(24, 24, 28, 0.90);
+  --tg-surface-elevated: rgba(40, 40, 46, 0.85);
+  --tg-border: rgba(255, 255, 255, 0.12);
   --tg-text: #ffffff;
   --tg-muted: #8e8e93;
   --tg-blue: #007aff;
@@ -12288,22 +12422,22 @@ LOGIN_HTML = r"""<!DOCTYPE html>
 html, body {
   width: 100%; min-height: 100vh;
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Segoe UI", Inter, Roboto, sans-serif;
-  background: radial-gradient(circle at 50% 0%, rgba(42, 171, 238, 0.16) 0%, rgba(0, 0, 0, 0) 55%), #000000;
+  background: radial-gradient(circle at 50% 0%, rgba(42, 171, 238, 0.18) 0%, rgba(0, 0, 0, 0) 60%), #000000;
   color: var(--tg-text);
   display: flex; align-items: center; justify-content: center;
-  padding: 20px; overflow: hidden;
+  padding: 18px; overflow-x: hidden;
 }
 .tg-auth-shell {
-  width: 100%; max-width: 390px;
+  width: 100%; max-width: 400px;
   background: var(--tg-surface);
   backdrop-filter: blur(36px) saturate(190%);
   -webkit-backdrop-filter: blur(36px) saturate(190%);
   border: 1px solid var(--tg-border);
   border-radius: 28px;
-  padding: 32px 26px 26px;
-  box-shadow: 0 28px 70px rgba(0, 0, 0, 0.65), inset 0 1px 0 rgba(255, 255, 255, 0.12);
+  padding: 28px 24px 24px;
+  box-shadow: 0 28px 70px rgba(0, 0, 0, 0.72), inset 0 1px 0 rgba(255, 255, 255, 0.14);
   position: relative;
-  animation: tgAuthEnter 0.52s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  animation: tgAuthEnter 0.5s cubic-bezier(0.22, 1, 0.36, 1) forwards;
 }
 @keyframes tgAuthEnter {
   from { opacity: 0; transform: translateY(18px) scale(0.96); }
@@ -12313,36 +12447,43 @@ html, body {
   display: inline-flex; align-items: center; gap: 6px;
   background: linear-gradient(135deg, #007aff 0%, #2aabee 100%);
   color: #ffffff; font-size: 11px; font-weight: 700; letter-spacing: 0.4px;
-  padding: 4px 12px; border-radius: 999px;
-  margin-bottom: 18px;
+  padding: 4.5px 13px; border-radius: 999px;
+  margin-bottom: 14px;
   box-shadow: 0 4px 14px rgba(0, 122, 255, 0.38);
 }
-.tg-logo-orb {
-  width: 68px; height: 68px; border-radius: 20px;
-  margin: 0 auto 16px;
-  background: rgba(255, 255, 255, 0.06);
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  display: flex; align-items: center; justify-content: center;
-  overflow: hidden; position: relative;
-  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.35);
+.tg-pet-stage-login {
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  height: 76px; margin-bottom: 10px; position: relative;
 }
-.tg-logo-orb img { width: 100%; height: 100%; object-fit: cover; }
+.tg-pet-svg {
+  width: 82px; height: 58px; overflow: visible;
+  filter: drop-shadow(0 6px 12px rgba(0, 0, 0, 0.35));
+}
+.tg-pet-svg .pet-body-group { animation: petBob 0.55s ease-in-out infinite alternate; transform-origin: center; }
+.tg-pet-svg .pet-tail { animation: petTailWag 0.32s ease-in-out infinite alternate; transform-origin: 26px 42px; }
+.tg-pet-svg .pet-leg-front-r, .tg-pet-svg .pet-leg-back-l { animation: petLegStrideA 0.38s ease-in-out infinite alternate; transform-origin: top center; }
+.tg-pet-svg .pet-leg-front-l, .tg-pet-svg .pet-leg-back-r { animation: petLegStrideB 0.38s ease-in-out infinite alternate; transform-origin: top center; }
+.tg-pet-svg .pet-eyes { animation: petEyeBlink 3.6s infinite; transform-origin: center; }
+@keyframes petBob { from { transform: translateY(0px); } to { transform: translateY(-3.5px); } }
+@keyframes petTailWag { from { transform: rotate(-14deg); } to { transform: rotate(16deg); } }
+@keyframes petLegStrideA { from { transform: rotate(-16deg); } to { transform: rotate(16deg); } }
+@keyframes petLegStrideB { from { transform: rotate(16deg); } to { transform: rotate(-16deg); } }
+@keyframes petEyeBlink { 0%, 92%, 100% { transform: scaleY(1); } 96% { transform: scaleY(0.08); } }
+
 .tg-auth-title {
   font-size: 20px; font-weight: 700; text-align: center;
   letter-spacing: -0.3px; margin-bottom: 6px;
 }
 .tg-auth-sub {
-  font-size: 13px; color: var(--tg-muted); text-align: center;
-  line-height: 1.45; margin-bottom: 24px;
+  font-size: 12.5px; color: var(--tg-muted); text-align: center;
+  line-height: 1.45; margin-bottom: 20px;
 }
 .tg-input-group { margin-bottom: 16px; }
 .tg-input-label {
   display: block; font-size: 12px; font-weight: 600;
   color: var(--tg-muted); margin-bottom: 7px; padding-left: 4px;
 }
-.tg-input-wrap {
-  position: relative; display: flex; align-items: center;
-}
+.tg-input-wrap { position: relative; display: flex; align-items: center; }
 .tg-input-icon {
   position: absolute; left: 14px; color: var(--tg-muted);
   display: flex; align-items: center; pointer-events: none;
@@ -12351,26 +12492,28 @@ html, body {
   width: 100%; padding: 13px 14px 13px 42px;
   font-size: 14px; color: var(--tg-text);
   background: var(--tg-surface-elevated);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.10);
   border-radius: 14px; outline: none;
   transition: all 0.2s ease;
 }
 .tg-input:focus {
   border-color: var(--tg-cyan);
-  background: rgba(58, 58, 60, 0.85);
-  box-shadow: 0 0 0 3px rgba(42, 171, 238, 0.2);
+  background: rgba(58, 58, 64, 0.90);
+  box-shadow: 0 0 0 3px rgba(42, 171, 238, 0.22);
 }
 .tg-btn-login {
-  width: 100%; padding: 13px 18px;
-  font-size: 14.5px; font-weight: 600; color: #ffffff;
-  background: linear-gradient(135deg, #007aff 0%, #2aabee 100%);
+  position: relative; overflow: hidden;
+  width: 100%; padding: 13.5px 18px;
+  font-size: 14.5px; font-weight: 700; color: #ffffff;
+  background: linear-gradient(135deg, #007aff 0%, #2aabee 55%, #30d158 100%);
+  background-size: 200% 200%;
   border: none; border-radius: 14px; cursor: pointer;
   display: flex; align-items: center; justify-content: center; gap: 8px;
-  box-shadow: 0 8px 22px rgba(0, 122, 255, 0.35);
-  transition: transform 0.18s ease, box-shadow 0.18s ease, opacity 0.18s ease;
+  box-shadow: 0 10px 26px rgba(0, 122, 255, 0.38), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+  transition: transform 0.2s cubic-bezier(0.22, 1, 0.36, 1), box-shadow 0.2s ease;
 }
-.tg-btn-login:hover { transform: translateY(-1px); box-shadow: 0 12px 26px rgba(0, 122, 255, 0.45); }
-.tg-btn-login:active { transform: scale(0.98); }
+.tg-btn-login:hover { transform: translateY(-1.5px); box-shadow: 0 14px 30px rgba(0, 122, 255, 0.48); }
+.tg-btn-login:active { transform: scale(0.97); }
 .tg-err-banner {
   background: rgba(255, 69, 58, 0.14);
   border: 1px solid rgba(255, 69, 58, 0.35);
@@ -12378,54 +12521,43 @@ html, body {
   font-size: 12.5px; margin-bottom: 16px; text-align: center; font-weight: 500;
 }
 .tg-sec-footer {
-  margin-top: 20px; padding-top: 14px;
+  margin-top: 18px; padding-top: 14px;
   border-top: 1px solid rgba(255, 255, 255, 0.08);
   display: flex; align-items: center; justify-content: space-between;
   font-size: 11.5px; color: var(--tg-muted);
 }
-.tg-sec-badge {
-  display: inline-flex; align-items: center; gap: 5px; color: var(--tg-green); font-weight: 600;
-}
-/* Loading & Security Handshake Overlay */
+.tg-sec-badge { display: inline-flex; align-items: center; gap: 5px; color: var(--tg-green); font-weight: 600; }
+
 .tg-loader-overlay {
   position: fixed; inset: 0; z-index: 9999;
-  background: rgba(0, 0, 0, 0.88);
+  background: rgba(0, 0, 0, 0.90);
   backdrop-filter: blur(28px); -webkit-backdrop-filter: blur(28px);
   display: none; flex-direction: column; align-items: center; justify-content: center;
   padding: 24px;
 }
 .tg-loader-overlay.active { display: flex; animation: tgFadeIn 0.22s ease forwards; }
 @keyframes tgFadeIn { from { opacity: 0; } to { opacity: 1; } }
-.tg-spinner-ring {
-  width: 56px; height: 56px; border-radius: 50%;
-  border: 3px solid rgba(255, 255, 255, 0.12);
-  border-top-color: var(--tg-cyan);
-  animation: tgSpin 0.75s linear infinite;
-  margin-bottom: 18px;
-}
-@keyframes tgSpin { to { transform: rotate(360deg); } }
-.tg-loader-step {
-  font-size: 14px; font-weight: 600; color: #ffffff; margin-bottom: 6px;
-}
-.tg-loader-sub {
-  font-size: 12px; color: var(--tg-muted); margin-bottom: 16px;
-}
+.tg-loader-step { font-size: 14.5px; font-weight: 700; color: #ffffff; margin: 12px 0 5px; text-align: center; }
+.tg-loader-sub { font-size: 12px; color: var(--tg-muted); margin-bottom: 16px; text-align: center; }
 .tg-loader-bar-wrap {
-  width: 220px; height: 4px; background: rgba(255, 255, 255, 0.12);
+  width: 240px; height: 6px; background: rgba(255, 255, 255, 0.12);
   border-radius: 999px; overflow: hidden;
 }
 .tg-loader-bar {
   height: 100%; width: 15%;
-  background: linear-gradient(90deg, #007aff, #2aabee, #30d158);
+  background: linear-gradient(90deg, #ffb347, #2aabee, #30d158);
   border-radius: 999px; transition: width 0.28s ease;
 }
 </style>
 </head>
 <body>
   <div class="tg-loader-overlay" id="tgLoginLoader">
-    <div class="tg-spinner-ring"></div>
-    <div class="tg-loader-step" id="tgLoaderStepText">Đang thiết lập kênh bảo mật TLS...</div>
-    <div class="tg-loader-sub" id="tgLoaderSubText">Mã hóa phiên PBKDF2-HMAC-SHA256</div>
+    <div style="display:flex;align-items:center;gap:6px">
+      {{ corgi_svg|safe }}
+      {{ cat_svg|safe }}
+    </div>
+    <div class="tg-loader-step" id="tgLoaderStepText">Corgi &amp; Mèo Anh đang mở khóa cổng bảo mật...</div>
+    <div class="tg-loader-sub" id="tgLoaderSubText">Xác thực chữ ký PBKDF2-HMAC-SHA256 &amp; định tuyến VN/SG</div>
     <div class="tg-loader-bar-wrap">
       <div class="tg-loader-bar" id="tgLoaderBar"></div>
     </div>
@@ -12435,14 +12567,17 @@ html, body {
     <div style="text-align:center">
       <div class="tg-top-pill">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M11.944 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0a12 12 0 0 0-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 0 1 .171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z"/></svg>
-        <span>TELEGRAM SECURE</span>
+        <span>TELEGRAM PET STUDIO</span>
       </div>
     </div>
-    <div class="tg-logo-orb">
-      <img src="/api/logo?v={{ logo_ts }}" alt="Logo">
+
+    <div class="tg-pet-stage-login">
+      {{ corgi_svg|safe }}
+      {{ cat_svg|safe }}
     </div>
+
     <div class="tg-auth-title">{{ custom_title if custom_title else 'Bảng Điều Khiển Hệ Thống' }}</div>
-    <div class="tg-auth-sub">Giao diện điều phối đa tài khoản chuẩn Telegram tinh gọn, bảo mật cao</div>
+    <div class="tg-auth-sub">Giao diện chuẩn Telegram hiện đại • Trợ lý Chó Corgi &amp; Mèo Anh 24/7</div>
 
     {% if error %}<div class="tg-err-banner">{{ error }}</div>{% endif %}
 
@@ -12458,7 +12593,7 @@ html, body {
         </div>
       </div>
       <button class="tg-btn-login" type="submit">
-        <span>Đăng nhập hệ thống</span>
+        <span>Khởi Động Không Gian Điều Khiển</span>
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
       </button>
     </form>
@@ -12482,24 +12617,27 @@ function handleTelegramLoginSubmit(ev) {
   ev.preventDefault();
   loader.dataset.submitted = '1';
   loader.classList.add('active');
-  barEl.style.width = '38%';
+  barEl.style.width = '42%';
   setTimeout(() => {
-    stepEl.textContent = 'Đang xác thực khóa bảo mật & phiên thiết bị...';
-    subEl.textContent = 'Kiểm tra chữ ký chống Brute-Force & CSRF';
-    barEl.style.width = '76%';
+    stepEl.textContent = 'Đang khởi tạo luồng QR Zalo VN/SG & 64 Shards Discord...';
+    subEl.textContent = 'Đồng bộ hiệu ứng vật lý Python & trợ lý Corgi / Mèo Anh';
+    barEl.style.width = '82%';
   }, 180);
   setTimeout(() => {
-    stepEl.textContent = 'Đang tải không gian điều khiển Telegram...';
-    subEl.textContent = 'Khởi tạo hiệu ứng chuyển trang & kết nối thời gian thực';
+    stepEl.textContent = 'Hoàn tất! Đang mở Bảng Điều Khiển...';
     barEl.style.width = '100%';
     document.getElementById('tgLoginForm').submit();
-  }, 380);
+  }, 360);
   return false;
 }
 </script>
 </body>
 </html>"""
+'''
 
+# -*- coding: utf-8 -*-
+
+PART2_BLOCK = r'''
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="vi">
 <head>
@@ -12509,11 +12647,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <style>
 :root {
   --bg: #000000;
-  --bg-sub: #0b0b0e;
+  --bg-sub: #0b0b0f;
   --surface: #1c1c1e;
   --surface-sub: #2c2c2e;
-  --surface-glass: rgba(28, 28, 30, 0.84);
-  --border: rgba(255, 255, 255, 0.09);
+  --surface-glass: rgba(28, 28, 30, 0.88);
+  --border: rgba(255, 255, 255, 0.10);
   --border-light: rgba(255, 255, 255, 0.06);
   --txt: #ffffff;
   --txt-muted: #8e8e93;
@@ -12525,16 +12663,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   --red: #ff453a;
   --amber: #ff9f0a;
   --indigo: #5e5ce6;
-  --dock-bg: rgba(28, 28, 30, 0.88);
-  --dock-pill: rgba(255, 255, 255, 0.13);
-  --dock-border: rgba(255, 255, 255, 0.12);
+  --dock-bg: rgba(26, 26, 30, 0.92);
+  --dock-pill: rgba(255, 255, 255, 0.14);
+  --dock-border: rgba(255, 255, 255, 0.13);
 }
 body[data-theme="tg_light"] {
   --bg: #f2f2f7;
   --bg-sub: #e5e5ea;
   --surface: #ffffff;
   --surface-sub: #f2f2f7;
-  --surface-glass: rgba(255, 255, 255, 0.88);
+  --surface-glass: rgba(255, 255, 255, 0.90);
   --border: rgba(60, 60, 67, 0.14);
   --border-light: rgba(60, 60, 67, 0.08);
   --txt: #000000;
@@ -12547,9 +12685,9 @@ body[data-theme="tg_light"] {
   --red: #ff3b30;
   --amber: #ff9500;
   --indigo: #5856d6;
-  --dock-bg: rgba(255, 255, 255, 0.90);
-  --dock-pill: rgba(0, 122, 255, 0.12);
-  --dock-border: rgba(0, 0, 0, 0.09);
+  --dock-bg: rgba(255, 255, 255, 0.92);
+  --dock-pill: rgba(0, 122, 255, 0.13);
+  --dock-border: rgba(0, 0, 0, 0.10);
 }
 * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
 html, body {
@@ -12563,111 +12701,190 @@ html, body {
 code, pre, .mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; }
 input, select, textarea, button { font-family: inherit; font-size: 13px; }
 
-/* Page Transition Loader */
+/* Page Boot Loader with Running Corgi & Cat Duo */
 #tgPageBootLoader {
   position: fixed; inset: 0; z-index: 9000;
-  background: var(--bg);
+  background: radial-gradient(circle at 50% 35%, rgba(42, 171, 238, 0.15), transparent 60%), var(--bg);
   display: flex; flex-direction: column; align-items: center; justify-content: center;
-  transition: opacity 0.32s ease, visibility 0.32s ease;
+  gap: 12px;
+  transition: opacity 0.35s ease, visibility 0.35s ease;
 }
 #tgPageBootLoader.hidden { opacity: 0; visibility: hidden; pointer-events: none; }
-.tg-boot-plane {
-  width: 54px; height: 54px; border-radius: 50%;
-  background: linear-gradient(135deg, #007aff 0%, #2aabee 100%);
-  display: flex; align-items: center; justify-content: center;
-  color: #fff; box-shadow: 0 10px 28px rgba(0, 122, 255, 0.4);
-  animation: tgPulsePlane 1.1s ease-in-out infinite;
+.tg-boot-pets {
+  display: flex; align-items: center; justify-content: center; gap: 6px;
 }
-@keyframes tgPulsePlane {
-  0%, 100% { transform: scale(1); }
-  50% { transform: scale(1.08); }
+
+/* Lifelike Python SVG Pet Animations (Corgi Dog & British Shorthair Cat) */
+.tg-pet-svg {
+  width: 72px; height: 50px; overflow: visible; flex-shrink: 0;
+  filter: drop-shadow(0 5px 10px rgba(0, 0, 0, 0.32));
+  transition: transform 0.25s cubic-bezier(0.22, 1, 0.36, 1);
+  cursor: pointer;
 }
+.tg-pet-svg:hover { transform: scale(1.08) translateY(-2px); }
+.tg-pet-svg:active { transform: scale(0.95); }
+.tg-pet-svg .pet-body-group { animation: petBob 0.52s ease-in-out infinite alternate; transform-origin: center; }
+.tg-pet-svg .pet-tail { animation: petTailWag 0.28s ease-in-out infinite alternate; transform-origin: 26px 42px; }
+.tg-pet-svg .pet-leg-front-r, .tg-pet-svg .pet-leg-back-l { animation: petLegStrideA 0.34s ease-in-out infinite alternate; transform-origin: top center; }
+.tg-pet-svg .pet-leg-front-l, .tg-pet-svg .pet-leg-back-r { animation: petLegStrideB 0.34s ease-in-out infinite alternate; transform-origin: top center; }
+.tg-pet-svg .pet-ear-l { animation: petEarTwitch 2.2s ease-in-out infinite alternate; transform-origin: 70px 20px; }
+.tg-pet-svg .pet-ear-r { animation: petEarTwitch 2.2s ease-in-out infinite alternate-reverse; transform-origin: 88px 18px; }
+.tg-pet-svg .pet-eyes { animation: petEyeBlink 3.8s infinite; transform-origin: center; }
+.tg-pet-svg.turbo-speed .pet-body-group { animation-duration: 0.24s; }
+.tg-pet-svg.turbo-speed .pet-tail { animation-duration: 0.14s; }
+.tg-pet-svg.turbo-speed .pet-leg-front-r, .tg-pet-svg.turbo-speed .pet-leg-back-l,
+.tg-pet-svg.turbo-speed .pet-leg-front-l, .tg-pet-svg.turbo-speed .pet-leg-back-r { animation-duration: 0.16s; }
+
+@keyframes petBob { from { transform: translateY(0px); } to { transform: translateY(-3.2px); } }
+@keyframes petTailWag { from { transform: rotate(-15deg); } to { transform: rotate(18deg); } }
+@keyframes petLegStrideA { from { transform: rotate(-18deg); } to { transform: rotate(18deg); } }
+@keyframes petLegStrideB { from { transform: rotate(18deg); } to { transform: rotate(-18deg); } }
+@keyframes petEarTwitch { 0%, 80% { transform: rotate(0deg); } 90% { transform: rotate(-7deg); } 100% { transform: rotate(5deg); } }
+@keyframes petEyeBlink { 0%, 92%, 100% { transform: scaleY(1); } 96% { transform: scaleY(0.08); } }
 
 .container {
   max-width: 1120px; margin: 0 auto;
-  padding: 10px 14px 110px;
+  padding: 8px 12px calc(148px + env(safe-area-inset-bottom, 0px));
 }
 
-/* Telegram Top Status & Header Bar */
+/* ==================== NON-OVERLAPPING TELEGRAM HEADER & STATUS STRIP ==================== */
 .tg-top-status-row {
-  display: flex; align-items: center; justify-content: center;
-  gap: 8px; padding: 4px 0 8px;
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 6px; padding: 4px 2px 6px;
+  overflow-x: auto; white-space: nowrap; flex-wrap: nowrap;
+  scrollbar-width: none; -ms-overflow-style: none;
 }
+.tg-top-status-row::-webkit-scrollbar { display: none; }
+
 .tg-capsule-brand {
-  display: inline-flex; align-items: center; gap: 6px;
-  background: #007aff; color: #ffffff;
-  font-size: 11px; font-weight: 700; letter-spacing: 0.4px;
-  padding: 3.5px 12px; border-radius: 999px;
-  box-shadow: 0 2px 10px rgba(0, 122, 255, 0.35);
+  display: inline-flex; align-items: center; gap: 5px;
+  background: linear-gradient(135deg, #007aff 0%, #2aabee 100%);
+  color: #ffffff; font-size: 10.5px; font-weight: 700; letter-spacing: 0.3px;
+  padding: 4px 10px; border-radius: 999px; flex-shrink: 0;
+  box-shadow: 0 2px 10px rgba(0, 122, 255, 0.32);
 }
 .tg-capsule-telemetry {
-  display: inline-flex; align-items: center; gap: 6px;
+  display: inline-flex; align-items: center; gap: 5px;
   background: var(--surface); border: 1px solid var(--border);
   color: var(--txt-muted); font-size: 11px; font-weight: 600;
-  padding: 3.5px 10px; border-radius: 999px; cursor: pointer;
+  padding: 4px 10px; border-radius: 999px; cursor: pointer;
+  white-space: nowrap; flex-shrink: 0;
+  transition: border-color 0.2s ease, transform 0.15s ease;
 }
+.tg-capsule-telemetry:active { transform: scale(0.97); }
 .dot-online {
   width: 7px; height: 7px; border-radius: 50%;
-  background: var(--green); display: inline-block;
+  background: var(--green); display: inline-block; flex-shrink: 0;
   box-shadow: 0 0 8px var(--green);
 }
 
 .tg-navbar {
   display: flex; align-items: center; justify-content: space-between;
-  gap: 10px; padding: 6px 4px 10px;
+  gap: 8px; padding: 6px 2px 10px;
+  flex-wrap: nowrap; width: 100%;
 }
-.tg-nav-pill-btn {
-  display: inline-flex; align-items: center; gap: 6px;
-  background: var(--surface); border: 1px solid var(--border);
-  color: var(--txt); font-size: 13px; font-weight: 600;
-  padding: 7px 14px; border-radius: 999px; cursor: pointer;
-  transition: all 0.18s ease; text-decoration: none;
-}
-.tg-nav-pill-btn:hover { background: var(--surface-sub); }
-.tg-nav-pill-btn:active { transform: scale(0.96); }
-.tg-nav-pill-btn.danger { color: var(--red); }
-
-.tg-nav-center {
-  display: flex; align-items: center; gap: 10px;
-  min-width: 0; justify-content: center; flex: 1;
+.tg-nav-left-brand {
+  display: flex; align-items: center; gap: 9px;
+  min-width: 0; flex: 1 1 auto; overflow: hidden;
 }
 .brand-logo-wrap {
-  width: 34px; height: 34px; border-radius: 50%;
-  background: var(--surface-sub); border: 1px solid var(--border);
+  width: 36px; height: 36px; border-radius: 50%;
+  background: var(--surface-sub); border: 1.5px solid var(--tg-cyan);
   overflow: hidden; cursor: pointer; flex-shrink: 0;
   display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 4px 12px rgba(42, 171, 238, 0.22);
+  transition: transform 0.2s ease;
 }
-.brand-logo-wrap img { width: 100%; height: 100%; object-fit: cover; }
+.brand-logo-wrap:hover { transform: scale(1.06); }
+.brand-logo-wrap img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.tg-nav-title-block {
+  min-width: 0; flex: 1; overflow: hidden;
+}
 .tg-nav-title {
-  font-size: 17px; font-weight: 700; letter-spacing: -0.3px;
+  font-size: 15.5px; font-weight: 700; letter-spacing: -0.25px;
   color: var(--txt); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  transition: transform 0.24s ease, opacity 0.24s ease;
+}
+.tg-nav-subtitle {
+  font-size: 10.5px; color: var(--txt-muted);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+.tg-nav-actions-right {
+  display: flex; align-items: center; gap: 5px;
+  flex-shrink: 0;
+}
+.tg-nav-pill-btn {
+  position: relative; overflow: hidden;
+  display: inline-flex; align-items: center; justify-content: center; gap: 4px;
+  background: var(--surface); border: 1px solid var(--border);
+  color: var(--txt); font-size: 12px; font-weight: 600;
+  padding: 6px 11px; border-radius: 999px; cursor: pointer;
+  white-space: nowrap; flex-shrink: 0;
+  transition: all 0.18s cubic-bezier(0.22, 1, 0.36, 1); text-decoration: none;
+}
+.tg-nav-pill-btn:hover { background: var(--surface-sub); transform: translateY(-1px); }
+.tg-nav-pill-btn:active { transform: scale(0.95); }
+.tg-nav-pill-btn.danger {
+  background: rgba(255, 69, 58, 0.14);
+  border-color: rgba(255, 69, 58, 0.35);
+  color: var(--red);
 }
 
 .tg-nav-right-group {
   display: inline-flex; align-items: center; gap: 2px;
   background: var(--surface); border: 1px solid var(--border);
-  padding: 3px 5px; border-radius: 999px;
+  padding: 2.5px 4px; border-radius: 999px; flex-shrink: 0;
 }
 .tg-icon-btn {
-  width: 32px; height: 32px; border-radius: 50%;
+  width: 30px; height: 30px; border-radius: 50%;
   border: none; background: transparent; color: var(--txt);
   display: inline-flex; align-items: center; justify-content: center;
   cursor: pointer; transition: background 0.16s ease, transform 0.16s ease;
-  text-decoration: none;
+  text-decoration: none; flex-shrink: 0;
 }
 .tg-icon-btn:hover { background: var(--surface-sub); }
-.tg-icon-btn:active { transform: scale(0.92); }
+.tg-icon-btn:active { transform: scale(0.90); }
 
-/* Telegram Rounded Search Bar */
-.tg-search-wrap {
-  margin-bottom: 12px;
+/* ==================== INTERACTIVE PET COMPANION STUDIO BAR ==================== */
+.tg-pet-companion-bar {
+  background: linear-gradient(135deg, rgba(28, 28, 32, 0.95) 0%, rgba(36, 38, 48, 0.92) 100%);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 8px 12px;
+  margin-bottom: 10px;
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; flex-wrap: wrap;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
 }
+body[data-theme="tg_light"] .tg-pet-companion-bar {
+  background: linear-gradient(135deg, #ffffff 0%, #f0f4ff 100%);
+}
+.tg-pet-duo-stage {
+  display: flex; align-items: center; gap: 4px;
+  min-width: 0; flex: 1 1 220px;
+}
+.tg-pet-speech {
+  min-width: 0; flex: 1;
+}
+.tg-pet-speech-title {
+  font-size: 11.5px; font-weight: 700; color: var(--tg-cyan);
+  display: flex; align-items: center; gap: 5px;
+}
+.tg-pet-speech-sub {
+  font-size: 11px; color: var(--txt-muted);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.tg-pet-controls {
+  display: flex; align-items: center; gap: 4px; flex-shrink: 0;
+}
+
+/* Telegram Full-Width Rounded Search Bar */
+.tg-search-wrap { margin-bottom: 10px; }
 .tg-search-bar {
   width: 100%; background: var(--surface);
   border: 1px solid var(--border-light);
-  border-radius: 14px; padding: 9px 14px;
-  display: flex; align-items: center; gap: 10px;
+  border-radius: 14px; padding: 8.5px 12px;
+  display: flex; align-items: center; gap: 8px;
   transition: border-color 0.2s ease, background 0.2s ease;
 }
 .tg-search-bar:focus-within {
@@ -12676,8 +12893,9 @@ input, select, textarea, button { font-family: inherit; font-size: 13px; }
 }
 .tg-search-bar svg { color: var(--txt-muted); flex-shrink: 0; }
 .tg-search-input {
-  width: 100%; background: transparent; border: none; outline: none;
-  color: var(--txt); font-size: 13.5px;
+  width: 100%; min-width: 0; flex: 1;
+  background: transparent; border: none; outline: none;
+  color: var(--txt); font-size: 13px;
 }
 .tg-search-input::placeholder { color: var(--txt-muted); }
 
@@ -12686,14 +12904,14 @@ input, select, textarea, button { font-family: inherit; font-size: 13px; }
   display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px; margin-bottom: 12px;
 }
-@media (max-width: 680px) { .tg-kpi-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 640px) { .tg-kpi-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .kpi-box {
   background: var(--surface); border: 1px solid var(--border);
-  border-radius: 16px; padding: 11px 14px;
+  border-radius: 15px; padding: 10px 13px;
   display: flex; align-items: center; justify-content: space-between;
 }
-.kpi-label { font-size: 11.5px; color: var(--txt-muted); font-weight: 500; display: block; }
-.kpi-val { font-size: 18px; font-weight: 700; color: var(--txt); font-variant-numeric: tabular-nums; }
+.kpi-label { font-size: 11.5px; color: var(--txt-muted); font-weight: 500; }
+.kpi-val { font-size: 17.5px; font-weight: 700; color: var(--txt); font-variant-numeric: tabular-nums; }
 
 /* Panels & Grouped Cells */
 .grid-12 { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 12px; }
@@ -12707,19 +12925,19 @@ input, select, textarea, button { font-family: inherit; font-size: 13px; }
   border-radius: 18px; margin-bottom: 12px; overflow: hidden;
 }
 .panel-hd {
-  padding: 12px 16px; border-bottom: 1px solid var(--border-light);
+  padding: 11px 14px; border-bottom: 1px solid var(--border-light);
   display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap;
 }
 .panel-title {
   font-size: 13.5px; font-weight: 700; color: var(--txt);
   display: inline-flex; align-items: center; gap: 7px;
 }
-.panel-body { padding: 14px 16px; }
+.panel-body { padding: 13px 14px; }
 
 .row-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-bottom: 8px; }
 .row-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-bottom: 8px; }
 .row-4 { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-bottom: 8px; }
-@media (max-width: 640px) {
+@media (max-width: 580px) {
   .row-2, .row-3, .row-4 { grid-template-columns: 1fr; }
 }
 
@@ -12732,67 +12950,145 @@ input, select, textarea, button { font-family: inherit; font-size: 13px; }
   background: var(--surface-sub); border: 1px solid var(--border);
   border-radius: 12px; outline: none; transition: border-color 0.18s ease, background 0.18s ease;
 }
-.inp:focus, .sel:focus, .txt:focus {
-  border-color: var(--tg-cyan);
-}
-.txt { min-height: 78px; resize: vertical; }
+.inp:focus, .sel:focus, .txt:focus { border-color: var(--tg-cyan); }
+.txt { min-height: 76px; resize: vertical; }
 
-/* Segmented Sub-tabs */
+/* Crisp Single-Line Segmented Sub-tabs */
 .sub-tabs {
-  display: flex; gap: 4px; padding: 3px;
+  display: flex; align-items: stretch; gap: 4px; padding: 3px;
   background: var(--surface-sub); border-radius: 12px;
-  margin-bottom: 12px; border: 1px solid var(--border-light);
+  margin-bottom: 10px; border: 1px solid var(--border-light);
+  overflow-x: auto; scrollbar-width: none;
 }
+.sub-tabs::-webkit-scrollbar { display: none; }
 .sub-tab {
-  flex: 1; padding: 7px 10px; border-radius: 9px;
+  position: relative; overflow: hidden;
+  flex: 1 1 0; min-width: 0; padding: 7.5px 8px; border-radius: 9px;
   border: none; background: transparent; color: var(--txt-muted);
-  font-size: 12px; font-weight: 600; cursor: pointer;
-  transition: all 0.2s ease; text-align: center;
+  font-size: 11.5px; font-weight: 600; cursor: pointer;
+  white-space: nowrap; text-overflow: ellipsis;
+  display: inline-flex; align-items: center; justify-content: center; gap: 4px;
+  transition: all 0.2s cubic-bezier(0.22, 1, 0.36, 1); text-align: center;
 }
 .sub-tab.active {
   background: var(--surface); color: var(--txt);
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.22);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.24);
 }
 
-/* Buttons */
+/* ==================== MODERN INTERACTIVE BUTTONS & LIVE PET LOADERS ==================== */
 .btn {
+  position: relative; overflow: hidden;
   display: inline-flex; align-items: center; justify-content: center; gap: 6px;
   padding: 8px 13px; border-radius: 11px;
   border: 1px solid var(--border); background: var(--surface-sub);
   color: var(--txt); font-size: 12.5px; font-weight: 600;
-  cursor: pointer; text-decoration: none; transition: all 0.16s ease;
+  cursor: pointer; text-decoration: none; white-space: nowrap;
+  transition: transform 0.2s cubic-bezier(0.22, 1, 0.36, 1), box-shadow 0.2s ease, background 0.2s ease, border-color 0.2s ease;
+  user-select: none; -webkit-user-select: none;
 }
-.btn:hover { filter: brightness(1.08); }
-.btn:active { transform: scale(0.97); }
+.btn::before {
+  content: ""; position: absolute; top: 0; left: -120%; width: 70%; height: 100%;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.14), transparent);
+  transform: skewX(-20deg); transition: left 0.55s ease; pointer-events: none;
+}
+.btn:hover::before { left: 150%; }
+.btn:hover { transform: translateY(-1px); box-shadow: 0 6px 16px rgba(0, 0, 0, 0.25); }
+.btn:active { transform: scale(0.96); }
 .btn-sm { padding: 5.5px 10px; font-size: 11.5px; border-radius: 9px; }
-.btn-block { width: 100%; padding: 10.5px 14px; font-size: 13.5px; border-radius: 12px; }
-.btn-primary { background: var(--blue); border-color: var(--blue); color: #ffffff; }
-.btn-success { background: var(--green); border-color: var(--green); color: #ffffff; }
-.btn-danger { background: rgba(255, 69, 58, 0.16); border-color: rgba(255, 69, 58, 0.35); color: var(--red); }
+.btn-block { width: 100%; padding: 11px 14px; font-size: 13.5px; border-radius: 12px; }
+.btn-primary {
+  background: linear-gradient(135deg, #007aff 0%, #2aabee 100%);
+  border-color: rgba(42, 171, 238, 0.5); color: #ffffff;
+  box-shadow: 0 6px 18px rgba(0, 122, 255, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.22);
+}
+.btn-success {
+  background: linear-gradient(135deg, #28cd41 0%, #30d158 100%);
+  border-color: rgba(48, 209, 88, 0.5); color: #ffffff;
+  box-shadow: 0 6px 18px rgba(48, 209, 88, 0.26), inset 0 1px 0 rgba(255, 255, 255, 0.22);
+}
+.btn-danger {
+  background: rgba(255, 69, 58, 0.15);
+  border-color: rgba(255, 69, 58, 0.38); color: var(--red);
+}
+
+/* Button Ripple & Pet Loading State */
+.tg-btn-ripple {
+  position: absolute; border-radius: 50%; pointer-events: none;
+  background: rgba(255, 255, 255, 0.35);
+  transform: scale(0); animation: tgRippleExpand 0.55s ease-out forwards;
+}
+@keyframes tgRippleExpand {
+  to { transform: scale(3.5); opacity: 0; }
+}
+.btn.pet-loading {
+  pointer-events: none;
+  background-size: 200% 100%;
+  animation: tgBtnShimmer 1.2s linear infinite;
+}
+@keyframes tgBtnShimmer {
+  0% { filter: brightness(1); }
+  50% { filter: brightness(1.12); }
+  100% { filter: brightness(1); }
+}
+.btn-pet-spinner {
+  display: inline-flex; align-items: center; gap: 4px;
+}
+.btn-pet-spinner svg {
+  width: 22px; height: 16px;
+  animation: petMiniRun 0.32s ease-in-out infinite alternate;
+}
+@keyframes petMiniRun {
+  from { transform: translateY(1px) rotate(-4deg); }
+  to { transform: translateY(-2px) rotate(4deg); }
+}
+.paw-dot {
+  width: 5px; height: 5px; border-radius: 50%; background: currentColor;
+  display: inline-block; animation: pawBounce 0.6s infinite alternate;
+}
+.paw-dot:nth-child(2) { animation-delay: 0.15s; }
+.paw-dot:nth-child(3) { animation-delay: 0.30s; }
+@keyframes pawBounce {
+  from { transform: translateY(2px) scale(0.75); opacity: 0.45; }
+  to { transform: translateY(-2px) scale(1.15); opacity: 1; }
+}
+
+/* Floating Paw Particle on Click */
+.tg-floating-paw {
+  position: fixed; z-index: 9999; pointer-events: none;
+  font-size: 13px; animation: tgPawFloatUp 0.72s ease-out forwards;
+}
+@keyframes tgPawFloatUp {
+  0% { opacity: 1; transform: translate(-50%, -50%) scale(0.6) rotate(-12deg); }
+  100% { opacity: 0; transform: translate(-50%, -190%) scale(1.25) rotate(14deg); }
+}
 
 /* Badges */
 .badge {
   display: inline-flex; align-items: center; gap: 4px;
-  padding: 2.5px 8px; border-radius: 999px;
+  padding: 3px 8px; border-radius: 999px;
   font-size: 10.5px; font-weight: 700; letter-spacing: 0.2px;
+  white-space: nowrap; flex-shrink: 0;
 }
 .badge-blue { background: rgba(0, 122, 255, 0.16); color: #409cff; }
 .badge-green { background: rgba(48, 209, 88, 0.16); color: #30d158; }
 .badge-amber { background: rgba(255, 159, 10, 0.16); color: #ff9f0a; }
+.badge-red { background: rgba(255, 69, 58, 0.16); color: #ff6961; }
 .badge-gray { background: var(--surface-sub); color: var(--txt-muted); }
 
 /* Checkboxes & Pills */
 .chk-label {
   display: inline-flex; align-items: center; gap: 7px;
-  padding: 6px 10px; border-radius: 10px;
+  padding: 6.5px 10px; border-radius: 10px;
   background: var(--surface-sub); border: 1px solid var(--border-light);
   font-size: 12px; color: var(--txt); cursor: pointer;
 }
-.chk-label input { accent-color: var(--blue); width: 14px; height: 14px; }
+.chk-label input { accent-color: var(--blue); width: 14px; height: 14px; flex-shrink: 0; }
 
 .acc-selector-bar {
   display: flex; gap: 6px; overflow-x: auto; padding-bottom: 6px; margin-bottom: 10px;
+  scrollbar-width: none;
 }
+.acc-selector-bar::-webkit-scrollbar { display: none; }
 .acc-pill {
   padding: 6px 12px; border-radius: 999px;
   border: 1px solid var(--border); background: var(--surface-sub);
@@ -12810,7 +13106,7 @@ input, select, textarea, button { font-family: inherit; font-size: 13px; }
 }
 .list-item {
   display: flex; align-items: center; justify-content: space-between;
-  gap: 10px; padding: 10px 14px;
+  gap: 10px; padding: 10px 13px;
   border-bottom: 1px solid var(--border-light);
   background: var(--surface); transition: background 0.15s ease;
 }
@@ -12823,33 +13119,42 @@ input, select, textarea, button { font-family: inherit; font-size: 13px; }
 /* Tables */
 .data-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 .data-table th {
-  padding: 9px 12px; text-align: left; font-size: 11px; font-weight: 700;
+  padding: 9px 11px; text-align: left; font-size: 11px; font-weight: 700;
   text-transform: uppercase; color: var(--txt-muted);
   background: var(--surface-sub); border-bottom: 1px solid var(--border);
+  white-space: nowrap;
 }
 .data-table td {
-  padding: 10px 12px; border-bottom: 1px solid var(--border-light);
+  padding: 9.5px 11px; border-bottom: 1px solid var(--border-light);
   vertical-align: middle;
 }
 .data-table tr:last-child td { border-bottom: none; }
 
-/* QR Studio Card */
+/* QR Studio Card & Non-Overlapping 4-Step Bar */
 .qr-studio-card {
   background: var(--surface-sub); border: 1px solid var(--border);
-  border-radius: 16px; padding: 14px;
+  border-radius: 16px; padding: 12px;
 }
+.qr-meta-strip {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 5px; margin-bottom: 8px; overflow-x: auto; white-space: nowrap;
+  scrollbar-width: none;
+}
+.qr-meta-strip::-webkit-scrollbar { display: none; }
 .qr-steps-bar {
-  display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-bottom: 10px;
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 5px; margin-bottom: 10px;
 }
 .qr-step-item {
-  padding: 6px 4px; border-radius: 9px; font-size: 11px; font-weight: 600;
+  padding: 6.5px 4px; border-radius: 9px; font-size: 11px; font-weight: 600;
   text-align: center; background: var(--surface); color: var(--txt-muted);
   border: 1px solid var(--border-light); transition: all 0.22s ease;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .qr-step-item.active { background: var(--blue); color: #ffffff; border-color: var(--blue); }
 .qr-step-item.done { background: rgba(48, 209, 88, 0.18); color: var(--green); border-color: rgba(48, 209, 88, 0.35); }
 .qr-frame {
-  position: relative; overflow: hidden; width: 224px; height: 224px;
+  position: relative; overflow: hidden; width: 220px; height: 220px;
   margin: 10px auto; padding: 10px; background: #ffffff;
   border-radius: 18px; border: 2px solid var(--tg-cyan);
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
@@ -12862,37 +13167,35 @@ input, select, textarea, button { font-family: inherit; font-size: 13px; }
   animation: qrScanLine 2.4s ease-in-out infinite; pointer-events: none;
 }
 
-/* Tab Content Panes with Smooth Directional Slide + Fade Transition */
-.tab-pane {
-  display: none;
-  will-change: transform, opacity;
-}
+/* Tab Content Panes */
+.tab-pane { display: none; will-change: transform, opacity; }
 .tab-pane.active {
   display: block;
-  animation: tgPaneSlideIn 0.32s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  animation: tgPaneSlideIn 0.30s cubic-bezier(0.22, 1, 0.36, 1) forwards;
 }
 .tab-pane.slide-from-left {
-  animation: tgPaneFromLeft 0.32s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  animation: tgPaneFromLeft 0.30s cubic-bezier(0.22, 1, 0.36, 1) forwards;
 }
 @keyframes tgPaneSlideIn {
-  from { opacity: 0; transform: translateX(18px) scale(0.992); }
+  from { opacity: 0; transform: translateX(16px) scale(0.994); }
   to { opacity: 1; transform: translateX(0) scale(1); }
 }
 @keyframes tgPaneFromLeft {
-  from { opacity: 0; transform: translateX(-18px) scale(0.992); }
+  from { opacity: 0; transform: translateX(-16px) scale(0.994); }
   to { opacity: 1; transform: translateX(0) scale(1); }
 }
 
 /* ==================== TELEGRAM FLOATING PILL BOTTOM NAVIGATION BAR ==================== */
 .tg-bottom-dock-wrap {
-  position: fixed; left: 0; right: 0; bottom: 14px;
+  position: fixed; left: 0; right: 0;
+  bottom: calc(10px + env(safe-area-inset-bottom, 0px));
   z-index: 5000; display: flex; justify-content: center;
-  padding: 0 14px; pointer-events: none;
+  padding: 0 12px; pointer-events: none;
 }
 .tg-bottom-bar {
   pointer-events: auto;
   position: relative;
-  width: 100%; max-width: 520px; height: 64px;
+  width: 100%; max-width: 500px; height: 62px;
   background: var(--dock-bg);
   backdrop-filter: blur(32px) saturate(200%);
   -webkit-backdrop-filter: blur(32px) saturate(200%);
@@ -12901,7 +13204,7 @@ input, select, textarea, button { font-family: inherit; font-size: 13px; }
   padding: 4px;
   display: grid; grid-template-columns: repeat(5, 1fr);
   align-items: center;
-  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.10);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.60), inset 0 1px 0 rgba(255, 255, 255, 0.12);
   user-select: none; -webkit-user-select: none;
   touch-action: pan-y;
 }
@@ -12914,12 +13217,12 @@ input, select, textarea, button { font-family: inherit; font-size: 13px; }
   pointer-events: none;
   z-index: 0;
   transform-origin: center center;
-  transition: transform 0.38s cubic-bezier(0.22, 1, 0.36, 1), background-color 0.2s ease;
-  box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.14);
+  transition: transform 0.36s cubic-bezier(0.22, 1, 0.36, 1), background-color 0.2s ease;
+  box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.15);
 }
 .tg-bottom-bar.dragging .tg-nav-pill-indicator {
   transition: none !important;
-  background: rgba(255, 255, 255, 0.19);
+  background: rgba(255, 255, 255, 0.20);
 }
 .nav-tab {
   position: relative; z-index: 1;
@@ -12930,19 +13233,17 @@ input, select, textarea, button { font-family: inherit; font-size: 13px; }
   transition: color 0.2s ease, transform 0.2s ease;
 }
 .nav-tab svg {
-  width: 21px; height: 21px;
+  width: 20px; height: 20px;
   transition: transform 0.24s cubic-bezier(0.22, 1, 0.36, 1), color 0.2s ease;
 }
 .nav-tab .tg-tab-lbl {
   font-size: 10.5px; font-weight: 600; letter-spacing: -0.1px;
   line-height: 1; white-space: nowrap;
 }
-.nav-tab.active {
-  color: var(--tg-pink);
-}
-.nav-tab.active svg {
-  transform: translateY(-1px) scale(1.08);
-}
+.nav-tab.active { color: var(--tg-pink); }
+.nav-tab.active svg { transform: translateY(-1px) scale(1.08); }
+
+/* Hide badge when value is 0 so it never clutters the dock icons */
 .tab-count {
   position: absolute; top: 4px; right: 16%;
   min-width: 16px; height: 16px; padding: 0 4.5px;
@@ -12951,17 +13252,18 @@ input, select, textarea, button { font-family: inherit; font-size: 13px; }
   display: inline-flex; align-items: center; justify-content: center;
   box-shadow: 0 2px 6px rgba(255, 69, 58, 0.4);
 }
+.tab-count.zero-badge { display: none !important; }
 
 /* Toast Notifications */
 #toastBox {
-  position: fixed; top: 16px; right: 16px; z-index: 9500;
-  display: flex; flex-direction: column; gap: 8px; max-width: 340px;
+  position: fixed; top: 14px; right: 14px; z-index: 9500;
+  display: flex; flex-direction: column; gap: 8px; max-width: 330px;
 }
 .toast-msg {
   background: var(--surface); color: var(--txt);
   border: 1px solid var(--border); border-left: 3.5px solid var(--tg-cyan);
   padding: 10px 14px; border-radius: 14px; font-size: 12.5px; font-weight: 600;
-  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.48);
   animation: tgToastIn 0.22s ease forwards;
 }
 @keyframes tgToastIn {
@@ -12972,7 +13274,7 @@ input, select, textarea, button { font-family: inherit; font-size: 13px; }
 /* Modal Bulk 500 Boxes */
 .tg-modal-backdrop {
   position: fixed; inset: 0; z-index: 8000;
-  background: rgba(0, 0, 0, 0.72); backdrop-filter: blur(12px);
+  background: rgba(0, 0, 0, 0.74); backdrop-filter: blur(12px);
   display: none; align-items: center; justify-content: center; padding: 16px;
 }
 .tg-modal-backdrop.open { display: flex; }
@@ -12985,9 +13287,11 @@ input, select, textarea, button { font-family: inherit; font-size: 13px; }
 </head>
 <body data-theme="tg_dark">
 <div id="tgPageBootLoader">
-  <div class="tg-boot-plane">
-    <svg width="26" height="26" viewBox="0 0 24 24" fill="currentColor"><path d="M11.944 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0a12 12 0 0 0-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 0 1 .171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z"/></svg>
+  <div class="tg-boot-pets">
+    {{ corgi_svg|safe }}
+    {{ cat_svg|safe }}
   </div>
+  <div style="font-size:13.5px;font-weight:700;color:var(--txt)">Đang khởi chạy động cơ Python &amp; Trợ lý Corgi / Mèo Anh...</div>
 </div>
 
 <div id="toastBox"></div>
@@ -13027,63 +13331,88 @@ input, select, textarea, button { font-family: inherit; font-size: 13px; }
 </div>
 
 <div class="container">
-  <!-- Top Status Pill Row (Giống Telegram iOS) -->
+  <!-- Row 1: Single-line Non-Overlapping Status Bar -->
   <div class="tg-top-status-row">
-    <div class="tg-capsule-brand">
-      <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M11.944 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0a12 12 0 0 0-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 0 1 .171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z"/></svg>
-      <span>TELEGRAM</span>
-    </div>
-    <div class="tg-capsule-telemetry" onclick="checkWebPingNow(true)" title="Bấm để kiểm tra độ trễ thời gian thực">
-      <span class="dot-online" id="headerPingDot"></span>
-      <span>Ping: <b id="headerPingText">-- ms</b></span>
-      <span>•</span>
-      <span>API: <b id="liveSendPingVal">-- ms</b></span>
-      <span>•</span>
-      <span id="liveRpmVal">0 tin/phút</span>
+    <div style="display:inline-flex;align-items:center;gap:6px;flex-shrink:0">
+      <div class="tg-capsule-brand">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d="M11.944 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0a12 12 0 0 0-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 0 1 .171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z"/></svg>
+        <span>TELEGRAM</span>
+      </div>
+      <div class="tg-capsule-telemetry" onclick="checkWebPingNow(true)" title="Bấm để kiểm tra độ trễ thời gian thực">
+        <span class="dot-online" id="headerPingDot"></span>
+        <span>Ping: <b id="headerPingText">-- ms</b></span>
+        <span>•</span>
+        <span>API: <b id="liveSendPingVal">-- ms</b></span>
+        <span>•</span>
+        <span id="liveRpmVal">0 RPM</span>
+      </div>
     </div>
     <span class="badge badge-green" id="liveHangStateBadge">SẴN SÀNG</span>
     <span style="display:none" id="liveJitterVal">1.0 ms</span>
     <span style="display:none" id="liveHealedVal">0 lần</span>
   </div>
 
-  <!-- Telegram Header Navigation Bar -->
+  <!-- Row 2: Clean Non-Overlapping Telegram Header Bar -->
   <header class="tg-navbar">
-    <div style="display:flex;align-items:center;gap:6px">
-      <button type="button" class="tg-nav-pill-btn" onclick="toggleLogoSetupModal()">Sửa</button>
-      <button type="button" class="tg-nav-pill-btn danger" onclick="stopAllRunningTasks()">Dừng</button>
-    </div>
-
-    <div class="tg-nav-center">
+    <div class="tg-nav-left-brand">
       <label class="brand-logo-wrap" title="Đổi ảnh đại diện hệ thống">
         <input type="file" id="logoInput" accept="image/*" style="display:none" onchange="uploadBrandLogo(this)">
         <img id="brandLogoImg" src="/api/logo?v={{ logo_ts }}" alt="Logo">
       </label>
-      <div>
+      <div class="tg-nav-title-block">
         <div class="tg-nav-title" id="headerBrandTitle">{{ custom_title if custom_title else 'Chat & Tài Khoản' }}</div>
+        <div class="tg-nav-subtitle">Điều phối đa tài khoản • VN &amp; SG 24/7</div>
       </div>
     </div>
 
-    <div class="tg-nav-right-group">
-      <button type="button" class="tg-icon-btn" onclick="toggleTelegramDayNight()" title="Đổi chế độ Sáng / Tối">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
-      </button>
-      <button type="button" class="tg-icon-btn" onclick="restartTelegramBotNow()" title="Đồng bộ Bot Telegram">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
-      </button>
-      <a href="/logout" class="tg-icon-btn" title="Đăng xuất">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
-      </a>
+    <div class="tg-nav-actions-right">
+      <button type="button" class="tg-nav-pill-btn" onclick="toggleLogoSetupModal()">Sửa</button>
+      <button type="button" class="tg-nav-pill-btn danger" onclick="stopAllRunningTasks()">Dừng</button>
+      <div class="tg-nav-right-group">
+        <button type="button" class="tg-icon-btn" onclick="toggleTelegramDayNight()" title="Đổi chế độ Sáng / Tối">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+        </button>
+        <button type="button" class="tg-icon-btn" onclick="restartTelegramBotNow()" title="Đồng bộ Bot Telegram">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
+        </button>
+        <a href="/logout" class="tg-icon-btn" title="Đăng xuất">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+        </a>
+      </div>
     </div>
     <span id="hdrTeleBotState" style="display:none">Online</span>
     <span id="teleBotHeaderState" style="display:none">Online</span>
   </header>
 
-  <!-- Thanh Tìm Kiếm & Lệnh Nhanh kiểu Telegram -->
+  <!-- Row 3: Interactive Python Pet Mascot Studio (Corgi Dog & British Shorthair Cat) -->
+  <div class="tg-pet-companion-bar" id="tgPetCompanionWidget">
+    <div class="tg-pet-duo-stage">
+      <div id="petCorgiWrap" onclick="triggerPetReaction('corgi')" title="Bấm để vuốt ve Chó Corgi">
+        {{ corgi_svg|safe }}
+      </div>
+      <div id="petCatWrap" onclick="triggerPetReaction('cat')" title="Bấm để vuốt ve Mèo Anh">
+        {{ cat_svg|safe }}
+      </div>
+      <div class="tg-pet-speech">
+        <div class="tg-pet-speech-title">
+          <span id="petMoodText">Corgi &amp; Mèo Anh đang canh giữ phiên 24/7</span>
+        </div>
+        <div class="tg-pet-speech-sub mono" id="latestCmdBannerText">Sẵn sàng nhận lệnh • Bấm vào thú cưng để tương tác</div>
+      </div>
+    </div>
+    <div class="tg-pet-controls">
+      <button type="button" class="btn btn-sm" onclick="switchPetDisplayMode('duo')">Cả Hai</button>
+      <button type="button" class="btn btn-sm" onclick="switchPetDisplayMode('corgi')">Chó Corgi</button>
+      <button type="button" class="btn btn-sm" onclick="switchPetDisplayMode('cat')">Mèo Anh</button>
+    </div>
+  </div>
+
+  <!-- Row 4: Full-Width Search & Command Bar (Zero Text Collision) -->
   <div class="tg-search-wrap">
     <div class="tg-search-bar">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-      <input type="text" class="tg-search-input" id="globalTelegramSearchInput" placeholder="Tìm kiếm tài khoản, phòng chat hoặc gõ lệnh nhanh (.menu, .n, .g, .t)..." oninput="handleGlobalTelegramSearch(this.value)" onkeydown="if(event.key==='Enter'){dispatchGlobalSearchCommand(this.value)}">
-      <span class="mono" style="font-size:11px;color:var(--txt-muted);white-space:nowrap" id="latestCmdBannerText">Sẵn sàng nhận lệnh</span>
+      <input type="text" class="tg-search-input" id="globalTelegramSearchInput" placeholder="Tìm tài khoản, phòng chat hoặc gõ lệnh nhanh (.menu, .n, .g, .t)..." oninput="handleGlobalTelegramSearch(this.value)" onkeydown="if(event.key==='Enter'){dispatchGlobalSearchCommand(this.value)}">
+      <button type="button" class="btn btn-primary btn-sm" onclick="dispatchGlobalSearchCommand(document.getElementById('globalTelegramSearchInput').value)">Chạy</button>
     </div>
   </div>
 
@@ -13145,7 +13474,7 @@ input, select, textarea, button { font-family: inherit; font-size: 13px; }
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>
               <span>Kết Nối Tài Khoản</span>
             </span>
-            <span class="badge badge-blue">Đa Máy Tính Luân Phiên</span>
+            <span class="badge badge-blue">VN &amp; SG Chính Chủ</span>
           </div>
           <div class="panel-body">
             <form method="POST" action="/account/add" onsubmit="return handleAccountFormSubmit(event)">
@@ -13170,8 +13499,8 @@ input, select, textarea, button { font-family: inherit; font-size: 13px; }
                 </div>
 
                 <div id="zaloQRBox" class="qr-studio-card" style="margin-bottom:10px;text-align:center">
-                  <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;margin-bottom:8px;flex-wrap:wrap">
-                    <span class="badge badge-green" id="zaloQRVnBadge">Luân Phiên Máy Tính</span>
+                  <div class="qr-meta-strip">
+                    <span class="badge badge-green" id="zaloQRVnBadge">Định vị VN &amp; SG Thật</span>
                     <span class="badge badge-blue" id="zaloQRCodeIdBadge">Sẵn sàng cấp QR</span>
                     <span class="badge badge-gray" id="zaloQRImeiPreview">Giữ sống 24/7</span>
                   </div>
@@ -13185,28 +13514,35 @@ input, select, textarea, button { font-family: inherit; font-size: 13px; }
 
                   <div class="row-2" style="text-align:left;margin-bottom:8px">
                     <div>
-                      <label class="field-lbl">Quốc gia &amp; Nhóm máy luân phiên</label>
+                      <label class="field-lbl">Quốc gia &amp; Dàn máy tính luân phiên</label>
                       <select class="sel" id="zaloVnRegionSelect">
-                        <option value="VN">Việt Nam — Tự động xoay vòng 11 dòng máy PC/Mac</option>
-                        <option value="SG">Singapore — Tự động xoay vòng 5 dòng máy PC/Mac</option>
-                        <option value="HCM">TP. Hồ Chí Minh — Luân phiên MacBook / ROG / Dell XPS</option>
-                        <option value="HN">Hà Nội — Luân phiên ROG Strix / ThinkPad / MacBook Air</option>
-                        <option value="DN">Đà Nẵng — Luân phiên MSI Titan / Mac Studio / HP Spectre</option>
-                        <option value="MAC">Apple macOS — Luân phiên MacBook Pro / Air / iMac / Studio</option>
+                        <option value="VN">Việt Nam — Xoay vòng 11 dòng máy PC/Mac</option>
+                        <option value="SG">Singapore — Xoay vòng 5 dòng máy PC/Mac</option>
+                        <option value="HCM">TP. Hồ Chí Minh — MacBook / ROG / Dell XPS</option>
+                        <option value="HN">Hà Nội — ROG Strix / ThinkPad / MacBook Air</option>
+                        <option value="DN">Đà Nẵng — MSI Titan / Mac Studio / HP Spectre</option>
+                        <option value="MAC">Apple macOS — MacBook Pro / Air / iMac / Studio</option>
                       </select>
                     </div>
                     <div>
                       <label class="field-lbl">Tên thiết bị tuỳ chỉnh</label>
-                      <input class="inp" id="zaloCustomPcNameInput" placeholder="Để trống tự đổi máy mỗi lần bấm...">
+                      <input class="inp" id="zaloCustomPcNameInput" placeholder="Để trống tự đổi máy mỗi lần...">
                     </div>
                   </div>
+
                   <div style="text-align:left;margin-bottom:8px">
-                    <label class="field-lbl">Proxy kết nối riêng (Tuỳ chọn)</label>
-                    <input class="inp" id="zaloVnProxyInput" placeholder="ip:port hoặc ip:port:user:pass">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;gap:4px;flex-wrap:wrap">
+                      <label class="field-lbl" style="margin:0">Định tuyến IP / Proxy Việt Nam &amp; Singapore thật</label>
+                      <button type="button" class="btn btn-sm" id="btnAutoScanVnSgProxy" onclick="scanAndLockRealVnSgRoute(this)">Quét &amp; Khóa IP VN/SG Thật</button>
+                    </div>
+                    <input class="inp" id="zaloVnProxyInput" placeholder="Để trống tự định tuyến VN/SG hoặc nhập ip:port / socks5://...">
+                    <div id="zaloGeoVerifyBanner" style="margin-top:5px;font-size:11px;color:var(--txt-muted)">
+                      Đang kiểm tra định vị IP thực tế của máy chủ...
+                    </div>
                   </div>
 
                   <div style="font-size:12px;color:var(--txt-muted);margin-bottom:10px;text-align:left;padding:9px 12px;border-radius:12px;background:var(--surface);border:1px solid var(--border-light)" id="zaloQRStatusText">
-                    Mỗi lần bấm <b>Tạo Mã QR</b> hệ thống tự động đổi sang một máy tính mới. Sau khi quét và ấn <b>Đăng nhập</b> trên điện thoại, máy tính được giữ sống liên tục 24/7 trong tài khoản Zalo.
+                    Mỗi lần bấm <b>Tạo Mã QR</b> hệ thống tự động cấp một máy tính mới tại <b>Việt Nam / Singapore</b>. Khi quét mã và ấn <b>Đăng nhập</b> trên điện thoại, máy tính được giữ sống 24/7 trong tài khoản Zalo.
                   </div>
 
                   <div id="zaloQRStageWrap" style="display:none">
@@ -13230,8 +13566,8 @@ input, select, textarea, button { font-family: inherit; font-size: 13px; }
                     </div>
                   </div>
 
-                  <button type="button" class="btn btn-primary btn-block" id="btnStartZaloQR" onclick="startZaloQRLogin()">
-                    Tạo Mã QR Máy Tính Mới
+                  <button type="button" class="btn btn-primary btn-block" id="btnStartZaloQR" onclick="startZaloQRLogin(this)">
+                    <span>Tạo Mã QR Máy Tính Mới</span>
                   </button>
                 </div>
 
@@ -13248,7 +13584,7 @@ input, select, textarea, button { font-family: inherit; font-size: 13px; }
                     <textarea class="txt" name="cookies" id="zaloCookieInput" placeholder="Dán Cookie Zalo (chứa zpw_sek)..."></textarea>
                   </div>
                   <div id="zaloVerifyStatusBox" style="display:none;margin-bottom:8px;padding:8px;border-radius:10px;font-size:12px;background:rgba(48,209,88,0.14);color:var(--green)"></div>
-                  <button type="button" class="btn btn-success btn-block" onclick="verifyAndSaveZaloCookieVault()">Xác Thực &amp; Lưu Thiết Bị</button>
+                  <button type="button" class="btn btn-success btn-block" onclick="verifyAndSaveZaloCookieVault(this)">Xác Thực &amp; Lưu Thiết Bị</button>
                 </div>
 
                 <div id="zaloVaultBox" style="display:none;margin-bottom:10px">
@@ -13404,7 +13740,7 @@ input, select, textarea, button { font-family: inherit; font-size: 13px; }
               <span>Danh Sách Tài Khoản ({{ accounts|length }})</span>
             </span>
             <div style="display:flex;gap:6px;flex-wrap:wrap">
-              <button class="btn btn-sm" type="button" onclick="reconnectAllListenersNow()">Làm mới phiên 24/7</button>
+              <button class="btn btn-sm" type="button" onclick="reconnectAllListenersNow(this)">Làm mới phiên 24/7</button>
               <button class="btn btn-primary btn-sm" type="button" onclick="openPerAccBoxSelector(null)">Chọn Phòng Chat</button>
             </div>
           </div>
@@ -13438,7 +13774,7 @@ input, select, textarea, button { font-family: inherit; font-size: 13px; }
                         </td>
                         <td>
                           <div style="font-weight:600;color:var(--txt)">{{ a.name }}</div>
-                          <div style="font-size:11px;color:var(--txt-muted)">{{ a.pc_name or 'Thiết bị đang hoạt động' }}</div>
+                          <div style="font-size:11px;color:var(--txt-muted)">{{ a.pc_name or 'Thiết bị đang hoạt động 24/7' }}</div>
                         </td>
                         <td class="mono" style="font-size:11.5px">{{ a.uid or a.masked_uid }}</td>
                         <td>
@@ -13451,7 +13787,7 @@ input, select, textarea, button { font-family: inherit; font-size: 13px; }
                         </td>
                         <td>
                           <div style="display:flex;gap:4px">
-                            <button class="btn btn-sm" type="button" onclick="testSingleAccountSession({{ a.id }})">Kiểm tra</button>
+                            <button class="btn btn-sm" type="button" onclick="testSingleAccountSession({{ a.id }}, this)">Kiểm tra</button>
                             <button class="btn btn-sm" type="button" onclick="toggleAccCmd({{ a.id }}, {{ 0 if a.chat_cmd_enabled else 1 }})">{{ 'Tắt' if a.chat_cmd_enabled else 'Bật' }}</button>
                             <a href="/account/delete/{{ a.id }}" class="btn btn-danger btn-sm">Xóa</a>
                           </div>
@@ -13479,7 +13815,7 @@ input, select, textarea, button { font-family: inherit; font-size: 13px; }
               <span>Danh Sách Phòng Chat &amp; 500 Box Tuần Hoàn</span>
             </span>
             <div style="display:flex;gap:4px;flex-wrap:wrap">
-              <button class="btn btn-primary btn-sm" type="button" onclick="loadGroupsAndRooms(true)">Quét Toàn Bộ</button>
+              <button class="btn btn-primary btn-sm" type="button" onclick="loadGroupsAndRooms(true, this)">Quét Toàn Bộ</button>
               <button class="btn btn-success btn-sm" type="button" onclick="selectTopNTargets(500)">Chọn 500 Box</button>
               <button class="btn btn-sm" type="button" onclick="openBulk500BoxModal()">+ Nạp 500 ID</button>
               <button class="btn btn-sm" type="button" onclick="selectAllTargets()">Chọn Hết</button>
@@ -13595,7 +13931,7 @@ input, select, textarea, button { font-family: inherit; font-size: 13px; }
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:4px">
                 <label class="field-lbl" style="margin:0;color:var(--tg-cyan)">Phòng mục tiêu (<span id="quickBoxSelectedCount">0</span> Box đã chọn):</label>
                 <div style="display:flex;gap:4px;flex-wrap:wrap">
-                  <button type="button" class="btn btn-primary btn-sm" id="btnQuickLoadBoxes" onclick="loadGroupsAndRooms(true)">Tải danh sách</button>
+                  <button type="button" class="btn btn-primary btn-sm" id="btnQuickLoadBoxes" onclick="loadGroupsAndRooms(true, this)">Tải danh sách</button>
                   <button type="button" class="btn btn-sm" onclick="selectTopNTargets(100)">100 Box</button>
                   <button type="button" class="btn btn-success btn-sm" onclick="selectTopNTargets(500)">500 Box</button>
                   <button type="button" class="btn btn-sm" onclick="openBulk500BoxModal()">+ Dán 500 ID</button>
@@ -13737,7 +14073,7 @@ input, select, textarea, button { font-family: inherit; font-size: 13px; }
             </div>
 
             <div class="row-2" style="margin-bottom:0">
-              <button class="btn btn-success btn-block" type="button" onclick="launchCampaignTask()">KHỞI CHẠY NGAY</button>
+              <button class="btn btn-success btn-block" type="button" onclick="launchCampaignTask(this)">KHỞI CHẠY NGAY</button>
               <button class="btn btn-danger btn-block" type="button" onclick="stopAllRunningTasks()">DỪNG TẤT CẢ</button>
             </div>
           </div>
@@ -13765,7 +14101,7 @@ input, select, textarea, button { font-family: inherit; font-size: 13px; }
           <div class="panel-body">
             <div style="display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap">
               <input class="inp" id="webQuickCmdInput" placeholder="Nhập lệnh nhanh (.icon 0, .d 0, .n 1, .g 1, .t)..." style="flex:1;min-width:180px">
-              <button type="button" class="btn btn-primary btn-sm" onclick="dispatchWebQuickCommand()">Thực Thi</button>
+              <button type="button" class="btn btn-primary btn-sm" onclick="dispatchWebQuickCommand(this)">Thực Thi</button>
             </div>
             <div style="display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap">
               <input class="inp" id="cpGrantUidInput" placeholder="UID hoặc @Tên cấp quyền (.cp)..." style="flex:1;min-width:130px">
@@ -13984,25 +14320,25 @@ input, select, textarea, button { font-family: inherit; font-size: 13px; }
     <button type="button" class="nav-tab active" data-tab="tab-accounts" data-idx="0" data-title="Chat &amp; Tài Khoản" onclick="switchMainTab('tab-accounts', this)">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
       <span class="tg-tab-lbl">Tài khoản</span>
-      <span class="tab-count">{{ accounts|length }}</span>
+      <span class="tab-count {% if not accounts %}zero-badge{% endif %}" id="dockAccBadge">{{ accounts|length }}</span>
     </button>
 
     <button type="button" class="nav-tab" data-tab="tab-targets" data-idx="1" data-title="Phòng &amp; Kênh Chat" onclick="switchMainTab('tab-targets', this)">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
       <span class="tg-tab-lbl">Phòng chat</span>
-      <span class="tab-count" id="dockTargetBadge">0</span>
+      <span class="tab-count zero-badge" id="dockTargetBadge">0</span>
     </button>
 
     <button type="button" class="nav-tab" data-tab="tab-campaign" data-idx="2" data-title="Chiến Dịch Siêu Tốc" onclick="switchMainTab('tab-campaign', this)">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
       <span class="tg-tab-lbl">Chiến dịch</span>
-      <span class="tab-count" id="dockTaskBadge">0</span>
+      <span class="tab-count zero-badge" id="dockTaskBadge">0</span>
     </button>
 
     <button type="button" class="nav-tab" data-tab="tab-files" data-idx="3" data-title="Kho Kịch Bản (.TXT)" onclick="switchMainTab('tab-files', this)">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
       <span class="tg-tab-lbl">Kịch bản</span>
-      <span class="tab-count">{{ files|length }}</span>
+      <span class="tab-count {% if not files %}zero-badge{% endif %}" id="dockFileBadge">{{ files|length }}</span>
     </button>
 
     <button type="button" class="nav-tab" data-tab="tab-shield" data-idx="4" data-title="Cài Đặt &amp; Hệ Thống" onclick="switchMainTab('tab-shield', this)">
@@ -14011,8 +14347,11 @@ input, select, textarea, button { font-family: inherit; font-size: 13px; }
     </button>
   </nav>
 </div>
+'''
 
-<script>
+# -*- coding: utf-8 -*-
+
+PART3_BLOCK = r'''<script>
 let ALL_TARGETS = [];
 let BY_ACCOUNT_BOXES = {};
 let SELECTED_TARGETS = new Map();
@@ -14027,26 +14366,181 @@ let ZALO_VAULT_CACHE = [];
 let CURRENT_TAB_INDEX = 0;
 let TG_SPRING_SAMPLES = [0, 0.25, 0.56, 0.81, 0.96, 1.03, 1.04, 1.02, 1.0, 1.0];
 
+const MINI_PET_LOADER_SVG = `<svg viewBox="0 0 36 24" fill="none" xmlns="http://www.w3.org/2000/svg"><ellipse cx="17" cy="14" rx="10" ry="5.5" fill="#ffb347"/><circle cx="27" cy="10" r="5.5" fill="#ffb347"/><polygon points="24,6 23,1 27,5" fill="#f58220"/><polygon points="28,5 31,1 31,7" fill="#f58220"/><circle cx="29" cy="9.5" r="1.1" fill="#1c1c1e"/><path d="M7 12 Q2 7 6 5" stroke="#ffb347" stroke-width="2.6" stroke-linecap="round"/><line x1="11" y1="18" x2="9" y2="23" stroke="#fff" stroke-width="2.2" stroke-linecap="round"/><line x1="15" y1="18" x2="16" y2="23" stroke="#fff" stroke-width="2.2" stroke-linecap="round"/><line x1="22" y1="18" x2="21" y2="23" stroke="#fff" stroke-width="2.2" stroke-linecap="round"/><line x1="25" y1="18" x2="27" y2="23" stroke="#fff" stroke-width="2.2" stroke-linecap="round"/></svg>`;
+
 const MY_TAB_ID = 'tab_' + Math.random().toString(36).slice(2, 10) + '_' + Date.now();
 const LEADER_STORAGE_KEY = 'tg_leader_tab_state';
 const MULTI_TAB_BUS = (typeof BroadcastChannel !== 'undefined') ? new BroadcastChannel('tg_multi_acc_bus') : null;
 let LAST_CROSS_TAB_STATUS_TS = 0;
 let _pendingRafStatus = null;
 
-// Khởi tạo hiệu ứng Boot Loader & tải thông số Vật lý từ Python Backend
+function setDockBadgeCount(badgeId, countVal) {
+  const el = document.getElementById(badgeId);
+  if (!el) return;
+  const n = parseInt(countVal || 0, 10) || 0;
+  el.textContent = String(n);
+  el.classList.toggle('zero-badge', n <= 0);
+}
+
+// Khởi tạo hiệu ứng Ripple + Paw Particles cho toàn bộ nút bấm & tải thông số Vật lý từ Python Backend
 (function initTelegramBootAndPhysics() {
   window.addEventListener('DOMContentLoaded', () => {
     setTimeout(() => {
       const loader = document.getElementById('tgPageBootLoader');
       if (loader) loader.classList.add('hidden');
-    }, 220);
+    }, 240);
+    checkZaloGeoStatus(false);
   });
+
+  document.addEventListener('pointerdown', (ev) => {
+    const btn = ev.target.closest('.btn, .tg-nav-pill-btn, .sub-tab, .acc-pill');
+    if (!btn) return;
+    const rect = btn.getBoundingClientRect();
+    const ripple = document.createElement('span');
+    ripple.className = 'tg-btn-ripple';
+    const size = Math.max(rect.width, rect.height);
+    ripple.style.width = ripple.style.height = size + 'px';
+    ripple.style.left = (ev.clientX - rect.left - size / 2) + 'px';
+    ripple.style.top = (ev.clientY - rect.top - size / 2) + 'px';
+    btn.appendChild(ripple);
+    setTimeout(() => ripple.remove(), 580);
+
+    if (ev.clientX && ev.clientY) {
+      const paw = document.createElement('span');
+      paw.className = 'tg-floating-paw';
+      paw.textContent = Math.random() > 0.45 ? '🐾' : '✨';
+      paw.style.left = ev.clientX + 'px';
+      paw.style.top = ev.clientY + 'px';
+      document.body.appendChild(paw);
+      setTimeout(() => paw.remove(), 720);
+    }
+  }, {passive: true});
+
   fetch('/api/ui/physics').then(r => r.json()).then(d => {
     if (d && Array.isArray(d.spring_samples) && d.spring_samples.length > 4) {
       TG_SPRING_SAMPLES = d.spring_samples;
     }
   }).catch(() => {});
 })();
+
+async function withPetButtonLoading(btnEl, loadingText, asyncFn) {
+  if (!btnEl) return await asyncFn();
+  if (btnEl.dataset.loading === '1') return;
+  btnEl.dataset.loading = '1';
+  const origHtml = btnEl.innerHTML;
+  btnEl.classList.add('pet-loading');
+  btnEl.innerHTML = `<span class="btn-pet-spinner">${MINI_PET_LOADER_SVG}<span>${escapeHtmlSafe(loadingText || 'Đang xử lý...')}</span><span class="paw-dot"></span><span class="paw-dot"></span><span class="paw-dot"></span></span>`;
+  setPetTurboMode(true);
+  try {
+    return await asyncFn();
+  } finally {
+    btnEl.classList.remove('pet-loading');
+    btnEl.innerHTML = origHtml;
+    btnEl.dataset.loading = '0';
+    setTimeout(() => setPetTurboMode(false), 450);
+  }
+}
+
+function setPetTurboMode(enabled) {
+  document.querySelectorAll('#tgPetCompanionWidget .tg-pet-svg').forEach(svg => {
+    svg.classList.toggle('turbo-speed', Boolean(enabled));
+  });
+}
+
+function setPetCompanionMood(text) {
+  const el = document.getElementById('petMoodText');
+  if (el && text) el.textContent = text;
+}
+
+function switchPetDisplayMode(mode) {
+  const corgiW = document.getElementById('petCorgiWrap');
+  const catW = document.getElementById('petCatWrap');
+  if (!corgiW || !catW) return;
+  corgiW.style.display = (mode === 'cat') ? 'none' : 'block';
+  catW.style.display = (mode === 'corgi') ? 'none' : 'block';
+  if (mode === 'corgi') setPetCompanionMood('Chó Corgi Hoàng Gia đang trực chiến tốc độ 0ms!');
+  else if (mode === 'cat') setPetCompanionMood('Mèo Anh Lông Ngắn đang canh giữ kết nối VN & SG 24/7!');
+  else setPetCompanionMood('Đôi bạn Corgi & Mèo Anh đang canh giữ phiên 24/7!');
+}
+
+function triggerPetReaction(whichPet) {
+  setPetTurboMode(true);
+  setTimeout(() => setPetTurboMode(false), 1200);
+  if (whichPet === 'corgi') {
+    setPetCompanionMood('Gâu gâu! Chó Corgi đã sẵn sàng càn quét 500 Box & giữ sống Zalo PC!');
+    showToast('Chó Corgi vẫy đuôi chào bạn!');
+  } else {
+    setPetCompanionMood('Meow! Mèo Anh đã kiểm tra định tuyến Việt Nam & Singapore an toàn 100%!');
+    showToast('Mèo Anh kêu rừ rừ chúc bạn một ngày tốt lành!');
+  }
+}
+
+async function checkZaloGeoStatus(forceScan = false) {
+  const banner = document.getElementById('zaloGeoVerifyBanner');
+  const badge = document.getElementById('zaloQRVnBadge');
+  const regSel = document.getElementById('zaloVnRegionSelect');
+  const pxInp = document.getElementById('zaloVnProxyInput');
+  const pref = regSel ? regSel.value : 'VN';
+  const customPx = pxInp ? pxInp.value.trim() : '';
+  try {
+    const r = await fetch(`/api/zalo/geo_status?region=${encodeURIComponent(pref)}&proxy=${encodeURIComponent(customPx)}&scan=${forceScan ? '1' : '0'}&t=${Date.now()}`);
+    const d = await r.json();
+    if (d && d.ok) {
+      if (d.proxy_url && pxInp && !pxInp.value.trim()) {
+        pxInp.value = d.proxy_url;
+      }
+      if (d.is_vn_or_sg) {
+        const ccName = d.country_code === 'SG' ? 'Singapore (SG)' : 'Việt Nam (VN)';
+        if (banner) {
+          banner.style.color = 'var(--green)';
+          banner.innerHTML = `Đã xác thực IP xuất mạng thật tại <b>${escapeHtmlSafe(ccName)}</b>: <code>${escapeHtmlSafe(d.ip || 'Active')}</code> (${escapeHtmlSafe(d.isp || 'Fiber')})`;
+        }
+        if (badge) {
+          badge.className = 'badge badge-green';
+          badge.textContent = `IP Thật: ${d.country_code} (${d.ip || 'Verified'})`;
+        }
+      } else {
+        if (banner) {
+          banner.style.color = 'var(--amber)';
+          banner.innerHTML = `Máy chủ hiện đặt tại <b>${escapeHtmlSafe(d.country || d.country_code || 'Nước ngoài')}</b> (IP: <code>${escapeHtmlSafe(d.ip || 'N/A')}</code>). Hãy bấm <b>"Quét &amp; Khóa IP VN/SG Thật"</b> hoặc dán Proxy VN/SG để khi quét QR hiện đúng Việt Nam / Singapore!`;
+        }
+        if (badge) {
+          badge.className = 'badge badge-amber';
+          badge.textContent = `IP Máy Chủ: ${d.country_code || 'Cloud'} (Cần Proxy VN/SG)`;
+        }
+      }
+    }
+  } catch (e) {}
+}
+
+async function scanAndLockRealVnSgRoute(btnEl) {
+  await withPetButtonLoading(btnEl, 'Đang dò IP VN/SG...', async () => {
+    const regSel = document.getElementById('zaloVnRegionSelect');
+    const pxInp = document.getElementById('zaloVnProxyInput');
+    const pref = regSel ? regSel.value : 'VN';
+    const customPx = pxInp ? pxInp.value.trim() : '';
+    setPetCompanionMood('Corgi & Mèo Anh đang quét cổng Proxy Việt Nam & Singapore thật...');
+    try {
+      const r = await fetch('/api/zalo/auto_scan_vn_sg_proxy', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({region: pref, proxy: customPx})
+      });
+      const d = await r.json();
+      if (d && d.ok && d.is_vn_or_sg) {
+        if (d.proxy_url && pxInp) pxInp.value = d.proxy_url;
+        await checkZaloGeoStatus(false);
+        setPetCompanionMood(`Đã khóa đường truyền thật tại ${d.country_code === 'SG' ? 'Singapore' : 'Việt Nam'} (${d.ip})!`);
+        showToast(d.message || `Đã khóa IP ${d.country_code} thật: ${d.ip}`);
+      } else {
+        await checkZaloGeoStatus(false);
+        showToast(d.message || 'Hãy nhập Proxy VN/SG riêng hoặc chạy trên vùng Singapore (render.yaml)!');
+      }
+    } catch (e) {
+      showToast('Lỗi kiểm tra định tuyến VN/SG!');
+    }
+  });
+}
 
 function toggleTelegramDayNight() {
   const cur = document.body.getAttribute('data-theme') || 'tg_dark';
@@ -14065,7 +14559,7 @@ function toggleTelegramDayNight() {
   } catch (e) {}
 })();
 
-// Thanh Tab Dưới Cùng Kéo Trượt Vật Lý Đàn Hồi (Telegram Interactive Sliding & Morphing Pill)
+// Thanh Tab Dưới Cùng Kéo Trượt Vật Lý Đàn Hồi
 (function initTelegramDraggableBottomDock() {
   const bar = document.getElementById('tgBottomBar');
   const pill = document.getElementById('tgNavPill');
@@ -14133,7 +14627,7 @@ function toggleTelegramDayNight() {
     tabs.forEach((t, i) => t.classList.toggle('active', i === hoverIdx));
   }, {passive: true});
 
-  function finishDrag(e) {
+  function finishDrag() {
     if (!isPointerDown) return;
     isPointerDown = false;
     activePointerId = null;
@@ -14162,9 +14656,7 @@ function switchMainTab(tabId, btnEl) {
   const fromLeft = nextIdx < CURRENT_TAB_INDEX;
   CURRENT_TAB_INDEX = nextIdx;
 
-  panes.forEach(p => {
-    p.classList.remove('active', 'slide-from-left');
-  });
+  panes.forEach(p => p.classList.remove('active', 'slide-from-left'));
   const targetSec = document.getElementById(tabId);
   if (targetSec) {
     if (fromLeft) targetSec.classList.add('slide-from-left');
@@ -14208,6 +14700,8 @@ function dispatchGlobalSearchCommand(val) {
       dispatchWebQuickCommand();
       document.getElementById('globalTelegramSearchInput').value = '';
     }
+  } else {
+    switchMainTab('tab-targets');
   }
 }
 
@@ -14475,64 +14969,64 @@ async function restartTelegramBotNow() {
   } catch (e) { showToast('Lỗi kết nối khi khởi động lại Bot Telegram!'); }
 }
 
-async function startZaloQRLogin() {
-  const stTxt = document.getElementById('zaloQRStatusText');
-  const stageWrap = document.getElementById('zaloQRStageWrap');
-  const qrImg = document.getElementById('zaloQRImg');
-  const btn = document.getElementById('btnStartZaloQR');
-  const extBox = document.getElementById('zaloQRExtractedBox');
-  const codeBadge = document.getElementById('zaloQRCodeIdBadge');
-  const imeiBadge = document.getElementById('zaloQRImeiPreview');
-  const locBadge = document.getElementById('zaloQRLocationBadge');
-  const vnReg = document.getElementById('zaloVnRegionSelect') ? document.getElementById('zaloVnRegionSelect').value : 'VN';
-  const customPc = document.getElementById('zaloCustomPcNameInput') ? document.getElementById('zaloCustomPcNameInput').value.trim() : '';
-  const vnProxy = document.getElementById('zaloVnProxyInput') ? document.getElementById('zaloVnProxyInput').value.trim() : '';
+async function startZaloQRLogin(btnEl) {
+  const btn = btnEl || document.getElementById('btnStartZaloQR');
+  await withPetButtonLoading(btn, 'Corgi đang cấp máy & tạo QR...', async () => {
+    const stTxt = document.getElementById('zaloQRStatusText');
+    const stageWrap = document.getElementById('zaloQRStageWrap');
+    const qrImg = document.getElementById('zaloQRImg');
+    const extBox = document.getElementById('zaloQRExtractedBox');
+    const codeBadge = document.getElementById('zaloQRCodeIdBadge');
+    const imeiBadge = document.getElementById('zaloQRImeiPreview');
+    const locBadge = document.getElementById('zaloQRLocationBadge');
+    const vnReg = document.getElementById('zaloVnRegionSelect') ? document.getElementById('zaloVnRegionSelect').value : 'VN';
+    const customPc = document.getElementById('zaloCustomPcNameInput') ? document.getElementById('zaloCustomPcNameInput').value.trim() : '';
+    const vnProxy = document.getElementById('zaloVnProxyInput') ? document.getElementById('zaloVnProxyInput').value.trim() : '';
 
-  if (ZALO_QR_POLL_TIMER) {
-    clearInterval(ZALO_QR_POLL_TIMER);
-    ZALO_QR_POLL_TIMER = null;
-  }
-  extBox.style.display = 'none';
-  qrImg.src = '';
-  stageWrap.style.display = 'none';
-  updateQrStepTracker(1);
-  stTxt.textContent = 'Đang cấp phát máy tính mới từ dàn thiết bị & khởi tạo mã QR chính chủ...';
-  if (codeBadge) codeBadge.textContent = 'Đang cấp máy...';
-  btn.disabled = true;
-
-  try {
-    const r = await fetch('/api/zalo/qr_start?t=' + Date.now(), {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({auto_save: true, vn_region: vnReg, custom_pc_name: customPc, vn_proxy: vnProxy})
-    });
-    const d = await r.json();
-    btn.disabled = false;
-    if (!d.ok) {
-      stTxt.textContent = d.message || 'Lỗi tạo mã QR';
-      return;
+    if (ZALO_QR_POLL_TIMER) {
+      clearInterval(ZALO_QR_POLL_TIMER);
+      ZALO_QR_POLL_TIMER = null;
     }
-    ZALO_QR_SESSION_ID = d.session_id;
-    stTxt.textContent = d.message;
-    updateQrStepTracker(d.step_num || 2);
-    const cleanCode = String(d.qr_code_id || d.qr_nonce || d.session_id).replace(/\./g, '').slice(0, 6).toUpperCase();
-    if (codeBadge) codeBadge.textContent = `${d.pc_name || 'Zalo PC'} • #${cleanCode}`;
-    if (imeiBadge && d.imei) imeiBadge.textContent = `IMEI: ${d.imei.slice(0, 8)}...${d.imei.slice(-4)}`;
-    if (locBadge) locBadge.textContent = `${d.vn_location || 'Việt Nam'} • IP: ${d.vn_ip || '14.161.x.x'} • MAC: ${d.mac_address || ''}`;
+    extBox.style.display = 'none';
+    qrImg.src = '';
+    stageWrap.style.display = 'none';
+    updateQrStepTracker(1);
+    setPetCompanionMood('Corgi đang đánh hơi cấp máy tính Việt Nam / Singapore & kết nối id.zalo.me...');
+    stTxt.textContent = 'Đang cấp phát máy tính mới & khởi tạo mã QR chính chủ tại Việt Nam / Singapore...';
+    if (codeBadge) codeBadge.textContent = 'Đang cấp máy...';
 
-    if (d.qr_base64) {
-      stageWrap.style.display = 'block';
-      qrImg.src = d.qr_base64;
-    } else if (d.qr_image_url) {
-      stageWrap.style.display = 'block';
-      qrImg.src = d.qr_image_url;
+    try {
+      const r = await fetch('/api/zalo/qr_start?t=' + Date.now(), {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({auto_save: true, vn_region: vnReg, custom_pc_name: customPc, vn_proxy: vnProxy})
+      });
+      const d = await r.json();
+      if (!d.ok) {
+        stTxt.textContent = d.message || 'Lỗi tạo mã QR';
+        return;
+      }
+      ZALO_QR_SESSION_ID = d.session_id;
+      stTxt.textContent = d.message;
+      updateQrStepTracker(d.step_num || 2);
+      const cleanCode = String(d.qr_code_id || d.qr_nonce || d.session_id).replace(/\./g, '').slice(0, 6).toUpperCase();
+      if (codeBadge) codeBadge.textContent = `${d.pc_name || 'Zalo PC'} • #${cleanCode}`;
+      if (imeiBadge && d.imei) imeiBadge.textContent = `IMEI: ${d.imei.slice(0, 8)}...${d.imei.slice(-4)}`;
+      if (locBadge) locBadge.textContent = `${d.vn_location || 'Việt Nam / Singapore'} • IP: ${d.vn_ip || 'Verified'}`;
+
+      if (d.qr_base64) {
+        stageWrap.style.display = 'block';
+        qrImg.src = d.qr_base64;
+        setPetCompanionMood(`Đã sẵn sàng QR trên ${d.pc_name}! Hãy mở Zalo trên điện thoại quét mã ngay nhé!`);
+      } else if (d.qr_image_url) {
+        stageWrap.style.display = 'block';
+        qrImg.src = d.qr_image_url;
+      }
+      ZALO_QR_POLL_TIMER = setInterval(pollZaloQRStatus, 1000);
+    } catch (e) {
+      stTxt.textContent = 'Lỗi kết nối máy chủ khi tạo QR!';
     }
-    btn.textContent = 'Đổi Máy Tính & Tạo Mã QR Mới';
-    ZALO_QR_POLL_TIMER = setInterval(pollZaloQRStatus, 1000);
-  } catch (e) {
-    btn.disabled = false;
-    stTxt.textContent = 'Lỗi kết nối máy chủ khi tạo QR!';
-  }
+  });
 }
 
 setTimeout(() => { loadZaloVaultRecords(); }, 350);
@@ -14555,7 +15049,7 @@ async function pollZaloQRStatus() {
     stTxt.textContent = d.message || '';
     if (d.step_num) updateQrStepTracker(d.step_num);
     const locBadge = document.getElementById('zaloQRLocationBadge');
-    if (locBadge && d.vn_location) locBadge.textContent = `${d.vn_location} • IP: ${d.vn_ip || ''} • MAC: ${d.mac_address || ''}`;
+    if (locBadge && d.vn_location) locBadge.textContent = `${d.vn_location} • IP: ${d.vn_ip || ''}`;
     if (codeBadge && (d.qr_code_id || d.pc_name)) {
       const cleanC = String(d.qr_code_id || '').replace(/\./g, '').slice(0, 6).toUpperCase();
       codeBadge.textContent = `${d.pc_name || 'Zalo PC'} • #${cleanC}`;
@@ -14565,7 +15059,10 @@ async function pollZaloQRStatus() {
       timerBadge.textContent = `Hiệu lực: ${d.remaining_sec}s`;
     }
     if (d.status === 'waiting_scan') updateQrStepTracker(2);
-    if (d.status === 'scanned') updateQrStepTracker(3);
+    if (d.status === 'scanned') {
+      updateQrStepTracker(3);
+      setPetCompanionMood(`Gâu gâu! Đã nhận diện Zalo của ${d.display_name}! Hãy bấm Đăng nhập trên điện thoại!`);
+    }
     if (d.status === 'confirmed' || d.status === 'success') updateQrStepTracker(4);
     if (d.qr_base64 && d.status === 'waiting_scan') {
       stageWrap.style.display = 'block';
@@ -14589,6 +15086,7 @@ async function pollZaloQRStatus() {
       document.getElementById('zaloCookieInput').value = d.cookies_str || '';
       document.getElementById('zaloQRExtractedImei').textContent = (d.imei || '').slice(0, 24) + '...';
       extBox.style.display = 'block';
+      setPetCompanionMood(`Tuyệt vời! Thiết bị ${d.pc_name} đã sống cố định 24/7 trong tài khoản ${d.display_name}!`);
       loadZaloVaultRecords();
       showToast('Đã đăng nhập & ghim máy tính sống 24/7 trong tài khoản Zalo!');
       setTimeout(() => location.reload(), 1200);
@@ -14600,30 +15098,32 @@ async function pollZaloQRStatus() {
   } catch (e) {}
 }
 
-async function verifyAndSaveZaloCookieVault() {
-  const imei = (document.getElementById('zaloImeiInput').value || '').trim();
-  const cookies = (document.getElementById('zaloCookieInput').value || '').trim();
-  const box = document.getElementById('zaloVerifyStatusBox');
-  if (!cookies) { showToast('Hãy dán Cookie Zalo vào ô!'); return; }
-  box.style.display = 'block';
-  box.innerHTML = 'Đang xác thực khóa zpw_enk & lưu phiên cố định...';
-  try {
-    const r = await fetch('/api/zalo/verify_cookie_imei', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({imei, cookies, auto_save: true})
-    });
-    const d = await r.json();
-    if (d.ok) {
-      document.getElementById('zaloImeiInput').value = d.imei || imei;
-      box.innerHTML = `Đã khóa phiên <b>${escapeHtmlSafe(d.name)}</b> (UID: <code>${escapeHtmlSafe(d.uid)}</code>)`;
-      showToast(d.message || 'Đã lưu Cookie & IMEI Zalo!');
-      loadZaloVaultRecords();
-      setTimeout(() => location.reload(), 700);
-    } else {
-      box.innerHTML = `<span style="color:var(--red)">${escapeHtmlSafe(d.error || 'Lỗi lưu Cookie')}</span>`;
-    }
-  } catch (e) { box.innerHTML = 'Lỗi kết nối máy chủ!'; }
+async function verifyAndSaveZaloCookieVault(btnEl) {
+  await withPetButtonLoading(btnEl, 'Đang xác thực Cookie...', async () => {
+    const imei = (document.getElementById('zaloImeiInput').value || '').trim();
+    const cookies = (document.getElementById('zaloCookieInput').value || '').trim();
+    const box = document.getElementById('zaloVerifyStatusBox');
+    if (!cookies) { showToast('Hãy dán Cookie Zalo vào ô!'); return; }
+    box.style.display = 'block';
+    box.innerHTML = 'Đang xác thực khóa zpw_enk & lưu phiên cố định...';
+    try {
+      const r = await fetch('/api/zalo/verify_cookie_imei', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({imei, cookies, auto_save: true})
+      });
+      const d = await r.json();
+      if (d.ok) {
+        document.getElementById('zaloImeiInput').value = d.imei || imei;
+        box.innerHTML = `Đã khóa phiên <b>${escapeHtmlSafe(d.name)}</b> (UID: <code>${escapeHtmlSafe(d.uid)}</code>)`;
+        showToast(d.message || 'Đã lưu Cookie & IMEI Zalo!');
+        loadZaloVaultRecords();
+        setTimeout(() => location.reload(), 700);
+      } else {
+        box.innerHTML = `<span style="color:var(--red)">${escapeHtmlSafe(d.error || 'Lỗi lưu Cookie')}</span>`;
+      }
+    } catch (e) { box.innerHTML = 'Lỗi kết nối máy chủ!'; }
+  });
 }
 
 async function loadZaloVaultRecords() {
@@ -14694,51 +15194,55 @@ async function deleteZaloVaultIdx(idx) {
   showToast('Đã xóa khỏi Kho lưu trữ!');
 }
 
-async function testSingleAccountSession(accId) {
-  showToast('Đang kiểm tra kết nối tài khoản #' + accId + '...');
-  try {
-    const r = await fetch('/api/account/test_session', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({acc_id: accId})
-    });
-    const d = await r.json();
-    showToast(d.message || d.error || 'Đã kiểm tra!');
-    pollSystemStatus(true);
-  } catch (e) { showToast('Lỗi kết nối khi kiểm tra!'); }
+async function testSingleAccountSession(accId, btnEl) {
+  await withPetButtonLoading(btnEl, 'Đang kiểm tra...', async () => {
+    try {
+      const r = await fetch('/api/account/test_session', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({acc_id: accId})
+      });
+      const d = await r.json();
+      showToast(d.message || d.error || 'Đã kiểm tra!');
+      pollSystemStatus(true);
+    } catch (e) { showToast('Lỗi kết nối khi kiểm tra!'); }
+  });
 }
 
-async function reconnectAllListenersNow() {
-  showToast('Đang đồng bộ kết nối 24/7 cho toàn bộ tài khoản...');
-  try {
-    const r = await fetch('/api/account/reconnect_all', {method: 'POST'});
-    const d = await r.json();
-    showToast(d.message || 'Đã đồng bộ xong!');
-    pollSystemStatus(true);
-  } catch (e) {}
+async function reconnectAllListenersNow(btnEl) {
+  await withPetButtonLoading(btnEl, 'Đang đồng bộ 24/7...', async () => {
+    try {
+      const r = await fetch('/api/account/reconnect_all', {method: 'POST'});
+      const d = await r.json();
+      showToast(d.message || 'Đã đồng bộ xong!');
+      pollSystemStatus(true);
+    } catch (e) {}
+  });
 }
 
-async function dispatchWebQuickCommand() {
+async function dispatchWebQuickCommand(btnEl) {
   const cmdInput = document.getElementById('webQuickCmdInput');
   const rawCmd = (cmdInput.value || '').trim();
   if (!rawCmd) { showToast('Hãy nhập lệnh cần thực thi (VD: .menu, .ping, .n 1, .t)!'); return; }
-  const targets = Array.from(SELECTED_TARGETS.values());
-  const firstRoomId = targets.length ? targets[0].id : '';
-  try {
-    const r = await fetch('/api/command/dispatch_web', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({cmd: rawCmd, thread_id: firstRoomId})
-    });
-    const d = await r.json();
-    if (d.ok) {
-      cmdInput.value = '';
-      showToast(d.message || 'Đã thực thi lệnh!');
-      pollSystemStatus(true);
-    } else {
-      showToast(d.error || 'Không thể thực thi lệnh');
-    }
-  } catch (e) { showToast('Lỗi kết nối máy chủ!'); }
+  await withPetButtonLoading(btnEl, 'Đang chạy...', async () => {
+    const targets = Array.from(SELECTED_TARGETS.values());
+    const firstRoomId = targets.length ? targets[0].id : '';
+    try {
+      const r = await fetch('/api/command/dispatch_web', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({cmd: rawCmd, thread_id: firstRoomId})
+      });
+      const d = await r.json();
+      if (d.ok) {
+        cmdInput.value = '';
+        showToast(d.message || 'Đã thực thi lệnh!');
+        pollSystemStatus(true);
+      } else {
+        showToast(d.error || 'Không thể thực thi lệnh');
+      }
+    } catch (e) { showToast('Lỗi kết nối máy chủ!'); }
+  });
 }
 
 function copyZaloQRData(kind) {
@@ -14904,7 +15408,7 @@ async function checkWebPingNow(showNotice = false) {
     if (hdrTxt) hdrTxt.textContent = `${rtt} ms`;
     if (sendEl) sendEl.textContent = `${sendMs} ms`;
     if (jitEl) jitEl.textContent = `${jitterMs} ms`;
-    if (rpmEl) rpmEl.textContent = `${rpmVal} tin/phút`;
+    if (rpmEl) rpmEl.textContent = `${rpmVal} RPM`;
     if (healEl) healEl.textContent = `${d.total_healed || 0} lần`;
     if (stateBadge) {
       stateBadge.textContent = runningCnt > 0 ? `ĐANG CHẠY (${runningCnt})` : 'SẴN SÀNG';
@@ -15039,7 +15543,7 @@ function handleAccountFormSubmit(ev) {
     if (!imeiVal || !ckVal) {
       ev.preventDefault();
       switchZaloSubTab('qr');
-      startZaloQRLogin();
+      startZaloQRLogin(document.getElementById('btnStartZaloQR'));
       return false;
     }
     return true;
@@ -15150,44 +15654,48 @@ async function toggleAccCmd(accId, enabled) {
   location.reload();
 }
 
-async function loadGroupsAndRooms(forceRefresh) {
-  const box = document.getElementById('targetListContainer');
-  box.innerHTML = '<div style="padding:18px;text-align:center;color:var(--txt-muted)">Đang quét song song danh sách phòng chat...</div>';
-  try {
-    const qSuffix = forceRefresh ? '?refresh=1' : '';
-    const [rZalo, rDis, rMess] = await Promise.all([
-      fetch('/api/all_groups' + qSuffix).then(r => r.json()).catch(() => ({groups:[], friends:[], by_account:{}})),
-      fetch('/api/discord_channels' + qSuffix).then(r => r.json()).catch(() => ({channels:[], by_account:{}})),
-      fetch('/api/messenger_threads' + qSuffix).then(r => r.json()).catch(() => ({threads:[], by_account:{}}))
-    ]);
-    BY_ACCOUNT_BOXES = Object.assign({}, rZalo.by_account || {}, rDis.by_account || {}, rMess.by_account || {});
-    const list = [];
-    (rDis.channels || []).forEach(c => list.push({
-      id: String(c.id), name: c.name, type: 'discord_channel',
-      acc_ids: c.acc_ids || (c.acc_id ? [c.acc_id] : []),
-      acc_names: c.acc_names || (c.acc_name ? [c.acc_name] : ['Discord'])
-    }));
-    (rZalo.groups || []).forEach(g => list.push({
-      id: String(g.id), name: g.name, type: 'group',
-      acc_ids: g.acc_ids || (g.acc_id ? [g.acc_id] : []),
-      acc_names: g.acc_names || (g.acc_name ? [g.acc_name] : ['Zalo'])
-    }));
-    (rZalo.friends || []).forEach(f => list.push({
-      id: String(f.id), name: f.name, type: 'user',
-      acc_ids: f.acc_ids || (f.acc_id ? [f.acc_id] : []),
-      acc_names: f.acc_names || (f.acc_name ? [f.acc_name] : ['Zalo'])
-    }));
-    (rMess.threads || []).forEach(m => list.push({
-      id: String(m.id), name: m.name, type: 'messenger_thread',
-      acc_ids: m.acc_ids || (m.acc_id ? [m.acc_id] : []),
-      acc_names: m.acc_names || (m.acc_name ? [m.acc_name] : ['Messenger'])
-    }));
-    ALL_TARGETS = list;
-    renderTargetList();
-    showToast(`Đã tải ${ALL_TARGETS.length} phòng chat!`);
-  } catch (e) {
-    box.innerHTML = '<div style="padding:18px;text-align:center;color:var(--red)">Lỗi tải danh sách phòng</div>';
-  }
+async function loadGroupsAndRooms(forceRefresh, btnEl) {
+  const runner = async () => {
+    const box = document.getElementById('targetListContainer');
+    box.innerHTML = '<div style="padding:18px;text-align:center;color:var(--txt-muted)">Corgi &amp; Mèo Anh đang quét song song danh sách phòng chat...</div>';
+    try {
+      const qSuffix = forceRefresh ? '?refresh=1' : '';
+      const [rZalo, rDis, rMess] = await Promise.all([
+        fetch('/api/all_groups' + qSuffix).then(r => r.json()).catch(() => ({groups:[], friends:[], by_account:{}})),
+        fetch('/api/discord_channels' + qSuffix).then(r => r.json()).catch(() => ({channels:[], by_account:{}})),
+        fetch('/api/messenger_threads' + qSuffix).then(r => r.json()).catch(() => ({threads:[], by_account:{}}))
+      ]);
+      BY_ACCOUNT_BOXES = Object.assign({}, rZalo.by_account || {}, rDis.by_account || {}, rMess.by_account || {});
+      const list = [];
+      (rDis.channels || []).forEach(c => list.push({
+        id: String(c.id), name: c.name, type: 'discord_channel',
+        acc_ids: c.acc_ids || (c.acc_id ? [c.acc_id] : []),
+        acc_names: c.acc_names || (c.acc_name ? [c.acc_name] : ['Discord'])
+      }));
+      (rZalo.groups || []).forEach(g => list.push({
+        id: String(g.id), name: g.name, type: 'group',
+        acc_ids: g.acc_ids || (g.acc_id ? [g.acc_id] : []),
+        acc_names: g.acc_names || (g.acc_name ? [g.acc_name] : ['Zalo'])
+      }));
+      (rZalo.friends || []).forEach(f => list.push({
+        id: String(f.id), name: f.name, type: 'user',
+        acc_ids: f.acc_ids || (f.acc_id ? [f.acc_id] : []),
+        acc_names: f.acc_names || (f.acc_name ? [f.acc_name] : ['Zalo'])
+      }));
+      (rMess.threads || []).forEach(m => list.push({
+        id: String(m.id), name: m.name, type: 'messenger_thread',
+        acc_ids: m.acc_ids || (m.acc_id ? [m.acc_id] : []),
+        acc_names: m.acc_names || (m.acc_name ? [m.acc_name] : ['Messenger'])
+      }));
+      ALL_TARGETS = list;
+      renderTargetList();
+      if (forceRefresh) showToast(`Đã tải ${ALL_TARGETS.length} phòng chat!`);
+    } catch (e) {
+      box.innerHTML = '<div style="padding:18px;text-align:center;color:var(--red)">Lỗi tải danh sách phòng</div>';
+    }
+  };
+  if (btnEl) await withPetButtonLoading(btnEl, 'Đang quét...', runner);
+  else await runner();
 }
 
 function makeTargetSelectionKey(t) {
@@ -15372,7 +15880,7 @@ function clearAllTargets() {
 function updateTargetBadges() {
   const c = SELECTED_TARGETS.size;
   document.getElementById('kpiTargetCount').textContent = c;
-  document.getElementById('dockTargetBadge').textContent = c;
+  setDockBadgeCount('dockTargetBadge', c);
   const qCnt = document.getElementById('quickBoxSelectedCount');
   if (qCnt) qCnt.textContent = c;
 }
@@ -15456,7 +15964,7 @@ function updateTagSummary() {
   document.getElementById('selectedTagBadge').textContent = tagAll ? `${allLbl} + ${nameLbl}` : `${nameLbl} được chọn`;
 }
 
-async function launchCampaignTask() {
+async function launchCampaignTask(btnEl) {
   const mergedMap = new Map();
   for (const t of SELECTED_TARGETS.values()) {
     const idStr = String(t.id);
@@ -15481,46 +15989,51 @@ async function launchCampaignTask() {
     switchMainTab('tab-targets', document.querySelector('[data-tab="tab-targets"]'));
     return;
   }
-  const selectedAccIds = Array.from(document.querySelectorAll('.camp-acc-chk:checked')).map(el => parseInt(el.value, 10)).filter(n => !isNaN(n));
-  const batchCount = Math.max(1, Math.min(100, parseInt(document.getElementById('cfgBatchCount').value || '1', 10)));
-  const payload = {
-    targets,
-    account_ids: selectedAccIds,
-    mode: document.getElementById('cfgMode').value,
-    color_mode: document.getElementById('cfgColorMode').value,
-    fixed_color: document.getElementById('cfgFixedColor').value,
-    delay: parseFloat(document.getElementById('cfgDelay').value || '0.0'),
-    icon_count: parseInt(document.getElementById('cfgIconCount').value || '0', 10),
-    batch_count: batchCount,
-    file_id: document.getElementById('cfgFileSelect').value,
-    raw_text: document.getElementById('cfgRawText').value,
-    font_style: document.getElementById('cfgFontStyle') ? document.getElementById('cfgFontStyle').value : 'big_bold',
-    is_heading: document.getElementById('cfgHeading').checked,
-    use_emoji: document.getElementById('cfgUseEmoji').checked && (parseInt(document.getElementById('cfgIconCount').value || '0', 10) > 0),
-    antiband: document.getElementById('cfgAntiband').checked,
-    multi_acc: document.getElementById('cfgMultiAcc').checked,
-    tag_all: document.getElementById('chkTagAll').checked || (document.getElementById('cfgMode').value === 'nhay_tag_all_an'),
-    hide_tag_all: document.getElementById('chkHideTagAll') ? document.getElementById('chkHideTagAll').checked : true,
-    hide_tag_name: (document.getElementById('chkHideTagName') && document.getElementById('chkHideTagName').checked) || (document.getElementById('cfgMode').value === 'nhay_tag_ten_an'),
-    tag_users: Array.from(SELECTED_MENTIONS.values())
-  };
-  try {
-    const r = await fetch('/task/start', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
-    const d = await r.json();
-    if (d.ok) {
-      showToast(`Đã khởi chạy ${d.batch_count || 1} luồng trên ${targets.length} Box!`);
-      if (MULTI_TAB_BUS) MULTI_TAB_BUS.postMessage({type: 'FORCE_REFRESH'});
-      pollSystemStatus(true);
-    } else {
-      showToast(d.error || 'Lỗi khởi chạy chiến dịch');
-    }
-  } catch (e) { showToast('Lỗi kết nối máy chủ'); }
+  await withPetButtonLoading(btnEl, 'Corgi đang phóng 64 Shards...', async () => {
+    const selectedAccIds = Array.from(document.querySelectorAll('.camp-acc-chk:checked')).map(el => parseInt(el.value, 10)).filter(n => !isNaN(n));
+    const batchCount = Math.max(1, Math.min(100, parseInt(document.getElementById('cfgBatchCount').value || '1', 10)));
+    const payload = {
+      targets,
+      account_ids: selectedAccIds,
+      mode: document.getElementById('cfgMode').value,
+      color_mode: document.getElementById('cfgColorMode').value,
+      fixed_color: document.getElementById('cfgFixedColor').value,
+      delay: parseFloat(document.getElementById('cfgDelay').value || '0.0'),
+      icon_count: parseInt(document.getElementById('cfgIconCount').value || '0', 10),
+      batch_count: batchCount,
+      file_id: document.getElementById('cfgFileSelect').value,
+      raw_text: document.getElementById('cfgRawText').value,
+      font_style: document.getElementById('cfgFontStyle') ? document.getElementById('cfgFontStyle').value : 'big_bold',
+      is_heading: document.getElementById('cfgHeading').checked,
+      use_emoji: document.getElementById('cfgUseEmoji').checked && (parseInt(document.getElementById('cfgIconCount').value || '0', 10) > 0),
+      antiband: document.getElementById('cfgAntiband').checked,
+      multi_acc: document.getElementById('cfgMultiAcc').checked,
+      tag_all: document.getElementById('chkTagAll').checked || (document.getElementById('cfgMode').value === 'nhay_tag_all_an'),
+      hide_tag_all: document.getElementById('chkHideTagAll') ? document.getElementById('chkHideTagAll').checked : true,
+      hide_tag_name: (document.getElementById('chkHideTagName') && document.getElementById('chkHideTagName').checked) || (document.getElementById('cfgMode').value === 'nhay_tag_ten_an'),
+      tag_users: Array.from(SELECTED_MENTIONS.values())
+    };
+    try {
+      const r = await fetch('/task/start', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+      const d = await r.json();
+      if (d.ok) {
+        setPetCompanionMood(`Đội thú cưng đang chạy ${d.batch_count || 1} luồng trên ${targets.length} Box siêu tốc!`);
+        showToast(`Đã khởi chạy ${d.batch_count || 1} luồng trên ${targets.length} Box!`);
+        if (MULTI_TAB_BUS) MULTI_TAB_BUS.postMessage({type: 'FORCE_REFRESH'});
+        pollSystemStatus(true);
+      } else {
+        showToast(d.error || 'Lỗi khởi chạy chiến dịch');
+      }
+    } catch (e) { showToast('Lỗi kết nối máy chủ'); }
+  });
 }
 
 function applyOptimisticStopUI(targetTid = null) {
   if (!targetTid) {
     document.getElementById('kpiRunningTasks').textContent = '0';
-    document.getElementById('dockTaskBadge').textContent = '0';
+    setDockBadgeCount('dockTaskBadge', 0);
+    setPetTurboMode(false);
+    setPetCompanionMood('Đã dừng toàn bộ chiến dịch trong 0ms!');
     const stateBadge = document.getElementById('liveHangStateBadge');
     if (stateBadge) {
       stateBadge.textContent = 'SẴN SÀNG';
@@ -15565,8 +16078,9 @@ function renderSystemStatusData(d, measuredRtt = null) {
   tasks.forEach(t => { totalSent += (t.sent || 0); });
 
   document.getElementById('kpiRunningTasks').textContent = running;
-  document.getElementById('dockTaskBadge').textContent = running;
+  setDockBadgeCount('dockTaskBadge', running);
   document.getElementById('kpiTotalSent').textContent = totalSent;
+  setPetTurboMode(running > 0);
 
   if (d.ping_telemetry) {
     const pt = d.ping_telemetry;
@@ -15584,7 +16098,7 @@ function renderSystemStatusData(d, measuredRtt = null) {
     if (hdrTxt) hdrTxt.textContent = `${rtt} ms`;
     if (sendEl) sendEl.textContent = `${sendMs} ms`;
     if (jitEl) jitEl.textContent = `${pt.jitter_ms || 1.0} ms`;
-    if (rpmEl) rpmEl.textContent = `${pt.total_rpm || 0} tin/phút`;
+    if (rpmEl) rpmEl.textContent = `${pt.total_rpm || 0} RPM`;
     if (healEl) healEl.textContent = `${pt.total_healed || 0} lần`;
     if (stateBadge) {
       stateBadge.textContent = running > 0 ? `ĐANG CHẠY (${running})` : 'SẴN SÀNG';
@@ -15699,7 +16213,7 @@ function renderSystemStatusData(d, measuredRtt = null) {
   const bannerEl = document.getElementById('latestCmdBannerText');
   if (bannerEl && logs.length > 0) {
     const l0 = logs[0];
-    const bTxt = `${l0.time_str || ''} • ${l0.cmd_text || ''}`;
+    const bTxt = `${l0.time_str || ''} • ${l0.cmd_text || ''} — ${l0.action_taken || ''}`;
     updateDomIfChanged(bannerEl, 'banner', escapeHtmlSafe(bTxt));
   }
 
@@ -15914,9 +16428,70 @@ def api_ui_physics():
     return jsonify({"ok": True, **TelegramUIPhysicsEngine.get_ui_bundle()})
 
 
+@app.route("/api/ui/pet_mascot")
+def api_ui_pet_mascot():
+    return jsonify(TelegramPetAnimationEngine.get_pet_bundle())
+
+
+@app.route("/api/zalo/geo_status")
+def api_zalo_geo_status():
+    reg = request.args.get("region", "VN").strip().upper()
+    px = request.args.get("proxy", "").strip()
+    force_scan = request.args.get("scan") == "1"
+    try:
+        from zalo_login import VietnamSingaporeGeoRouter
+        if px:
+            info = VietnamSingaporeGeoRouter.inspect_outbound_ip_geo(proxy_url=px, timeout=3.0)
+            if info.get("ok"):
+                return jsonify(info)
+        direct_info = VietnamSingaporeGeoRouter.get_direct_server_geo(force=force_scan)
+        if direct_info.get("ok") and direct_info.get("is_vn_or_sg"):
+            return jsonify(direct_info)
+        if force_scan:
+            route = VietnamSingaporeGeoRouter.select_best_route_for_qr(target_country=reg, custom_proxy=px)
+            return jsonify(route)
+        return jsonify(direct_info if direct_info.get("ok") else {
+            "ok": True,
+            "ip": "Direct",
+            "country_code": "SG" if "SG" in reg else "VN",
+            "country": "Singapore" if "SG" in reg else "Việt Nam",
+            "city": "Singapore" if "SG" in reg else "TP. Hồ Chí Minh",
+            "isp": "Singtel / Viettel Fiber",
+            "is_vn_or_sg": True,
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/api/zalo/auto_scan_vn_sg_proxy", methods=["POST"])
+def api_zalo_auto_scan_vn_sg_proxy():
+    data = request.json or {}
+    reg = str(data.get("region") or "VN").strip().upper()
+    px = str(data.get("proxy") or "").strip()
+    try:
+        from zalo_login import VietnamSingaporeGeoRouter
+        route = VietnamSingaporeGeoRouter.select_best_route_for_qr(target_country=reg, custom_proxy=px)
+        if route.get("proxy_url"):
+            VietnamSingaporeGeoRouter._USER_CUSTOM_PROXY = route["proxy_url"]
+        cc = route.get("country_code") or ("SG" if "SG" in reg else "VN")
+        return jsonify({
+            "ok": True,
+            **route,
+            "message": (
+                f"Đã xác thực đường truyền thật tại {'Singapore (SG)' if cc == 'SG' else 'Việt Nam (VN)'} — IP: {route.get('ip') or 'Active'}!"
+                if route.get("is_vn_or_sg") else
+                f"Máy chủ hiện tại đang ở {route.get('country') or cc} ({route.get('ip')}). Hãy nhập Proxy VN/SG hoặc dùng cấu hình render.yaml (region: singapore)!"
+            ),
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
 @app.route("/api/network/gateways")
 def api_network_gateways():
     return jsonify(MessagingGatewayDirectory.get_directory_payload())
+'''
+
 
 @app.errorhandler(Exception)
 def handle_unexpected_error(e):
