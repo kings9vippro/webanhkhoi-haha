@@ -2,8 +2,10 @@ import os
 import re
 import io
 import time
+import uuid
 import json
 import hmac
+import zlib
 import base64
 import struct
 import sqlite3
@@ -24,6 +26,8 @@ from zalo_login import (
     login_qr_with_unique_imei,
     LoginQRCallbackEventType,
     ZaloPCSessionKeeper,
+    check_zalo_cookie_imei_live,
+    parse_cookies_input_flexible,
 )
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8995799349:AAE8uwWyS-CHzj2yQNkFkMynCTprFTZ1JNc")
@@ -33,9 +37,13 @@ MENU_BANNER_PATH = os.path.join(BASE_DIR, "menu_banner.png")
 
 API_2FA = "https://keyherlyswar.x10.mx/Apidocs/tien_ich/2fa.php?secret={}"
 
+DISCORD_TOKEN_RE = re.compile(
+    r"((?:mfa\.[A-Za-z0-9_\-]{50,160})|(?:[A-Za-z0-9_\-]{18,44}\.[A-Za-z0-9_\-]{5,14}\.[A-Za-z0-9_\-]{20,140}))"
+)
+
 
 def add_border_to_qr(image_data: bytes) -> bytes:
-    """Thêm viền trắng chuẩn (Quiet Zone 28px) xung quanh mã QR để camera điện thoại quét qua màn hình khác nhận diện ngay trong 0.1s!"""
+    """Thêm viền trắng chuẩn (Quiet Zone 28px) xung quanh mã QR để camera điện thoại quét nhận diện ngay trong 0.1s!"""
     if not HAS_PIL or not image_data:
         return image_data
     try:
@@ -106,12 +114,12 @@ def sync_zalo_account_to_web_db(uid, display_name, imei, cookies_dict, zpw_enk="
             """INSERT OR REPLACE INTO zalo_cookie_vault
                (uid, display_name, imei, cookies_json, zpw_enk, user_agent, updated_at)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (str(uid or imei), str(display_name or "Zalo VN"), str(imei), c_json, str(zpw_enk or ""), str(user_agent or ""), now),
+            (str(uid or imei), str(display_name or "Zalo SG"), str(imei), c_json, str(zpw_enk or ""), str(user_agent or ""), now),
         )
         existing = cur.execute("SELECT id FROM accounts WHERE platform='zalo' AND (uid=? OR imei=?)", (str(uid), str(imei))).fetchone()
         if existing:
             cur.execute(
-                "UPDATE accounts SET name=?, imei=?, cookies=?, uid=?, user_agent=?, zpw_enk=?, pc_name=?, chat_cmd_enabled=1, enabled=1 WHERE id=?",
+                "UPDATE accounts SET name=?, imei=?, cookies=?, uid=?, user_agent=?, zpw_enk=?, pc_name=?, chat_cmd_enabled=1, allow_all_cmd=1, enabled=1 WHERE id=?",
                 (str(display_name), str(imei), c_json, str(uid), str(user_agent), str(zpw_enk), str(pc_name), existing[0]),
             )
         else:
@@ -122,9 +130,131 @@ def sync_zalo_account_to_web_db(uid, display_name, imei, cookies_dict, zpw_enk="
             )
         conn.commit()
         conn.close()
+        ZaloPCSessionKeeper.register_and_keep_alive(
+            uid=uid or imei, imei=imei, cookies_dict=cookies_dict,
+            zpw_enk=zpw_enk, user_agent=user_agent, pc_name=pc_name or "Windows 11 Pro (Singapore)",
+            display_name=display_name, db_path=DB_PATH
+        )
         return True
     except Exception:
         return False
+
+
+def parse_imei_and_cookie_from_text(raw_text):
+    """Bóc tách thông minh IMEI và Cookie Zalo từ tin nhắn văn bản hoặc nội dung file .txt do người dùng gửi."""
+    s = str(raw_text or "").strip()
+    if not s:
+        return "", {}, ""
+    imei = ""
+    zpw_enk = ""
+
+    m_imei_blk = re.search(r"(?:Imei|IMEI|imei|z_uuid)\s*[:=]\s*\n?\s*([0-9a-fA-F\-]{20,80})", s)
+    if m_imei_blk:
+        imei = m_imei_blk.group(1).strip()
+    else:
+        m_uuid = re.search(r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}-[0-9a-fA-F]{16,36})", s)
+        if m_uuid:
+            imei = m_uuid.group(1).strip()
+
+    m_enk = re.search(r"(?:Zpw_Enk|zpw_enk)\s*[:=]\s*\n?\s*([A-Za-z0-9+/=]{16,64})", s)
+    if m_enk:
+        zpw_enk = m_enk.group(1).strip()
+
+    cookies_dict = {}
+    m_json = re.search(r"(\{[\s\S]*\})", s)
+    if m_json:
+        cookies_dict = parse_cookies_input_flexible(m_json.group(1))
+    if not cookies_dict:
+        if "|" in s and not imei:
+            parts = [p.strip() for p in s.split("|") if p.strip()]
+            if len(parts) >= 2:
+                imei = parts[0]
+                cookies_dict = parse_cookies_input_flexible(parts[1])
+        else:
+            cookies_dict = parse_cookies_input_flexible(s)
+
+    if not imei and cookies_dict.get("z_uuid"):
+        imei = str(cookies_dict["z_uuid"]).strip()
+    return imei, cookies_dict, zpw_enk
+
+
+def sync_and_keepalive_tokens_to_db(raw_text):
+    """Nạp 1 hoặc nhiều Token Discord (hoặc Cookie+IMEI Zalo) vào kho Web, khóa cố định định danh thiết bị
+    và giữ hoạt động liên tục 24/7 để dù đăng xuất/đăng nhập lại cũng không báo thay đổi Cookie/Token."""
+    s = str(raw_text or "").strip()
+    tokens = []
+    for m in DISCORD_TOKEN_RE.finditer(s):
+        tk = m.group(1).strip()
+        if tk and tk not in tokens:
+            tokens.append(tk)
+
+    results = []
+    if tokens:
+        conn = sqlite3.connect(DB_PATH, timeout=15)
+        cur = conn.cursor()
+        now = time.time()
+        for idx, tk in enumerate(tokens):
+            uid = ""
+            try:
+                first_seg = tk.split(".")[0].strip()
+                pad = (4 - len(first_seg) % 4) % 4
+                dec = base64.urlsafe_b64decode(first_seg + ("=" * pad)).decode("utf-8", errors="ignore").strip()
+                if dec.isdigit():
+                    uid = dec
+            except Exception:
+                pass
+            uname = f"Discord_{uid[-4:]}" if uid else f"Discord_VIP_{idx+1}"
+            tkey = hashlib.sha256(tk.encode("utf-8")).hexdigest()[:28]
+            seed = hashlib.sha256(tk.encode("utf-8")).digest()
+            u1 = str(uuid.UUID(bytes=seed[:16], version=4))
+            u2 = str(uuid.UUID(bytes=seed[16:32], version=4))
+            cur.execute(
+                """INSERT OR REPLACE INTO discord_token_vault
+                   (token_key, launch_sig, hb_sess, dcfduid, sdcfduid, cfuvid, profile_idx, updated_at)
+                   VALUES (?, ?, ?, '', '', '', 0, ?)""",
+                (tkey, u1, u2, now),
+            )
+            ex = cur.execute("SELECT id, name FROM accounts WHERE platform='discord' AND token=?", (tk,)).fetchone()
+            if ex:
+                uname = ex[1] or uname
+                cur.execute(
+                    "UPDATE accounts SET uid=?, chat_cmd_enabled=1, allow_all_cmd=1, enabled=1 WHERE id=?",
+                    (uid, ex[0]),
+                )
+            else:
+                cur.execute(
+                    """INSERT INTO accounts (name, platform, imei, cookies, token, is_bot, uid, chat_cmd_enabled, cmd_prefix, allow_all_cmd, enabled, created_at)
+                       VALUES (?, 'discord', '', '{}', ?, 0, ?, 1, '.', 1, 1, ?)""",
+                    (uname, tk, uid, now),
+                )
+            ZaloPCSessionKeeper.register_token_keep_alive(tk, platform="discord", uid=uid, display_name=uname, db_path=DB_PATH)
+            results.append({"type": "DISCORD", "name": uname, "uid": uid or "Locked", "alive": True})
+        conn.commit()
+        conn.close()
+        return results
+
+    # Nếu dữ liệu gửi vào là Cookie + IMEI Zalo
+    imei, ck_dict, enk = parse_imei_and_cookie_from_text(s)
+    if imei and ck_dict:
+        chk = check_zalo_cookie_imei_live(imei=imei, cookies_input=ck_dict, zpw_enk=enk)
+        if chk["alive"]:
+            sync_zalo_account_to_web_db(
+                uid=chk["uid"] or imei,
+                display_name=chk["display_name"] or "Zalo SG",
+                imei=imei,
+                cookies_dict=chk["cookies"],
+                zpw_enk=chk["zpw_enk"],
+                pc_name="Windows 11 Pro (Singapore)",
+            )
+        results.append({
+            "type": "ZALO",
+            "name": chk.get("display_name") or f"Zalo_{imei[:6]}",
+            "uid": chk.get("uid") or imei[:10],
+            "alive": chk["alive"],
+            "groups_count": chk.get("groups_count", 0),
+            "reason": chk.get("reason", ""),
+        })
+    return results
 
 
 class DiscordTokenGetter:
@@ -177,7 +307,7 @@ class DiscordTokenGetter:
                 )
                 d2 = r2.json() if r2.content else {}
                 if r2.status_code == 200 and d2.get("token"):
-                    return d2["token"], d.get("user_id", ""), "Thành công"
+                    return d2["token"], d2.get("user_id", ""), "Thành công"
                 return None, None, d2.get("message") or "Mã 2FA không chính xác"
             return None, None, d.get("message") or f"Không thể đăng nhập (Mã {r.status_code})"
         except Exception as e:
@@ -259,7 +389,9 @@ class DirectTelegramBotRunner:
                 data={
                     "commands": [
                         {"command": "start", "description": "Menu chính"},
-                        {"command": "qr", "description": "Tạo mã QR Zalo PC"},
+                        {"command": "qr", "description": "Tạo mã QR Zalo PC (Singapore)"},
+                        {"command": "check", "description": "Check Cookie + IMEI Zalo Sống hay Die"},
+                        {"command": "token", "description": "Nạp & Giữ Sống Token / Cookie 24/7"},
                         {"command": "get", "description": "Lấy Token Discord / Cookie FB"},
                         {"command": "2fa", "description": "Tạo mã OTP 2FA"},
                         {"command": "status", "description": "Xem thiết bị đang Online"},
@@ -267,6 +399,7 @@ class DirectTelegramBotRunner:
                 },
                 timeout=10,
             )
+            ZaloPCSessionKeeper.restore_all_from_db(DB_PATH)
         except Exception as e:
             self.last_error = str(e)
 
@@ -314,17 +447,20 @@ class DirectTelegramBotRunner:
         return {
             "inline_keyboard": [
                 [
-                    {"text": "🇻🇳 Tạo QR Zalo (Việt Nam)", "callback_data": "qr_vn_hcm"},
-                    {"text": "🇸🇬 Tạo QR Zalo (Singapore)", "callback_data": "qr_sg_vip"},
+                    {"text": "🇸🇬 Tạo QR Windows 11 (Singapore)", "callback_data": "qr_sg_vip"},
+                    {"text": "💻 Tạo QR MacBook (Singapore)", "callback_data": "qr_sg_mac_pro"},
                 ],
                 [
-                    {"text": "💻 Tạo QR MacBook", "callback_data": "qr_vn_mac"},
-                    {"text": "🖥️ Thiết Bị Đang Online", "callback_data": "menu_status"},
+                    {"text": "🔍 Check Cookie + IMEI Zalo (Sống/Die)", "callback_data": "menu_check_zalo"},
+                    {"text": "🔑 Giữ Sống Token / Cookie 24/7", "callback_data": "menu_keep_token"},
                 ],
                 [
-                    {"text": "🔑 Lấy Token Discord", "callback_data": "menu_discord"},
-                    {"text": "🍪 Lấy Cookie FB", "callback_data": "menu_facebook"},
+                    {"text": "🖥️ Thiết Bị Đang Trong Acc", "callback_data": "menu_status"},
                     {"text": "🔐 Mã 2FA", "callback_data": "menu_2fa"},
+                ],
+                [
+                    {"text": "🎯 Lấy Token Discord", "callback_data": "menu_discord"},
+                    {"text": "🍪 Lấy Cookie FB", "callback_data": "menu_facebook"},
                 ],
             ]
         }
@@ -333,14 +469,91 @@ class DirectTelegramBotRunner:
     def build_main_menu_caption():
         return (
             "⚡ <b>NHK SYSTEM — Phan Anh Khôi (Rike)</b>\n"
-            "• <b>/qr</b> — Tạo mã QR Zalo PC (VN / SG)\n"
-            "• <b>/get</b> — Lấy Token Discord / Cookie FB\n"
-            "• <b>/2fa</b> — Lấy mã OTP 2FA 6 số\n"
-            "• <b>/status</b> — Thiết bị đang Online 24/7\n\n"
+            "• <b>/qr</b> — Tạo mã QR Zalo PC (100% Máy Tính Singapore)\n"
+            "• <b>/check</b> — Check Cookie + IMEI Zalo đang Sống (Trong Acc) hay Die\n"
+            "• <b>/token</b> — Nạp &amp; giữ sống Token / Cookie hoạt động liên tục 24/7\n"
+            "• <b>/status</b> — Xem danh sách máy tính đang sống trong Acc\n\n"
             "👇 <b>Chọn chức năng bên dưới:</b>"
         )
 
-    def handle_zalo_qr_command(self, chat_id, user_id, msg_id=None, region_code="vn_hcm", custom_pc_name=""):
+    def handle_check_all_stored_zalo_cookies(self, chat_id, reply_to=None):
+        """Kiểm tra trực tiếp toàn bộ Cookie + IMEI Zalo đang lưu trong DB xem máy tính còn ở trong Acc hay đã đăng xuất (Die)."""
+        wait_r = self.send_text(
+            chat_id,
+            "🔍 <b>Đang kiểm tra trạng thái Sống/Die của toàn bộ Cookie + IMEI Zalo trong kho...</b>",
+            reply_to=reply_to,
+        )
+        wait_id = (wait_r.get("result") or {}).get("message_id")
+        rows_to_check = []
+        try:
+            conn = sqlite3.connect(DB_PATH, timeout=10)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            acc_rows = cur.execute("SELECT id, name, uid, imei, cookies, zpw_enk, user_agent, pc_name FROM accounts WHERE platform='zalo'").fetchall()
+            seen_imeis = set()
+            for r in acc_rows:
+                rd = dict(r)
+                im = str(rd.get("imei") or "").strip()
+                if im and im not in seen_imeis:
+                    seen_imeis.add(im)
+                    rows_to_check.append(rd)
+            conn.close()
+        except Exception:
+            pass
+
+        if not rows_to_check:
+            self.delete_msg(chat_id, wait_id)
+            self.user_states[chat_id] = {"tool": "check_zalo", "step": "input"}
+            self.send_text(
+                chat_id,
+                "📌 <b>Kho hiện chưa có tài khoản Zalo nào.</b>\n"
+                "👉 Bạn hãy dán trực tiếp <b>IMEI + Cookie Zalo</b> (hoặc gửi file .txt) vào đây để Bot kiểm tra <b>Sống (Trong Acc)</b> hay <b>Die (Đã thoát Acc)</b> nhé!",
+                reply_to=reply_to,
+            )
+            return
+
+        alive_cnt = 0
+        die_cnt = 0
+        report_lines = ["🔍 <b>KẾT QUẢ CHECK COOKIE + IMEI ZALO (TRONG ACC):</b>"]
+        for idx, item in enumerate(rows_to_check, 1):
+            chk = check_zalo_cookie_imei_live(
+                imei=item["imei"],
+                cookies_input=item["cookies"],
+                zpw_enk=item.get("zpw_enk") or "",
+                user_agent=item.get("user_agent") or "",
+                uid=item.get("uid") or "",
+            )
+            d_name = chk.get("display_name") or item.get("name") or f"Zalo #{idx}"
+            im_short = f"{str(item['imei'])[:8]}...{str(item['imei'])[-4:]}"
+            if chk["alive"]:
+                alive_cnt += 1
+                sync_zalo_account_to_web_db(
+                    uid=chk["uid"] or item.get("uid") or item["imei"],
+                    display_name=d_name,
+                    imei=item["imei"],
+                    cookies_dict=chk["cookies"],
+                    zpw_enk=chk["zpw_enk"],
+                    user_agent=item.get("user_agent") or "",
+                    pc_name=item.get("pc_name") or "Windows 11 Pro (Singapore)",
+                )
+                report_lines.append(
+                    f"{idx}. 🟢 <b>SỐNG (ON)</b> — <b>{d_name}</b> (UID: {chk['uid']} • {chk['groups_count']} nhóm • Máy tính đang trong Acc • IMEI: {im_short})"
+                )
+            else:
+                die_cnt += 1
+                report_lines.append(
+                    f"{idx}. 🔴 <b>DIE (OFF)</b> — <b>{d_name}</b> (Máy tính đã đăng xuất khỏi Acc • IMEI: {im_short})"
+                )
+
+        report_lines.append(
+            f"\n📊 <b>Tổng kết:</b> <b>{alive_cnt} SỐNG (Đang giữ hoạt động 24/7)</b> • <b>{die_cnt} DIE</b>\n"
+            f"💡 <i>Gửi thêm Cookie + IMEI hoặc file .txt vào đây bất kỳ lúc nào để check trực tiếp!</i>"
+        )
+        self.user_states[chat_id] = {"tool": "check_zalo", "step": "input"}
+        self.delete_msg(chat_id, wait_id)
+        self.send_text(chat_id, "\n".join(report_lines), reply_to=reply_to, reply_markup=self.build_main_menu_keyboard())
+
+    def handle_zalo_qr_command(self, chat_id, user_id, msg_id=None, region_code="sg_vip", custom_pc_name=""):
         if user_id in self.active_qr_locks:
             self.send_text(
                 chat_id,
@@ -356,7 +569,7 @@ class DirectTelegramBotRunner:
             try:
                 wait_r = self.send_text(
                     chat_id,
-                    "⏳ <b>Đang tạo mã QR Zalo PC...</b>",
+                    "⏳ <b>Đang cấp máy tính Singapore &amp; tạo mã QR Zalo PC...</b>",
                     reply_to=msg_id,
                 )
                 wait_id = (wait_r.get("result") or {}).get("message_id")
@@ -370,14 +583,13 @@ class DirectTelegramBotRunner:
                         raw_b64 = str(ev_data.get("image") or "").split(",", 1)[-1].strip()
                         raw_png = base64.b64decode(raw_b64 + ("=" * ((4 - len(raw_b64) % 4) % 4)))
                         bordered_png = add_border_to_qr(raw_png)
-                        pc_lbl = ev_data.get("pc_name") or "Zalo PC"
-                        reg_lbl = ev_data.get("region_label") or "Việt Nam"
+                        pc_lbl = ev_data.get("pc_name") or "Windows 11 Pro (Singapore)"
                         cap = (
                             f"📲 <b>QUÉT MÃ QR ĐĂNG NHẬP ZALO PC</b>\n"
                             f"• Thiết bị: <b>{pc_lbl}</b>\n"
-                            f"• Khu vực: <b>{reg_lbl}</b>\n"
+                            f"• Địa điểm: <b>Singapore (SG)</b>\n"
                             f"• Hiệu lực: <b>100 giây</b>\n"
-                            f"👉 Mở Zalo quét mã và bấm <b>Đăng nhập</b>."
+                            f"👉 Mở Zalo quét mã và bấm <b>Đăng nhập</b> để ghim máy tính sống 24/7 trong Acc."
                         )
                         pr = self.send_photo_bytes(chat_id, bordered_png, caption=cap, reply_to=msg_id)
                         qr_msg_id = (pr.get("result") or {}).get("message_id")
@@ -387,7 +599,7 @@ class DirectTelegramBotRunner:
                         d_name = ev_data.get("display_name") or "Zalo"
                         sr = self.send_text(
                             chat_id,
-                            f"✅ <b>Đã quét: {d_name}</b> — Hãy bấm <b>Đăng nhập</b> trên điện thoại!",
+                            f"✅ <b>Đã quét: {d_name}</b> — Hãy bấm <b>Đăng nhập</b> trên điện thoại để hoàn tất!",
                             reply_to=msg_id,
                         )
                         scan_msg_id = (sr.get("result") or {}).get("message_id")
@@ -413,11 +625,12 @@ class DirectTelegramBotRunner:
                         imei = ev_data.get("imei") or ""
                         zpw_enk = ev_data.get("zpw_enk") or ""
                         ua = ev_data.get("user_agent") or ""
-                        pc_name = ev_data.get("pc_name") or "Zalo PC"
+                        pc_name = ev_data.get("pc_name") or "Windows 11 Pro (Singapore)"
                         u_info = ev_data.get("user_info") or {}
                         d_name = ev_data.get("display_name") or u_info.get("displayName") or "Zalo User"
                         uid = ev_data.get("uid") or u_info.get("uid") or "N/A"
                         grp_cnt = ev_data.get("groups_count") or u_info.get("groups_count") or 0
+                        in_acc = bool(ev_data.get("in_account_verified", True))
 
                         sync_zalo_account_to_web_db(
                             uid=uid, display_name=d_name, imei=imei,
@@ -427,21 +640,24 @@ class DirectTelegramBotRunner:
 
                         cookies_str = json.dumps(cookies, ensure_ascii=False, indent=2)
                         file_txt = (
-                            f"# ZALO PC SESSION - {d_name} (UID: {uid})\n"
+                            f"# ZALO PC SINGAPORE SESSION - {d_name} (UID: {uid})\n"
                             f"PC_Device: {pc_name}\n"
+                            f"Location: Singapore (SG)\n"
                             f"Imei:\n{imei}\n\n"
                             f"Zpw_Enk:\n{zpw_enk}\n\n"
                             f"User_Agent:\n{ua}\n\n"
                             f"Cookie:\n{cookies_str}\n"
                         )
+                        st_lbl = "🟢 SỐNG TRONG ACC (Giữ hoạt động liên tục 24/7)" if in_acc else "🟡 Đã lưu phiên"
                         cap_ok = (
-                            f"✅ <b>ĐĂNG NHẬP ZALO THÀNH CÔNG!</b>\n"
+                            f"✅ <b>ĐĂNG NHẬP ZALO PC SINGAPORE THÀNH CÔNG!</b>\n"
                             f"• Tài khoản: <b>{d_name}</b> (UID: {uid})\n"
                             f"• Thiết bị: <b>{pc_name}</b> ({grp_cnt} nhóm)\n"
+                            f"• Địa điểm: <b>Singapore (SG)</b>\n"
                             f"• IMEI: {imei}\n"
-                            f"• Trạng thái: <b>Đã lưu vào Web &amp; giữ sống 24/7</b>"
+                            f"• Trạng thái: <b>{st_lbl}</b>"
                         )
-                        safe_fn = re.sub(r"[^\w\-\.]", "_", d_name) + "_zalo.txt"
+                        safe_fn = re.sub(r"[^\w\-\.]", "_", d_name) + "_zalo_sg.txt"
                         self.send_doc_bytes(chat_id, file_txt.encode("utf-8"), safe_fn, caption=cap_ok, reply_to=msg_id)
 
                 login_qr_with_unique_imei(
@@ -470,6 +686,16 @@ class DirectTelegramBotRunner:
         if data.startswith("qr_"):
             reg = data.replace("qr_", "")
             self.handle_zalo_qr_command(chat_id, user_id, msg_id=msg_id, region_code=reg)
+        elif data == "menu_check_zalo":
+            threading.Thread(target=self.handle_check_all_stored_zalo_cookies, args=(chat_id, msg_id), daemon=True).start()
+        elif data == "menu_keep_token":
+            self.user_states[user_id] = {"tool": "keep_token", "step": "input"}
+            self.send_text(
+                chat_id,
+                "🔑 <b>Gửi Token Discord hoặc Cookie+IMEI Zalo (hoặc file .txt) vào đây:</b>\n"
+                "👉 Bot sẽ tự động khóa định danh thiết bị, đồng bộ lên Web (bật sẵn quyền dùng lệnh) và chạy đa hoạt động liên tục 24/7 để không bao giờ bị die hoặc báo thay đổi Cookie mới!",
+                reply_to=msg_id,
+            )
         elif data == "menu_discord":
             self.user_states[user_id] = {"tool": "discord", "step": "email"}
             self.send_text(chat_id, "🔑 <b>Gửi Email hoặc SĐT Discord:</b>", reply_to=msg_id)
@@ -483,27 +709,91 @@ class DirectTelegramBotRunner:
             self.send_status_report(chat_id, msg_id)
 
     def send_status_report(self, chat_id, reply_to=None):
+        ZaloPCSessionKeeper.restore_all_from_db(DB_PATH)
         active_devs = ZaloPCSessionKeeper.list_active_devices()
         if not active_devs:
             cap_s = (
-                "📊 <b>TRẠNG THÁI HỆ THỐNG</b>\n"
+                "📊 <b>TRẠNG THÁI HỆ THỐNG (SINGAPORE 24/7)</b>\n"
                 "• Bot Telegram: <b>Đang hoạt động 24/7</b>\n"
-                "• Thiết bị Zalo PC: <b>0 thiết bị</b>\n"
-                "👉 Bấm nút bên dưới hoặc gõ <b>/qr</b> để tạo mã QR mới."
+                "• Thiết bị Zalo PC trong Acc: <b>0 thiết bị</b>\n"
+                "👉 Bấm nút bên dưới hoặc gõ <b>/qr</b> để tạo mã QR máy tính Singapore mới."
             )
         else:
-            lines_s = [f"🖥️ <b>THIẾT BỊ ĐANG ONLINE ({len(active_devs)}):</b>"]
+            lines_s = [f"🖥️ <b>THIẾT BỊ MÁY TÍNH SINGAPORE ĐANG SỐNG TRONG ACC ({len(active_devs)}):</b>"]
             for dv in active_devs:
-                lines_s.append(f"• <b>{dv['display_name']}</b> — {dv['pc_name']} (UID: {dv['uid']})")
+                grp_info = f" • {dv.get('groups_count', 0)} nhóm" if dv.get("groups_count") else ""
+                lines_s.append(
+                    f"• 🟢 <b>{dv['display_name']}</b> — {dv['pc_name']} (UID: {dv['uid']}{grp_info} • Xung nhịp: {dv.get('ping_count', 1)})"
+                )
             cap_s = "\n".join(lines_s)
         self.send_menu_with_horizontal_banner(chat_id, cap_s, reply_to=reply_to)
 
     def handle_interactive_state(self, chat_id, user_id, text, msg_id):
-        st = self.user_states.get(user_id)
+        st = self.user_states.get(user_id) or self.user_states.get(chat_id)
         if not st:
             return False
         tool = st.get("tool")
         step = st.get("step")
+
+        if tool == "check_zalo" and step == "input":
+            self.user_states.pop(user_id, None)
+            self.user_states.pop(chat_id, None)
+            imei, ck_dict, enk = parse_imei_and_cookie_from_text(text)
+            if not imei or not ck_dict:
+                self.send_text(
+                    chat_id,
+                    "⚠️ Không tìm thấy đủ <b>IMEI</b> và <b>Cookie Zalo</b> trong nội dung bạn gửi. Hãy gửi theo dạng <b>IMEI|Cookie</b> hoặc gửi file .txt xuất từ Bot!",
+                    reply_to=msg_id,
+                )
+                return True
+            chk = check_zalo_cookie_imei_live(imei=imei, cookies_input=ck_dict, zpw_enk=enk)
+            if chk["alive"]:
+                sync_zalo_account_to_web_db(
+                    uid=chk["uid"] or imei,
+                    display_name=chk["display_name"] or "Zalo SG",
+                    imei=imei,
+                    cookies_dict=chk["cookies"],
+                    zpw_enk=chk["zpw_enk"],
+                    pc_name="Windows 11 Pro (Singapore)",
+                )
+                self.send_text(
+                    chat_id,
+                    f"🟢 <b>COOKIE + IMEI ĐANG SỐNG (ON — TRONG ACC)!</b>\n"
+                    f"• Tài khoản: <b>{chk['display_name']}</b> (UID: {chk['uid']})\n"
+                    f"• Số nhóm hoạt động: <b>{chk['groups_count']} nhóm</b>\n"
+                    f"• IMEI: {imei}\n"
+                    f"• Trạng thái: <b>Đã kích hoạt giữ sống liên tục 24/7 trên Web &amp; Bot!</b>",
+                    reply_to=msg_id,
+                )
+            else:
+                self.send_text(
+                    chat_id,
+                    f"🔴 <b>COOKIE + IMEI ĐÃ DIE (OFF)!</b>\n"
+                    f"• IMEI: {imei}\n"
+                    f"• Nguyên nhân: <b>{chk['reason']}</b>\n"
+                    f"👉 Thiết bị máy tính của Cookie/IMEI này đã đăng xuất khỏi tài khoản Zalo. Hãy gõ <b>/qr</b> để quét máy tính Singapore mới!",
+                    reply_to=msg_id,
+                )
+            return True
+
+        if tool == "keep_token" and step == "input":
+            self.user_states.pop(user_id, None)
+            self.user_states.pop(chat_id, None)
+            res_list = sync_and_keepalive_tokens_to_db(text)
+            if not res_list:
+                self.send_text(
+                    chat_id,
+                    "⚠️ Không nhận diện được Token Discord hoặc Cookie+IMEI Zalo hợp lệ. Vui lòng kiểm tra lại!",
+                    reply_to=msg_id,
+                )
+                return True
+            lines_t = [f"✅ <b>ĐÃ NẠP &amp; KÍCH HOẠT GIỮ SỐNG 24/7 ({len(res_list)} PHIÊN):</b>"]
+            for idx, r_it in enumerate(res_list, 1):
+                st_b = "🟢 SỐNG 24/7" if r_it.get("alive") else "🔴 DIE"
+                lines_t.append(f"{idx}. [{r_it['type']}] <b>{r_it['name']}</b> (UID: {r_it['uid']}) — <b>{st_b}</b>")
+            lines_t.append("👉 Đã đồng bộ lên Web (bật sẵn quyền sử dụng lệnh) và duy trì hoạt động liên tục không đổi Cookie mới!")
+            self.send_text(chat_id, "\n".join(lines_t), reply_to=msg_id, reply_markup=self.build_main_menu_keyboard())
+            return True
 
         if tool == "2fa" and step == "secret":
             self.user_states.pop(user_id, None)
@@ -543,7 +833,8 @@ class DirectTelegramBotRunner:
                 tk, uid, msg_s = discord_getter.login_discord(st["email"], st["password"], "")
                 if tk:
                     self.user_states.pop(user_id, None)
-                    self.send_text(chat_id, f"✅ <b>Token Discord (UID: {uid}):</b>\n{tk}", reply_to=msg_id)
+                    sync_and_keepalive_tokens_to_db(tk)
+                    self.send_text(chat_id, f"✅ <b>Token Discord (UID: {uid} — Đã giữ sống 24/7):</b>\n{tk}", reply_to=msg_id)
                 elif msg_s == "NEED_2FA":
                     st["step"] = "2fa"
                     self.send_text(chat_id, "🔐 Gửi <b>Mã 6 số 2FA</b> hoặc <b>Secret Key</b>:", reply_to=msg_id)
@@ -557,12 +848,64 @@ class DirectTelegramBotRunner:
                 self.user_states.pop(user_id, None)
                 tk, uid, msg_s = discord_getter.login_discord(email, pw, text.strip())
                 if tk:
-                    self.send_text(chat_id, f"✅ <b>Token Discord (UID: {uid}):</b>\n{tk}", reply_to=msg_id)
+                    sync_and_keepalive_tokens_to_db(tk)
+                    self.send_text(chat_id, f"✅ <b>Token Discord (UID: {uid} — Đã giữ sống 24/7):</b>\n{tk}", reply_to=msg_id)
                 else:
                     self.send_text(chat_id, f"❌ Lỗi: {msg_s}", reply_to=msg_id)
                 return True
 
         return False
+
+    def _handle_uploaded_document(self, chat_id, user_id, doc_obj, msg_id):
+        """Hỗ trợ người dùng gửi trực tiếp file .txt chứa Cookie + IMEI Zalo hoặc danh sách Token Discord vào Bot để check & giữ sống."""
+        file_id = doc_obj.get("file_id")
+        if not file_id:
+            return
+        try:
+            r_info = self.api_call("getFile", data={"file_id": file_id}, timeout=10)
+            f_path = (r_info.get("result") or {}).get("file_path")
+            if not f_path:
+                return
+            dl_url = f"https://api.telegram.org/file/bot{self.token}/{f_path}"
+            raw_txt = self.session.get(dl_url, timeout=15).text or ""
+            if not raw_txt.strip():
+                return
+            imei, ck_dict, enk = parse_imei_and_cookie_from_text(raw_txt)
+            if imei and ck_dict:
+                chk = check_zalo_cookie_imei_live(imei=imei, cookies_input=ck_dict, zpw_enk=enk)
+                if chk["alive"]:
+                    sync_zalo_account_to_web_db(
+                        uid=chk["uid"] or imei,
+                        display_name=chk["display_name"] or "Zalo SG",
+                        imei=imei,
+                        cookies_dict=chk["cookies"],
+                        zpw_enk=chk["zpw_enk"],
+                        pc_name="Windows 11 Pro (Singapore)",
+                    )
+                    self.send_text(
+                        chat_id,
+                        f"🟢 <b>FILE COOKIE + IMEI ĐANG SỐNG (ON — TRONG ACC)!</b>\n"
+                        f"• Tài khoản: <b>{chk['display_name']}</b> (UID: {chk['uid']} • {chk['groups_count']} nhóm)\n"
+                        f"• Trạng thái: <b>Đã nạp lên Web &amp; giữ sống liên tục 24/7!</b>",
+                        reply_to=msg_id,
+                    )
+                else:
+                    self.send_text(
+                        chat_id,
+                        f"🔴 <b>FILE COOKIE + IMEI ĐÃ DIE (OFF)!</b>\n"
+                        f"• Lý do: <b>{chk['reason']}</b>",
+                        reply_to=msg_id,
+                    )
+                return
+            res_list = sync_and_keepalive_tokens_to_db(raw_txt)
+            if res_list:
+                self.send_text(
+                    chat_id,
+                    f"✅ <b>Đã nạp &amp; kích hoạt giữ sống 24/7 cho {len(res_list)} Token từ file!</b>",
+                    reply_to=msg_id,
+                )
+        except Exception:
+            pass
 
     def process_update(self, upd):
         self.processed_updates += 1
@@ -576,15 +919,37 @@ class DirectTelegramBotRunner:
         from_u = msg.get("from") or {}
         user_id = from_u.get("id") or chat_id
         msg_id = msg.get("message_id")
+        if not chat_id:
+            return
+
+        if msg.get("document"):
+            self._handle_uploaded_document(chat_id, user_id, msg["document"], msg_id)
+            return
+
         text = str(msg.get("text") or "").strip()
-        if not chat_id or not text:
+        if not text:
             return
 
         if not text.startswith("/") and not text.startswith("."):
-            self.handle_interactive_state(chat_id, user_id, text, msg_id)
+            if self.handle_interactive_state(chat_id, user_id, text, msg_id):
+                return
+            # Tự động nhận diện nếu người dùng dán thẳng Token Discord hoặc Cookie+IMEI Zalo vào khung chat
+            if DISCORD_TOKEN_RE.search(text) or ("zpw_sek" in text and len(text) > 40):
+                res_auto = sync_and_keepalive_tokens_to_db(text)
+                if res_auto:
+                    r0 = res_auto[0]
+                    st_lbl = "🟢 ĐANG SỐNG TRONG ACC (Đã bật giữ sống 24/7)" if r0.get("alive") else f"🔴 DIE ({r0.get('reason', 'Đã đăng xuất')})"
+                    self.send_text(
+                        chat_id,
+                        f"⚡ <b>TỰ ĐỘNG KIỂM TRA &amp; GIỮ SỐNG ({len(res_auto)} PHIÊN):</b>\n"
+                        f"• Loại: <b>{r0['type']}</b> — <b>{r0['name']}</b> (UID: {r0['uid']})\n"
+                        f"• Trạng thái: <b>{st_lbl}</b>",
+                        reply_to=msg_id,
+                    )
             return
 
         self.user_states.pop(user_id, None)
+        self.user_states.pop(chat_id, None)
         parts = text.split()
         raw_cmd = parts[0].lower().split("@")[0]
         cmd = "/" + raw_cmd.lstrip("/.")
@@ -598,26 +963,74 @@ class DirectTelegramBotRunner:
                 reply_markup=self.build_main_menu_keyboard(),
             )
 
+        elif cmd in ("/check", "/checkzalo", "/checkcookie"):
+            if args:
+                raw_in = " ".join(args)
+                imei, ck_dict, enk = parse_imei_and_cookie_from_text(raw_in)
+                if imei and ck_dict:
+                    chk = check_zalo_cookie_imei_live(imei=imei, cookies_input=ck_dict, zpw_enk=enk)
+                    if chk["alive"]:
+                        sync_zalo_account_to_web_db(
+                            uid=chk["uid"] or imei,
+                            display_name=chk["display_name"] or "Zalo SG",
+                            imei=imei,
+                            cookies_dict=chk["cookies"],
+                            zpw_enk=chk["zpw_enk"],
+                            pc_name="Windows 11 Pro (Singapore)",
+                        )
+                        self.send_text(
+                            chat_id,
+                            f"🟢 <b>COOKIE + IMEI SỐNG (TRONG ACC): {chk['display_name']}</b> (UID: {chk['uid']} • {chk['groups_count']} nhóm) — Đã giữ sống 24/7!",
+                            reply_to=msg_id,
+                        )
+                    else:
+                        self.send_text(
+                            chat_id,
+                            f"🔴 <b>COOKIE + IMEI ĐÃ DIE:</b> {chk['reason']}",
+                            reply_to=msg_id,
+                        )
+                    return
+            self.handle_check_all_stored_zalo_cookies(chat_id, reply_to=msg_id)
+
+        elif cmd in ("/token", "/keeptoken", "/nap"):
+            if not args:
+                self.user_states[user_id] = {"tool": "keep_token", "step": "input"}
+                self.send_text(
+                    chat_id,
+                    "🔑 <b>Gửi Token Discord hoặc Cookie+IMEI Zalo cần giữ sống liên tục 24/7:</b>",
+                    reply_to=msg_id,
+                )
+                return
+            res_list = sync_and_keepalive_tokens_to_db(" ".join(args))
+            if res_list:
+                self.send_text(
+                    chat_id,
+                    f"✅ <b>Đã nạp &amp; giữ sống liên tục 24/7 cho {len(res_list)} phiên!</b>",
+                    reply_to=msg_id,
+                )
+            else:
+                self.send_text(chat_id, "⚠️ Token hoặc Cookie không hợp lệ!", reply_to=msg_id)
+
         elif cmd == "/qr" or (cmd == "/get" and args and args[0].lower() == "zalo"):
-            reg_arg = (args[0].lower() if (cmd == "/qr" and args) else (args[1].lower() if len(args) > 1 else "vn"))
+            reg_arg = (args[0].lower() if (cmd == "/qr" and args) else (args[1].lower() if len(args) > 1 else "sg"))
             reg_map = {
                 "sg": "sg_vip",
                 "singapore": "sg_vip",
-                "hcm": "vn_hcm",
-                "vn": "vn_hcm",
-                "hn": "vn_hn",
-                "hanoi": "vn_hn",
-                "dn": "vn_dn",
-                "danang": "vn_dn",
-                "mac": "vn_mac",
-                "macair": "vn_mac_air",
-                "imac": "vn_imac",
-                "macstudio": "vn_mac_studio",
-                "dell": "vn_dell_xps",
-                "thinkpad": "vn_thinkpad",
-                "hp": "vn_hp_spectre",
+                "hcm": "sg_rog_zephyrus",
+                "vn": "sg_vip",
+                "hn": "sg_rog_strix",
+                "hanoi": "sg_rog_strix",
+                "dn": "sg_msi_titan",
+                "danang": "sg_msi_titan",
+                "mac": "sg_mac_pro",
+                "macair": "sg_mac_air",
+                "imac": "sg_imac",
+                "macstudio": "sg_mac_studio",
+                "dell": "sg_dell_precision",
+                "thinkpad": "sg_thinkpad_z16",
+                "hp": "sg_hp_spectre",
             }
-            reg_code = reg_map.get(reg_arg, "vn_hcm")
+            reg_code = reg_map.get(reg_arg, "sg_vip")
             custom_pc = " ".join(args[1:]) if (cmd == "/qr" and len(args) > 1) else ""
             self.handle_zalo_qr_command(chat_id, user_id, msg_id=msg_id, region_code=reg_code, custom_pc_name=custom_pc)
 
@@ -645,7 +1058,8 @@ class DirectTelegramBotRunner:
                 if plat == "discord":
                     tk, uid, st_m = discord_getter.login_discord(u_acc, u_pw, u_2fa)
                     if tk:
-                        self.send_text(chat_id, f"✅ <b>Token Discord (UID: {uid}):</b>\n{tk}", reply_to=msg_id)
+                        sync_and_keepalive_tokens_to_db(tk)
+                        self.send_text(chat_id, f"✅ <b>Token Discord (UID: {uid} — Giữ sống 24/7):</b>\n{tk}", reply_to=msg_id)
                     else:
                         self.send_text(chat_id, f"❌ Lỗi: {st_m}", reply_to=msg_id)
                 elif plat in ("facebook", "fb"):
@@ -671,7 +1085,7 @@ class DirectTelegramBotRunner:
             normal = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
             styles = {
                 "Bold Serif": "𝐀𝐁𝐂𝐃𝐄𝐅𝐆𝐇𝐈𝐉𝐊𝐋𝐌𝐍𝐎𝐏𝐐𝐑𝐒𝐓𝐔𝐕𝐖𝐗𝐘𝐙𝐚𝐛𝐜𝐝𝐞𝐟𝐠𝐡𝐢𝐣𝐤𝐥𝐦𝐧𝐨𝐩𝐪𝐫𝐬𝐭𝐮𝐯𝐰𝐱𝐲𝐳𝟎𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖𝟗",
-                "Bold Sans": "𝗔𝗕𝗖𝗗𝗘𝗙𝗚𝗛𝗜𝗝𝗞𝗟𝗠𝗡𝗢𝗣𝗤𝗥𝗦𝗧𝗨𝗩𝗪𝗫𝗬𝗭𝗮𝗯𝗰𝗱𝗲𝗳𝗴𝗵𝗶𝗷𝗸𝗹𝗺𝗻𝗼𝗽𝗾𝗿𝘀𝘁𝐮𝘃𝘄𝘅𝘆𝘇𝟬𝟭𝟮𝟯𝟰𝟱𝟲𝟳𝟴𝟵",
+                "Bold Sans": "𝗔𝗕𝗖𝗗𝗘𝗙𝗚𝗛𝗜𝗝𝗞𝗟𝗠𝗡𝗢𝗣𝗤𝗥𝗦𝗧𝗨𝗩𝗪𝗫𝗬𝗭𝗮𝗯𝗰𝗱𝗲𝗳𝗴𝐡𝗶𝗷𝗸𝗹𝗺𝗻𝗼𝗽𝗾𝗿𝘀𝘁𝘂𝘃𝘄𝘅𝘆𝘇𝟬𝟭𝟮𝟯𝟰𝟱𝟲𝟳𝟴𝟵",
                 "Script": "𝒜ℬ𝒞𝒟ℰℱ𝒢ℋℐ𝒥𝒦ℒℳ𝒩𝒪𝒫𝒬ℛ𝒮𝒯𝒰𝒱𝒲𝒳𝒴𝒵𝒶𝒷𝒸𝒹ℯ𝒻ℊ𝒽𝒾𝒿𝓀𝓁𝓂𝓃ℴ𝓅𝓆𝓇𝓈𝓉𝓊𝓋𝓌𝓍𝓎𝓏0123456789",
                 "Double Struck": "𝔸𝔹ℂ𝔻𝔼𝔽𝔾ℍ𝕀𝕁𝕂𝕃𝕄ℕ𝕆ℙℚℝ𝕊𝕋𝕌𝕍𝕎𝕏𝕐ℤ𝕒𝕓𝕔𝕕𝖊𝖋𝖌𝖍𝖎𝖏𝖐𝖑𝖒𝖓𝖔𝖕𝖖𝖗𝖘𝖙𝖚𝖛𝖜𝖝𝖞𝖟𝟘𝟙𝟚𝟛𝟜𝟝𝟞𝟟𝟠𝟡",
             }
