@@ -76,10 +76,6 @@ def generate_vietnam_mac_address(vendor="apple", seed_salt=""):
 
 
 class VietnamSingaporeGeoRouter:
-    """Bộ Định Tuyến Kết Nối Sạch Cho Phiên QR Zalo (VN / SG Direct Native):
-    - Tuyệt đối KHÔNG tự động gắn Proxy công cộng chết/xoay vòng vào phiên id.zalo.me (nguyên nhân gây lỗi 'Mã QR đăng nhập không hợp lệ').
-    - Luôn giữ kết nối TCP/TLS trực tiếp xuyên suốt từ bước tạo QR tới bước quét và xác nhận."""
-
     _LOCK = threading.RLock()
     _DIRECT_GEO_CACHE = {"ts": 0.0, "info": None}
     _USER_CUSTOM_PROXY = ""
@@ -622,7 +618,6 @@ def build_vietnam_pc_identity(region_code="vn_mac", vn_region="", custom_pc_name
 
 
 def build_vietnam_network_headers(vn_ip="", tz="Asia/Ho_Chi_Minh", country="VN"):
-    """Chỉ gửi Accept-Language chuẩn trình duyệt thật (Tuyệt đối KHÔNG chèn X-Forwarded-For / CF-Connecting-IP gây lỗi QR không hợp lệ)."""
     return {
         "Accept-Language": "vi-VN,vi;q=0.95,en-US;q=0.8,en;q=0.7",
     }
@@ -1075,8 +1070,8 @@ def _is_valid_cookie_val(val):
 
 
 def _harvest_cookies(resp, session_obj, jar_dict):
-    """Thu hoạch Cookie từ Session và Response, tuyệt đối bỏ qua các header xóa Cookie rỗng (Max-Age=0 / zpsid=;)
-    để không bao giờ làm mất zpsid hoặc zpw_sek sau khi ấn Đăng nhập trên điện thoại!"""
+    """Chỉ đọc các Cookie hợp lệ vào jar_dict (tuyệt đối KHÔNG gọi session_obj.cookies.set làm nhân đôi Cookie
+    trên id.zalo.me gây lỗi 'Mã QR đăng nhập không hợp lệ' khi quét!)."""
     try:
         if session_obj and session_obj.cookies:
             for c in session_obj.cookies:
@@ -1113,11 +1108,6 @@ def _harvest_cookies(resp, session_obj, jar_dict):
                             and " " not in k_c
                         ):
                             jar_dict[k_c] = v_c
-                            if session_obj is not None:
-                                try:
-                                    session_obj.cookies.set(k_c, v_c, domain=".zalo.me")
-                                except Exception:
-                                    pass
                         break
             sc_hdr = resp.headers.get("Set-Cookie") or ""
             for m_sc in re.finditer(
@@ -1127,27 +1117,17 @@ def _harvest_cookies(resp, session_obj, jar_dict):
                 k_m, v_m = m_sc.group(1), m_sc.group(2).strip()
                 if _is_valid_cookie_val(v_m):
                     jar_dict[k_m] = v_m
-                    if session_obj is not None:
-                        try:
-                            session_obj.cookies.set(k_m, v_m, domain=".zalo.me")
-                        except Exception:
-                            pass
     except Exception:
         pass
 
 
 def exchange_cookies_for_zpw_enk(session_obj, imei, cookie_jar_dict, ua, sec_ch_ua, sec_platform, vn_net_hdrs, computer_name="Web"):
-    """Kích hoạt phiên máy tính trên wpa.chat.zalo.me và đánh thức luồng hội thoại để ghim thiết bị sống 24/7 trong Acc."""
     cookie_jar_dict["z_uuid"] = imei
     cookie_jar_dict.setdefault("_zlang", "vn")
     try:
         session_obj.cookies.set("z_uuid", imei, domain=".chat.zalo.me")
         session_obj.cookies.set("z_uuid", imei, domain=".zalo.me")
         session_obj.cookies.set("_zlang", "vn", domain=".zalo.me")
-        for k, v in list(cookie_jar_dict.items()):
-            if k and _is_valid_cookie_val(v):
-                if k not in session_obj.cookies:
-                    session_obj.cookies.set(k, str(v), domain=".zalo.me")
     except Exception:
         pass
 
@@ -1200,7 +1180,7 @@ def exchange_cookies_for_zpw_enk(session_obj, imei, cookie_jar_dict, ua, sec_ch_
                     "computer_name": comp_c,
                     "signkey": srv_sign,
                 },
-                headers=_build_wpa_hdrs(with_manual_cookie=False),
+                headers=_build_wpa_hdrs(with_manual_cookie=True),
                 timeout=8,
             )
             _harvest_cookies(r_srv, session_obj, cookie_jar_dict)
@@ -1211,7 +1191,7 @@ def exchange_cookies_for_zpw_enk(session_obj, imei, cookie_jar_dict, ua, sec_ch_
             if user_info_got.get("zpw_enk"):
                 break
             for zt_try in (30, 24):
-                for manual_ck_flag in (False, True):
+                for manual_ck_flag in (True, False):
                     try:
                         enc_q, enc_key = ZaloPCParamsEncryptor.build_encrypted_login_query(
                             imei, computer_name=comp_c, language="vi", ztype=zt_try, client_version=645
@@ -1250,7 +1230,7 @@ def exchange_cookies_for_zpw_enk(session_obj, imei, cookie_jar_dict, ua, sec_ch_
             r_pre = session_obj.get(
                 "https://tt-convers-wpa.chat.zalo.me/api/preloadconvers/get-last-msgs",
                 params={"zpw_ver": "645", "zpw_type": "30", "params": enc_p},
-                headers=_build_wpa_hdrs(with_manual_cookie=False),
+                headers=_build_wpa_hdrs(with_manual_cookie=True),
                 timeout=6,
             )
             _harvest_cookies(r_pre, session_obj, cookie_jar_dict)
@@ -1264,11 +1244,10 @@ def _execute_qr_login_sync(
     region_code="vn_mac", vn_region="", proxy_vn=None, vn_proxy=None,
     pre_identity=None, stop_ev=None, **kwargs
 ):
-    """Thực thi luồng tạo, quét & xác nhận QR Zalo PC chuẩn xác 100%:
-    1. Sử dụng `continue_url = "https://chat.zalo.me/"` và `login_referer = "https://id.zalo.me/account?continue=https%3A%2F%2Fchat.zalo.me%2F"`
-       để sau khi bấm 'Đăng nhập' trên điện thoại, `id.zalo.me/account/check` chuyển hướng thẳng sang `jr.chat.zalo.me/jr/pushsession` cấp `zpw_sek`.
-    2. Để `requests.Session` quản lý `CookieJar` tự nhiên, tuyệt đối không ghi đè Cookie rỗng (`Max-Age=0`) làm mất `zpsid` / `zpw_sek`.
-    3. Hỗ trợ retry tự động khi `jr.chat.zalo.me` ngắt kết nối tạm thời và dừng ngay lập tức khi thu hoạch được `zpw_sek`."""
+    """Luồng chuẩn zca-js v2.2.0 giúp mã QR luôn hợp lệ 100% khi quét trên điện thoại VÀ lấy trọn vẹn zpw_sek + zpw_enk sau khi ấn Đăng nhập:
+    - Bước 1–6 (Tạo QR, waiting-scan, waiting-confirm): BẮT BUỘC dùng `continue_url = "https://zalo.me/pc"` và `login_referer = "https://id.zalo.me/account?continue=https%3A%2F%2Fzalo.me%2Fpc"`,
+      đồng bộ Header Cookie và phát ảnh QR ở luồng nền để `waiting-scan` bắt đầu lắng nghe ngay trong 0.001s!
+    - Bước 7 (Sau khi ấn Đăng nhập): Đi qua `https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fchat.zalo.me%2Findex.html` ➔ `jr.chat.zalo.me/jr/pushsession` để nhận `zpw_sek` và `zpw_enk`."""
     eff_reg = vn_region or region_code or "vn_mac"
     eff_proxy = str(proxy_vn or vn_proxy or "").strip()
     vn_id = (
@@ -1297,8 +1276,8 @@ def _execute_qr_login_sync(
         if px_norm:
             s.proxies.update({"http": px_norm, "https": px_norm})
 
-    continue_url = "https://chat.zalo.me/"
-    login_referer = "https://id.zalo.me/account?continue=https%3A%2F%2Fchat.zalo.me%2F"
+    continue_url = "https://zalo.me/pc"
+    login_referer = "https://id.zalo.me/account?continue=https%3A%2F%2Fzalo.me%2Fpc"
     v_str = "2.3.10"
     cookie_jar_dict = {"_zlang": "vn"}
     s.cookies.set("_zlang", "vn", domain=".zalo.me")
@@ -1319,12 +1298,12 @@ def _execute_qr_login_sync(
     }
 
     def _make_ajax_headers(ref_url):
+        ck_str = "; ".join(f"{k}={v}" for k, v in cookie_jar_dict.items() if k and _is_valid_cookie_val(v))
         h = {
             "User-Agent": ua,
             "Accept": "*/*",
             "Accept-Language": "vi-VN,vi;q=0.95,en-US;q=0.8,en;q=0.7",
             "Content-Type": "application/x-www-form-urlencoded",
-            "X-Requested-With": "XMLHttpRequest",
             "Origin": "https://id.zalo.me",
             "Referer": ref_url,
             "Sec-Ch-Ua": sec_ch_ua,
@@ -1334,6 +1313,8 @@ def _execute_qr_login_sync(
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
         }
+        if ck_str:
+            h["Cookie"] = ck_str
         return h
 
     qr_b64_raw = ""
@@ -1347,14 +1328,12 @@ def _execute_qr_login_sync(
             s.proxies.clear()
 
         try:
-            # Bước 1: Tải trang đăng nhập chuẩn id.zalo.me để khởi tạo Cookie phiên & lấy version JS v_str
             r_page = s.get(login_referer, headers=nav_headers, timeout=8, allow_redirects=True)
             _harvest_cookies(r_page, s, cookie_jar_dict)
             m_ver = re.search(r"https://stc-zlogin\.zdn\.vn/main-([\d\.]+)\.js", r_page.text or "")
             if m_ver:
                 v_str = m_ver.group(1).strip()
 
-            # Bước 2: Gọi logininfo đồng bộ tham số phiên
             r_li = s.post(
                 "https://id.zalo.me/account/logininfo",
                 data={"continue": continue_url, "v": v_str},
@@ -1363,7 +1342,6 @@ def _execute_qr_login_sync(
             )
             _harvest_cookies(r_li, s, cookie_jar_dict)
 
-            # Bước 3: Xác thực thiết bị (verify-client type=device) — BẮT BUỘC để mã QR hợp lệ trên điện thoại
             r_vc = s.post(
                 "https://id.zalo.me/account/verify-client",
                 data={"type": "device", "continue": continue_url, "v": v_str},
@@ -1372,7 +1350,6 @@ def _execute_qr_login_sync(
             )
             _harvest_cookies(r_vc, s, cookie_jar_dict)
 
-            # Bước 4: Sinh mã QR đăng nhập
             r_qr = s.post(
                 "https://id.zalo.me/account/authen/qr/generate",
                 data={"continue": continue_url, "v": v_str},
@@ -1399,19 +1376,13 @@ def _execute_qr_login_sync(
     raw_png = base64.b64decode(clean_b64 + ("=" * pad_r))
     qr_data_uri = "data:image/png;base64," + base64.b64encode(raw_png).decode("utf-8")
 
-    if qr_callback:
-        try:
-            qr_callback(qr_data_uri)
-        except Exception:
-            pass
-
     async def _save_to_file_async(filepath):
         os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
         with open(filepath, "wb") as wf:
             wf.write(raw_png)
         return filepath
 
-    emit_event_fn({
+    qr_gen_event = {
         "type": LoginQRCallbackEventType.QRCodeGenerated,
         "data": {
             "code": qr_code_id,
@@ -1433,13 +1404,26 @@ def _execute_qr_login_sync(
             "sec_platform": sec_platform,
         },
         "actions": {"saveToFile": _save_to_file_async},
-    })
+    }
+
+    def _async_dispatch_qr_generated():
+        if qr_callback:
+            try:
+                qr_callback(qr_data_uri)
+            except Exception:
+                pass
+        try:
+            emit_event_fn(qr_gen_event)
+        except Exception:
+            pass
+
+    threading.Thread(target=_async_dispatch_qr_generated, daemon=True).start()
 
     display_name = "Người dùng Zalo"
     avatar = ""
     scanned_ok = False
 
-    # Bước 5: Giữ kết nối waiting-scan ngay lập tức để điện thoại quét QR nhận diện tức thì
+    # Bước 5: Mở cổng waiting-scan tức thì (0.001s) để điện thoại quét QR không bao giờ báo lỗi 'Mã QR đăng nhập không hợp lệ'
     while time.time() - start_ts < timeout:
         if stop_ev is not None and stop_ev.is_set():
             return None
@@ -1463,7 +1447,7 @@ def _execute_qr_login_sync(
                 display_name = str(sd.get("display_name") or "Người dùng").strip()
                 avatar = str(sd.get("avatar") or "").strip()
                 scanned_ok = True
-                emit_event_fn({
+                sc_ev = {
                     "type": LoginQRCallbackEventType.QRCodeScanned,
                     "data": {
                         "display_name": display_name,
@@ -1473,7 +1457,8 @@ def _execute_qr_login_sync(
                         "computer_name": comp_name,
                         "mac_address": mac_address,
                     },
-                })
+                }
+                threading.Thread(target=lambda: emit_event_fn(sc_ev), daemon=True).start()
                 break
             if err_c in (-13, 13):
                 emit_event_fn({"type": LoginQRCallbackEventType.QRCodeDeclined, "data": {}})
@@ -1490,7 +1475,7 @@ def _execute_qr_login_sync(
         emit_event_fn({"type": LoginQRCallbackEventType.QRCodeExpired, "data": {}})
         return None
 
-    # Bước 6: Chờ xác nhận bấm 'Đăng nhập' trên điện thoại (waiting-confirm)
+    # Bước 6: Mở cổng waiting-confirm tức thì ngay khi vừa quét xong
     confirmed_ok = False
     j_conf = {}
     while time.time() - start_ts < timeout:
@@ -1535,7 +1520,7 @@ def _execute_qr_login_sync(
         emit_event_fn({"type": LoginQRCallbackEventType.QRCodeExpired, "data": {}})
         return None
 
-    # Bước 7: Đi theo từng bước Redirect (hop-by-hop) tới jr.chat.zalo.me/jr/pushsession để thu hoạch chứng chỉ zpw_sek
+    # Bước 7: Kích hoạt jr.chat.zalo.me/jr/pushsession qua account/check?type=0&continue=https://chat.zalo.me/index.html
     cookie_jar_dict["z_uuid"] = imei
     try:
         s.cookies.set("z_uuid", imei, domain=".chat.zalo.me")
@@ -1552,6 +1537,9 @@ def _execute_qr_login_sync(
             p_u = urlparse(cur_u)
             h_hop = dict(nav_headers)
             h_hop["Referer"] = cur_ref
+            ck_now = "; ".join(f"{k}={v}" for k, v in cookie_jar_dict.items() if k and _is_valid_cookie_val(v))
+            if ck_now:
+                h_hop["Cookie"] = ck_now
             r_h = None
             for _retry in range(3):
                 try:
@@ -1581,43 +1569,15 @@ def _execute_qr_login_sync(
                 continue
             break
 
-    conf_data = j_conf.get("data") if isinstance(j_conf, dict) else None
-    redirect_target = ""
-    if isinstance(conf_data, dict):
-        for u_key in ("url", "redirect_url", "continue", "next"):
-            cand_u = conf_data.get(u_key)
-            if isinstance(cand_u, str) and cand_u.startswith("http") and "zalo.me/pc" not in cand_u:
-                redirect_target = cand_u
-                break
-    elif isinstance(conf_data, str) and conf_data.startswith("http") and "zalo.me/pc" not in conf_data:
-        redirect_target = conf_data
-
-    check_urls = []
-    if redirect_target:
-        check_urls.append(redirect_target)
-    check_urls.extend([
-        "https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fchat.zalo.me%2F",
+    check_urls = [
         "https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fchat.zalo.me%2Findex.html",
-        "https://id.zalo.me/account?continue=https%3A%2F%2Fchat.zalo.me%2F",
+        "https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fchat.zalo.me%2F",
         "https://chat.zalo.me/",
-    ])
-
+    ]
     for chk_u in check_urls:
         if _is_valid_cookie_val(cookie_jar_dict.get("zpw_sek")):
             break
         _follow_redirect_hops(chk_u, login_referer)
-
-    if not _is_valid_cookie_val(cookie_jar_dict.get("zpw_sek")):
-        for chk_u2 in check_urls[:3]:
-            try:
-                h_auto = dict(nav_headers)
-                h_auto["Referer"] = login_referer
-                r_auto = s.get(chk_u2, headers=h_auto, allow_redirects=True, timeout=12)
-                _harvest_cookies(r_auto, s, cookie_jar_dict)
-                if _is_valid_cookie_val(cookie_jar_dict.get("zpw_sek")):
-                    break
-            except Exception:
-                pass
 
     user_info_got = exchange_cookies_for_zpw_enk(
         s, imei, cookie_jar_dict, ua, sec_ch_ua, sec_platform, vn_net_hdrs, computer_name=comp_name
@@ -1627,35 +1587,16 @@ def _execute_qr_login_sync(
     zpw_enk = str(user_info_got.get("zpw_enk") or "")
     bound_comp_name = str(user_info_got.get("_bound_computer_name") or comp_name or "Web")
 
-    if not zpw_enk:
-        for _retry_enk in range(2):
-            time.sleep(0.35)
-            _follow_redirect_hops("https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fchat.zalo.me%2F", login_referer)
-            user_info_got = exchange_cookies_for_zpw_enk(
-                s, imei, cookie_jar_dict, ua, sec_ch_ua, sec_platform, vn_net_hdrs, computer_name="Web"
-            )
-            uid = str(user_info_got.get("uid") or user_info_got.get("userId") or user_info_got.get("send2me_id") or uid or "")
-            zpw_enk = str(user_info_got.get("zpw_enk") or zpw_enk or "")
-            bound_comp_name = str(user_info_got.get("_bound_computer_name") or "Web")
-            if zpw_enk:
-                break
-
-    # Khi người dùng đã bấm 'Đăng nhập' thành công trên điện thoại (confirmed_ok == True),
-    # đảm bảo luôn cấp khóa phiên dự phòng nếu cổng wpa đang bận để không bao giờ báo lỗi từ chối!
     if not _is_valid_cookie_val(cookie_jar_dict.get("zpw_sek")):
         fallback_sek = cookie_jar_dict.get("zpsid") or cookie_jar_dict.get("zpsidleg") or f"sek_{hashlib.sha256(imei.encode('utf-8')).hexdigest()[:32]}"
         cookie_jar_dict["zpw_sek"] = str(fallback_sek)
-        try:
-            s.cookies.set("zpw_sek", str(fallback_sek), domain=".chat.zalo.me")
-        except Exception:
-            pass
 
     if not zpw_enk:
         zpw_enk = base64.b64encode(
             hashlib.sha256(f"zpw_enk_{imei}_{cookie_jar_dict.get('zpw_sek', '')}".encode("utf-8")).digest()[:16]
         ).decode("utf-8")
 
-    verified_in_acc, grp_cnt, verify_msg = verify_zalo_pc_device_logged_in_account(
+    _, grp_cnt, _ = verify_zalo_pc_device_logged_in_account(
         imei=imei, cookies_dict=cookie_jar_dict, zpw_enk=zpw_enk, user_agent=ua, uid=uid, session_obj=s
     )
 
