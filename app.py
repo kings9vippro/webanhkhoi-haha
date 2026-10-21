@@ -86,6 +86,7 @@ from flask import (
     Flask, request, jsonify, session, redirect, Response, send_from_directory, render_template_string
 )
 from werkzeug.utils import secure_filename
+from werkzeug.exceptions import HTTPException
 
 # CẤU HÌNH HỆ THỐNG & BẢO MẬT WEB
 APP_TITLE = "Bảng Điều Khiển Đa Tài Khoản"
@@ -12167,7 +12168,7 @@ threading.Thread(target=_listener_watchdog_loop, daemon=True).start()
 # -*- coding: utf-8 -*-
 import math
 
-PART1_BLOCK = r'''class TelegramPetAnimationEngine:
+class TelegramPetAnimationEngine:
     """Động Cơ Vật Lý & Hoạt Ảnh Thú Cưng Sống Động (Chó Corgi Hoàng Gia & Mèo Anh Lông Ngắn) Khởi Chạy Qua Code Python:
     - Tính toán chu kỳ bước chạy bộ (Stride Kinematics), nhịp vẫy đuôi (Sinusoidal Tail Wag), nhịp thở lồng ngực,
       và phản xạ chớp mắt tự nhiên trực tiếp từ Python.
@@ -12633,11 +12634,9 @@ function handleTelegramLoginSubmit(ev) {
 </script>
 </body>
 </html>"""
-'''
 
 # -*- coding: utf-8 -*-
 
-PART2_BLOCK = r'''
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="vi">
 <head>
@@ -14347,11 +14346,9 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
     </button>
   </nav>
 </div>
-'''
 
-# -*- coding: utf-8 -*-
 
-PART3_BLOCK = r'''<script>
+<script>
 let ALL_TARGETS = [];
 let BY_ACCOUNT_BOXES = {};
 let SELECTED_TARGETS = new Map();
@@ -16490,27 +16487,28 @@ def api_zalo_auto_scan_vn_sg_proxy():
 @app.route("/api/network/gateways")
 def api_network_gateways():
     return jsonify(MessagingGatewayDirectory.get_directory_payload())
-'''
 
 
 @app.errorhandler(Exception)
 def handle_unexpected_error(e):
+    # Preserve normal HTTP responses such as 404 and 405.
+    if isinstance(e, HTTPException):
+        return e
+
+    # Do not hide template/runtime errors behind a fake 200 OK response.
+    app.logger.error(
+        "Unhandled exception while serving %s %s",
+        request.method,
+        request.path,
+        exc_info=(type(e), e, e.__traceback__),
+    )
     if request.path.startswith("/api/") or request.path.startswith("/task/"):
-        return jsonify({"ok": False, "error": str(e)}), 200
-    try:
-        has_logo = bool(get_setting("brand_logo_b64", "") or get_setting("brand_logo_url", ""))
-        logo_ts = get_setting("brand_logo_ts", "1")
-        custom_title = get_setting("custom_web_title", "")
-        return render_template_string(
-            DASHBOARD_HTML,
-            accounts=[],
-            files=[],
-            has_logo=has_logo,
-            logo_ts=logo_ts,
-            custom_title=custom_title,
-        ), 200
-    except Exception:
-        return Response("System Ready", mimetype="text/plain"), 200
+        return jsonify({"ok": False, "error": "Lỗi máy chủ nội bộ"}), 500
+    return Response(
+        "Đã xảy ra lỗi máy chủ nội bộ. Vui lòng kiểm tra log ứng dụng.",
+        mimetype="text/plain",
+        status=500,
+    )
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
