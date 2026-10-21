@@ -90,11 +90,13 @@ from werkzeug.utils import secure_filename
 # CẤU HÌNH HỆ THỐNG & BẢO MẬT WEB
 APP_TITLE = "NHK"
 APP_AUTHOR = "Phan Anh Khôi (Rike)"
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8995799349:AAE8uwWyS-CHzj2yQNkFkMynCTprFTZ1JNc")
-SECRET_KEY = os.environ.get("SECRET_KEY", "telegram-ultra-secure-session-key-2026-hmac-sha256")
-ACCESS_KEY = os.environ.get("WEB_KEY", "anhba")
-DEFAULT_ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-DEFAULT_ADMIN_PASS = os.environ.get("ADMIN_PASS", "anhba")
+# Secrets must be configured in the deployment environment, never embedded in source.
+# If TELEGRAM_BOT_TOKEN was ever committed or shared, revoke it with BotFather and create a new one.
+TELEGRAM_BOT_TOKEN = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+SECRET_KEY = (os.environ.get("SECRET_KEY") or secrets.token_urlsafe(48)).strip()
+DEFAULT_ADMIN_USER = (os.environ.get("ADMIN_USER") or "admin").strip() or "admin"
+DEFAULT_ADMIN_PASS = (os.environ.get("ADMIN_PASS") or "").strip()
+ADMIN_PASS_RESET = os.environ.get("ADMIN_PASS_RESET", "0").strip() == "1"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "database.db")
@@ -110,6 +112,12 @@ app.config["JSON_AS_ASCII"] = False
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 3600
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = (
+    os.environ.get("COOKIE_SECURE", "").strip().lower() in {"1", "true", "yes"}
+    or bool(os.environ.get("RENDER"))
+)
+app.config["PERMANENT_SESSION_LIFETIME"] = 12 * 60 * 60
+app.config["SESSION_REFRESH_EACH_REQUEST"] = False
 
 # LÁ CHẮN BẢO MẬT WEB (CHỐNG BRUTE-FORCE, RATE-LIMIT API, HEADERS)
 LOGIN_ATTEMPTS = defaultdict(lambda: {"fails": 0, "lock_until": 0.0})
@@ -143,19 +151,34 @@ def record_login_result(ip, success):
                 st["lock_until"] = now + min(300, 20 * (st["fails"] - 7))
 
 def hash_password_secure(raw_pw):
-    salt = secrets.token_hex(8)
-    h = hashlib.pbkdf2_hmac("sha256", raw_pw.encode("utf-8"), salt.encode("utf-8"), 100000).hex()
-    return f"pbkdf2${salt}${h}"
+    """PBKDF2-HMAC-SHA256 password hash with versioned iteration count."""
+    salt = secrets.token_hex(16)
+    iterations = 600_000
+    digest = hashlib.pbkdf2_hmac("sha256", raw_pw.encode("utf-8"), salt.encode("utf-8"), iterations).hex()
+    return f"pbkdf2v2${iterations}${salt}${digest}"
+
 
 def verify_password_secure(stored_pw, provided_pw):
     if not stored_pw or not provided_pw:
         return False
-    if stored_pw.startswith("pbkdf2$"):
-        parts = stored_pw.split("$")
-        if len(parts) == 3:
-            _, salt, h = parts
-            calc = hashlib.pbkdf2_hmac("sha256", provided_pw.encode("utf-8"), salt.encode("utf-8"), 100000).hex()
-            return hmac.compare_digest(h, calc)
+    try:
+        if stored_pw.startswith("pbkdf2v2$"):
+            _, rounds, salt, expected = stored_pw.split("$", 3)
+            iterations = int(rounds)
+            if iterations < 100_000 or iterations > 2_000_000:
+                return False
+            actual = hashlib.pbkdf2_hmac("sha256", provided_pw.encode("utf-8"), salt.encode("utf-8"), iterations).hex()
+            return hmac.compare_digest(expected, actual)
+        if stored_pw.startswith("pbkdf2$"):
+            parts = stored_pw.split("$")
+            if len(parts) == 3:
+                _, salt, expected = parts
+                actual = hashlib.pbkdf2_hmac("sha256", provided_pw.encode("utf-8"), salt.encode("utf-8"), 100_000).hex()
+                return hmac.compare_digest(expected, actual)
+    except (ValueError, TypeError):
+        return False
+    # Legacy plaintext database entries are still accepted for a single successful login;
+    # callers should immediately replace them with a versioned hash.
     return hmac.compare_digest(str(stored_pw), str(provided_pw))
 
 def get_or_create_csrf_token():
@@ -168,8 +191,28 @@ def get_or_create_csrf_token():
 @app.before_request
 def security_middleware():
     if not WebSecurityFortress.inspect_request():
-        return jsonify({"ok": False, "error": "Forbidden Request Signature"}), 403
-    if request.path.startswith("/api/") or request.path.startswith("/task/"):
+        return jsonify({"ok": False, "error": "Yêu cầu bị từ chối."}), 403
+
+    public_paths = {"/login", "/logout", "/api/logo", "/api/menu_banner.png"}
+    is_public = request.path in public_paths or request.path.startswith("/static/")
+
+    # The dashboard and its APIs must all require an authenticated session.
+    if not is_public and not session.get("logged_in"):
+        if request.path.startswith(("/api/", "/task/")) or request.method not in {"GET", "HEAD", "OPTIONS"}:
+            return jsonify({"ok": False, "error": "Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại."}), 401
+        return redirect("/login")
+
+    # CSRF protection for login forms, normal forms, and same-origin JSON requests.
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        expected = session.get("csrf_token", "")
+        supplied = (
+            request.headers.get("X-CSRF-Token", "")
+            or request.form.get("csrf_token", "")
+        )
+        if not expected or not supplied or not hmac.compare_digest(str(expected), str(supplied)):
+            return jsonify({"ok": False, "error": "Yêu cầu hết hạn hoặc thiếu mã bảo vệ. Hãy tải lại trang."}), 400
+
+    if request.path.startswith(("/api/", "/task/")):
         ip = get_client_ip()
         now = time.time()
         with SECURITY_LOCK:
@@ -177,7 +220,7 @@ def security_middleware():
             while dq and now - dq[0] > 10.0:
                 dq.popleft()
             if len(dq) >= 320:
-                return jsonify({"ok": False, "error": "Thao tác quá nhanh, vui lòng thử lại sau vài giây"}), 429
+                return jsonify({"ok": False, "error": "Thao tác quá nhanh. Vui lòng thử lại sau."}), 429
             dq.append(now)
 
 class WebSecurityFortress:
@@ -202,7 +245,18 @@ def add_security_headers(resp):
     resp.headers["X-Frame-Options"] = "SAMEORIGIN"
     resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     resp.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
-    if request.path.startswith("/api/"):
+    resp.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+    resp.headers["Cross-Origin-Resource-Policy"] = "same-origin"
+    resp.headers["X-Permitted-Cross-Domain-Policies"] = "none"
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'self'; img-src 'self' data: blob: https:; "
+        "style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; "
+        "font-src 'self' data: https:; connect-src 'self' https: wss:; "
+        "frame-ancestors 'self'; base-uri 'self'; form-action 'self' https:"
+    )
+    if request.is_secure or request.headers.get("X-Forwarded-Proto", "").lower() == "https":
+        resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    if request.path.startswith(("/api/", "/task/")) or request.path in {"/login", "/"}:
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return resp
 
@@ -608,11 +662,21 @@ def init_db():
         pass
 
     existing_admin = cur.execute("SELECT id FROM users WHERE username = ?", (DEFAULT_ADMIN_USER,)).fetchone()
-    if not existing_admin:
+    if DEFAULT_ADMIN_PASS and ADMIN_PASS_RESET:
+        # Set ADMIN_PASS_RESET=1 for one deployment to reset an existing admin, then remove the flag.
         cur.execute(
-            "INSERT INTO users (username, password, created_at) VALUES (?, ?, ?)",
+            "INSERT INTO users (username, password, created_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(username) DO UPDATE SET password=excluded.password",
             (DEFAULT_ADMIN_USER, hash_password_secure(DEFAULT_ADMIN_PASS), time.time())
         )
+    elif not existing_admin:
+        bootstrap_password = DEFAULT_ADMIN_PASS or secrets.token_urlsafe(18)
+        cur.execute(
+            "INSERT INTO users (username, password, created_at) VALUES (?, ?, ?)",
+            (DEFAULT_ADMIN_USER, hash_password_secure(bootstrap_password), time.time())
+        )
+        if not DEFAULT_ADMIN_PASS:
+            print("[SECURITY] Initial admin password (copy now; it is stored as a hash): " + bootstrap_password, flush=True)
 
     conn.commit()
     conn.close()
@@ -5712,23 +5776,51 @@ class ZaloQRLoginManager:
                 pass
 
     @staticmethod
+    def _is_valid_cookie_val(val):
+        if val is None:
+            return False
+        s = str(val).strip()
+        if not s or s.lower() in ("deleted", "null", "none", '""', "''"):
+            return False
+        return True
+
+    @staticmethod
     def _harvest_cookies(resp, session_obj, jar_dict):
         try:
             if session_obj and session_obj.cookies:
                 for c in session_obj.cookies:
-                    if c.name and c.value is not None:
-                        jar_dict[c.name] = c.value
+                    if c.name and ZaloQRLoginManager._is_valid_cookie_val(c.value):
+                        jar_dict[c.name] = str(c.value).strip()
             if resp is not None:
                 if getattr(resp, "history", None):
                     for h_resp in resp.history:
                         ZaloQRLoginManager._harvest_cookies(h_resp, None, jar_dict)
                 if resp.cookies:
                     for c in resp.cookies:
-                        if c.name and c.value is not None:
-                            jar_dict[c.name] = c.value
+                        if c.name and ZaloQRLoginManager._is_valid_cookie_val(c.value):
+                            jar_dict[c.name] = str(c.value).strip()
+                raw_headers = getattr(getattr(resp, "raw", None), "headers", None)
+                sc_list = []
+                if raw_headers is not None and hasattr(raw_headers, "getlist"):
+                    sc_list = raw_headers.getlist("Set-Cookie")
+                elif resp.headers.get("Set-Cookie"):
+                    sc_list = [resp.headers.get("Set-Cookie")]
+                for sc_line in sc_list:
+                    sc_low = str(sc_line or "").lower()
+                    if "max-age=0" in sc_low or "max-age=-" in sc_low or "1970" in sc_low:
+                        continue
+                    for seg in str(sc_line or "").split(";"):
+                        if "=" in seg:
+                            k_c, v_c = seg.strip().split("=", 1)
+                            k_c, v_c = k_c.strip(), v_c.strip()
+                            if k_c and ZaloQRLoginManager._is_valid_cookie_val(v_c) and "," not in k_c and " " not in k_c:
+                                if k_c.lower() not in ("expires", "path", "domain", "max-age", "secure", "httponly", "samesite", "priority", "version"):
+                                    jar_dict[k_c] = v_c
+                            break
                 sc_hdr = resp.headers.get("Set-Cookie") or ""
                 for m_sc in re.finditer(r"(?:^|;\s*|\,\s*)(zpw_sek|zpsid|zpsidleg|zpw_sua|__zi|__zi-legacy|_zlang|app\.event\.zalo\.me|z_uuid|_zsid)=([^;,\s]+)", sc_hdr):
-                    jar_dict[m_sc.group(1)] = m_sc.group(2)
+                    if ZaloQRLoginManager._is_valid_cookie_val(m_sc.group(2)):
+                        jar_dict[m_sc.group(1)] = m_sc.group(2).strip()
         except Exception:
             pass
 
@@ -5850,8 +5942,8 @@ class ZaloQRLoginManager:
         pc_name = st.get("pc_name", "ASUS ROG Zephyrus G16 (Windows 11 Pro VN)")
         comp_name = st.get("computer_name") or "Web"
 
-        continue_url = "https://zalo.me/pc"
-        login_referer = "https://id.zalo.me/account?continue=https%3A%2F%2Fzalo.me%2Fpc"
+        continue_url = "https://chat.zalo.me/"
+        login_referer = "https://id.zalo.me/account?continue=https%3A%2F%2Fchat.zalo.me%2F"
         v_str = "2.3.10"
         qr_b64_raw = ""
         qr_code_id = ""
@@ -6071,15 +6163,41 @@ class ZaloQRLoginManager:
             s.cookies.set("z_uuid", st["imei"], domain=".chat.zalo.me")
 
             def _follow_redirect_clean(start_url, initial_ref):
-                if not start_url:
-                    return
-                h_hop = dict(nav_headers)
-                h_hop["Referer"] = initial_ref
-                try:
-                    r_h = s.get(start_url, headers=h_hop, allow_redirects=True, timeout=12)
+                cur_u = start_url
+                cur_ref = initial_ref
+                for _hop in range(10):
+                    if not cur_u or cls._is_valid_cookie_val(cookie_jar_dict.get("zpw_sek")):
+                        break
+                    p_u = urlparse(cur_u)
+                    h_hop = dict(nav_headers)
+                    h_hop["Referer"] = cur_ref
+                    r_h = None
+                    for _retry in range(3):
+                        try:
+                            r_h = s.get(cur_u, headers=h_hop, allow_redirects=False, timeout=10)
+                            break
+                        except Exception:
+                            time.sleep(0.2)
+                    if r_h is None:
+                        break
                     cls._harvest_cookies(r_h, s, cookie_jar_dict)
-                except Exception:
-                    pass
+                    if cls._is_valid_cookie_val(cookie_jar_dict.get("zpw_sek")):
+                        break
+                    if r_h.status_code in (301, 302, 303, 307, 308):
+                        loc = r_h.headers.get("Location") or ""
+                        if not loc:
+                            break
+                        if loc.startswith("/"):
+                            loc = f"{p_u.scheme}://{p_u.netloc}{loc}"
+                        cur_ref = cur_u
+                        cur_u = loc
+                        continue
+                    m_jr = re.search(r"(https://jr\.chat\.zalo\.me/jr/pushsession[^\s\"'<>]+)", r_h.text or "")
+                    if m_jr:
+                        cur_ref = cur_u
+                        cur_u = m_jr.group(1)
+                        continue
+                    break
 
             conf_data = j_conf.get("data") if isinstance(j_conf, dict) else None
             redirect_target = ""
@@ -12393,160 +12511,41 @@ threading.Thread(target=_listener_watchdog_loop, daemon=True).start()
 import math
 
 class TelegramPetAnimationEngine:
-    """Động Cơ Đồ Họa 3D NHK & Biểu Tượng Động Khởi Chạy Qua Code Python:
-    - Kết xuất trực tiếp Vector SVG 3D đa lớp và Khối Lập Phương 3D NHK Holo-Core.
-    - Tự động bơm (inject) trực tiếp vào mọi trang HTML qua @app.context_processor để 100% luôn hiển thị rõ nét."""
+    """Bộ Quản Lý Trạng Thái Giao Diện Tối Giản (Đã xoá toàn bộ Chó, Mèo và Khối 3D theo yêu cầu người dùng)."""
 
     @classmethod
     def compute_stride_curve(cls, steps=24):
-        out = []
-        for i in range(steps):
-            theta = (2.0 * math.pi * i) / max(1, steps - 1)
-            leg_front = round(math.sin(theta) * 19.0, 2)
-            leg_back = round(math.sin(theta + math.pi) * 19.0, 2)
-            body_bob = round(abs(math.cos(theta)) * -3.6, 2)
-            tail_wag = round(math.sin(theta * 2.0) * 18.0, 2)
-            out.append({
-                "t": round(i / max(1, steps - 1), 3),
-                "leg_front_deg": leg_front,
-                "leg_back_deg": leg_back,
-                "body_bob_px": body_bob,
-                "tail_wag_deg": tail_wag,
-            })
-        return out
+        return []
 
     @classmethod
     def get_nhk_3d_emblem_svg(cls):
-        return (
-            '<div class="nhk-3d-viewport" title="Khối Lập Phương Năng Lượng 3D NHK">'
-            '<div class="nhk-3d-orbit-ring ring-a"></div>'
-            '<div class="nhk-3d-orbit-ring ring-b"></div>'
-            '<div class="nhk-3d-cube">'
-            '<div class="nhk-cube-face face-front"><span>NHK</span></div>'
-            '<div class="nhk-cube-face face-back"><span>NHK</span></div>'
-            '<div class="nhk-cube-face face-right"><span>3D</span></div>'
-            '<div class="nhk-cube-face face-left"><span>VIP</span></div>'
-            '<div class="nhk-cube-face face-top"><span>⚡</span></div>'
-            '<div class="nhk-cube-face face-bottom"><span>👑</span></div>'
-            '</div>'
-            '</div>'
-        )
+        return ""
 
     @classmethod
     def get_corgi_svg(cls):
-        return (
-            '<svg class="tg-pet-svg pet-corgi-svg tg-corgi-svg" viewBox="0 0 128 88" fill="none" xmlns="http://www.w3.org/2000/svg">'
-            '<defs>'
-            '<linearGradient id="corgiFur3D" x1="0%" y1="0%" x2="100%" y2="100%">'
-            '<stop offset="0%" stop-color="#ffd269"/><stop offset="48%" stop-color="#ff9924"/><stop offset="100%" stop-color="#c95206"/>'
-            '</linearGradient>'
-            '<linearGradient id="corgiCream3D" x1="0%" y1="0%" x2="0%" y2="100%">'
-            '<stop offset="0%" stop-color="#ffffff"/><stop offset="100%" stop-color="#f3dfc4"/>'
-            '</linearGradient>'
-            '<radialGradient id="corgiGlow" cx="50%" cy="50%" r="50%">'
-            '<stop offset="0%" stop-color="rgba(255,179,71,0.42)"/><stop offset="100%" stop-color="rgba(255,179,71,0)"/>'
-            '</radialGradient>'
-            '</defs>'
-            '<circle cx="64" cy="44" r="40" fill="url(#corgiGlow)"/>'
-            '<ellipse class="pet-shadow" cx="62" cy="79" rx="36" ry="5.5" fill="rgba(0,0,0,0.42)"/>'
-            '<g class="pet-body-group">'
-            '<g class="pet-tail"><path d="M24 45 C10 34, 8 20, 18 17 C25 15, 31 26, 29 38 Z" fill="url(#corgiFur3D)"/><circle cx="16" cy="19" r="5.5" fill="url(#corgiCream3D)"/></g>'
-            '<g class="pet-leg-back-l"><rect x="30" y="54" width="9.5" height="19" rx="4.7" fill="#c95206"/><ellipse cx="34.8" cy="73.5" rx="6.4" ry="3.4" fill="url(#corgiCream3D)"/></g>'
-            '<g class="pet-leg-front-l"><rect x="70" y="54" width="9.5" height="19" rx="4.7" fill="#c95206"/><ellipse cx="74.8" cy="73.5" rx="6.4" ry="3.4" fill="url(#corgiCream3D)"/></g>'
-            '<rect x="24" y="34" width="60" height="28" rx="14" fill="url(#corgiFur3D)"/>'
-            '<path d="M36 47 C47 45, 68 45, 80 40 L81 57 C67 62, 43 62, 34 58 Z" fill="url(#corgiCream3D)"/>'
-            '<path d="M63 34 C68 27, 78 27, 84 36 C80 45, 68 46, 63 34 Z" fill="url(#corgiCream3D)"/>'
-            '<g class="pet-leg-back-r"><rect x="38" y="55" width="10" height="20" rx="5" fill="url(#corgiFur3D)"/><ellipse cx="43" cy="75" rx="6.6" ry="3.6" fill="url(#corgiCream3D)"/></g>'
-            '<g class="pet-leg-front-r"><rect x="76" y="55" width="10" height="20" rx="5" fill="url(#corgiFur3D)"/><ellipse cx="81" cy="75" rx="6.6" ry="3.6" fill="url(#corgiCream3D)"/></g>'
-            '<path d="M68 34 L84 48" stroke="#ef4444" stroke-width="4.5" stroke-linecap="round"/>'
-            '<circle cx="77" cy="44" r="4.5" fill="#fbbf24" stroke="#fff" stroke-width="1"/>'
-            '<g class="pet-head">'
-            '<path class="pet-ear-l" d="M69 22 L63 3 L80 14 Z" fill="url(#corgiFur3D)"/>'
-            '<path d="M69 19 L65 7 L77 14 Z" fill="#fda4af"/>'
-            '<path class="pet-ear-r" d="M88 18 L100 2 L102 22 Z" fill="url(#corgiFur3D)"/>'
-            '<path d="M90 18 L97 6 L98 20 Z" fill="#fda4af"/>'
-            '<ellipse cx="85" cy="27" rx="18" ry="15" fill="url(#corgiFur3D)"/>'
-            '<path d="M84 13 C87 20, 87 26, 85 40 C94 41, 105 37, 106 28 C107 22, 97 15, 84 13 Z" fill="url(#corgiCream3D)"/>'
-            '<ellipse cx="100" cy="29" rx="9.5" ry="7" fill="url(#corgiCream3D)"/>'
-            '<ellipse cx="107" cy="27" rx="3.8" ry="3" fill="#0f172a"/>'
-            '<path class="pet-tongue" d="M97 34 Q101 43 105 35 Z" fill="#fb7185"/>'
-            '<path d="M94 33 Q99 36.5 104 32" stroke="#0f172a" stroke-width="1.9" stroke-linecap="round" fill="none"/>'
-            '<g class="pet-eyes">'
-            '<circle cx="80.5" cy="24" r="3.2" fill="#0f172a"/><circle cx="81.6" cy="22.8" r="1.2" fill="#ffffff"/>'
-            '<circle cx="93" cy="23.5" r="3.2" fill="#0f172a"/><circle cx="94.1" cy="22.3" r="1.2" fill="#ffffff"/>'
-            '</g>'
-            '<ellipse cx="76" cy="28.5" rx="3.3" ry="1.8" fill="rgba(251,113,133,0.52)"/>'
-            '<ellipse cx="96" cy="28.5" rx="3.1" ry="1.7" fill="rgba(251,113,133,0.52)"/>'
-            '</g>'
-            '</g>'
-            '</svg>'
-        )
+        return ""
 
     @classmethod
     def get_cat_svg(cls):
-        return (
-            '<svg class="tg-pet-svg pet-cat-svg tg-cat-svg" viewBox="0 0 128 88" fill="none" xmlns="http://www.w3.org/2000/svg">'
-            '<defs>'
-            '<linearGradient id="catFur3D" x1="0%" y1="0%" x2="100%" y2="100%">'
-            '<stop offset="0%" stop-color="#c7d2fe"/><stop offset="50%" stop-color="#818cf8"/><stop offset="100%" stop-color="#4f46e5"/>'
-            '</linearGradient>'
-            '<linearGradient id="catBelly3D" x1="0%" y1="0%" x2="0%" y2="100%">'
-            '<stop offset="0%" stop-color="#ffffff"/><stop offset="100%" stop-color="#e0e7ff"/>'
-            '</linearGradient>'
-            '<radialGradient id="catGlow" cx="50%" cy="50%" r="50%">'
-            '<stop offset="0%" stop-color="rgba(129,140,248,0.42)"/><stop offset="100%" stop-color="rgba(129,140,248,0)"/>'
-            '</radialGradient>'
-            '</defs>'
-            '<circle cx="64" cy="44" r="40" fill="url(#catGlow)"/>'
-            '<ellipse class="pet-shadow" cx="62" cy="79" rx="34" ry="5.2" fill="rgba(0,0,0,0.42)"/>'
-            '<g class="pet-body-group">'
-            '<g class="pet-tail"><path d="M27 46 C10 43, 7 20, 19 14 C26 11, 28 22, 23 28 C19 33, 23 41, 30 43 Z" fill="url(#catFur3D)"/></g>'
-            '<g class="pet-leg-back-l"><rect x="33" y="54" width="8.5" height="19" rx="4.2" fill="#4338ca"/><ellipse cx="37.2" cy="73.5" rx="5.6" ry="3" fill="url(#catBelly3D)"/></g>'
-            '<g class="pet-leg-front-l"><rect x="69" y="54" width="8.5" height="19" rx="4.2" fill="#4338ca"/><ellipse cx="73.2" cy="73.5" rx="5.6" ry="3" fill="url(#catBelly3D)"/></g>'
-            '<rect x="28" y="35" width="54" height="26" rx="13" fill="url(#catFur3D)"/>'
-            '<path d="M39 48 C49 46, 65 46, 75 43 L76 57 C64 61, 45 61, 37 57 Z" fill="url(#catBelly3D)"/>'
-            '<g class="pet-leg-back-r"><rect x="40" y="55" width="9" height="20" rx="4.5" fill="url(#catFur3D)"/><ellipse cx="44.5" cy="75" rx="5.8" ry="3.2" fill="url(#catBelly3D)"/></g>'
-            '<g class="pet-leg-front-r"><rect x="75" y="55" width="9" height="20" rx="4.5" fill="url(#catFur3D)"/><ellipse cx="79.5" cy="75" rx="5.8" ry="3.2" fill="url(#catBelly3D)"/></g>'
-            '<path d="M68 36 L81 48" stroke="#ec4899" stroke-width="4" stroke-linecap="round"/>'
-            '<circle cx="76" cy="44" r="4" fill="#38bdf8" stroke="#fff" stroke-width="1"/>'
-            '<g class="pet-head">'
-            '<path class="pet-ear-l" d="M69 21 L66 4 L81 14 Z" fill="url(#catFur3D)"/>'
-            '<path d="M70 19 L68 8 L78 14 Z" fill="#f472b6"/>'
-            '<path class="pet-ear-r" d="M87 16 L98 3 L100 20 Z" fill="url(#catFur3D)"/>'
-            '<path d="M89 16 L96 7 L97 19 Z" fill="#f472b6"/>'
-            '<ellipse cx="84" cy="27" rx="16.5" ry="14" fill="url(#catFur3D)"/>'
-            '<ellipse cx="87" cy="31" rx="11.5" ry="8.5" fill="url(#catBelly3D)"/>'
-            '<polygon points="92,27 96,27 94,30.5" fill="#fb7185"/>'
-            '<path d="M90 32.5 Q94 35.5 98 32.5" stroke="#1e1b4b" stroke-width="1.7" stroke-linecap="round" fill="none"/>'
-            '<g class="pet-eyes">'
-            '<ellipse cx="80" cy="24" rx="3" ry="3.4" fill="#10b981"/><ellipse cx="80" cy="24" rx="1.3" ry="2.8" fill="#0f172a"/><circle cx="81" cy="22.6" r="1.1" fill="#ffffff"/>'
-            '<ellipse cx="92.5" cy="24" rx="3" ry="3.4" fill="#10b981"/><ellipse cx="92.5" cy="24" rx="1.3" ry="2.8" fill="#0f172a"/><circle cx="93.5" cy="22.6" r="1.1" fill="#ffffff"/>'
-            '</g>'
-            '<line x1="97" y1="28" x2="108" y2="26" stroke="#e2e8f0" stroke-width="1.3" stroke-linecap="round"/>'
-            '<line x1="97" y1="30.5" x2="109" y2="30.5" stroke="#e2e8f0" stroke-width="1.3" stroke-linecap="round"/>'
-            '<line x1="73" y1="29" x2="62" y2="28" stroke="#e2e8f0" stroke-width="1.3" stroke-linecap="round"/>'
-            '</g>'
-            '</g>'
-            '</svg>'
-        )
+        return ""
 
     @classmethod
     def get_pet_bundle(cls, mood="happy"):
         return {
             "ok": True,
             "brand": "NHK",
-            "stride_keyframes": cls.compute_stride_curve(20),
+            "stride_keyframes": [],
             "mood": mood,
-            "nhk_3d_svg": cls.get_nhk_3d_emblem_svg(),
-            "corgi_svg": cls.get_corgi_svg(),
-            "cat_svg": cls.get_cat_svg(),
+            "nhk_3d_svg": "",
+            "corgi_svg": "",
+            "cat_svg": "",
             "mood_quotes": {
-                "idle": "NHK 3D Core • Hệ thống trực chiến 24/7 — Phản hồi lệnh 0ms!",
-                "qr_generating": "Đang cấp phát máy tính Việt Nam / Singapore chính chủ cho NHK...",
+                "idle": "Hệ thống trực chiến 24/7 — Phản hồi lệnh 0ms!",
+                "qr_generating": "Đang cấp phát máy tính Việt Nam / Singapore chính chủ...",
                 "qr_waiting": "Kênh QR đang sẵn sàng — Hãy mở Zalo quét mã ngay nhé!",
                 "qr_scanned": "Đã nhận diện Zalo của bạn — Hãy ấn Đăng nhập trên điện thoại!",
-                "qr_success": "Tuyệt vời! Thiết bị đã ghim sống 24/7 trong tài khoản Zalo trên NHK!",
-                "campaign_running": "NHK 3D Core đang phóng 96 Shards gửi đa Box siêu tốc 0s!",
+                "qr_success": "Tuyệt vời! Thiết bị đã ghim sống 24/7 trong tài khoản Zalo!",
+                "campaign_running": "Hệ thống đang phóng 96 Shards gửi đa Box siêu tốc 0s!",
                 "stopped": "Đã phanh gấp 0ms toàn bộ chiến dịch theo lệnh của bạn!",
             }
         }
@@ -12591,15 +12590,15 @@ class TelegramUIPhysicsEngine:
             "pill_stretch_max": 1.14,
             "pill_squish_min": 0.93,
             "page_transition_ms": 340,
-            "security_mode": "PBKDF2-SHA256 + CSRF-HMAC + TLS1.3",
+            "security_mode": "PBKDF2-SHA256 + CSRF + Security Headers",
             "pets": TelegramPetAnimationEngine.get_pet_bundle(),
             "pet_engine": TelegramPetAnimationEngine.get_pet_bundle(),
             "pets": pet_info,
             "tabs": [
-                {"id": "tab-accounts", "title": "Tài khoản", "header": "Quản lý Tài khoản"},
-                {"id": "tab-targets", "title": "Phòng chat", "header": "Phòng & Kênh Mục Tiêu"},
-                {"id": "tab-campaign", "title": "Chiến dịch", "header": "Điều Phối Chiến Dịch"},
-                {"id": "tab-files", "title": "Kịch bản", "header": "Kho File Kịch Bản"},
+                {"id": "tab-accounts", "title": "Tài khoản", "header": "Tài khoản"},
+                {"id": "tab-targets", "title": "Phòng", "header": "Phòng & Kênh"},
+                {"id": "tab-campaign", "title": "Gửi tin", "header": "Gửi tin"},
+                {"id": "tab-files", "title": "Mẫu tin", "header": "Mẫu tin"},
                 {"id": "tab-shield", "title": "Cài đặt", "header": "Hệ Thống & Mạng API"},
             ],
         }
@@ -12655,8 +12654,9 @@ LOGIN_HTML = r"""<!DOCTYPE html>
 <html lang="vi">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,minimum-scale=1.0,user-scalable=no,viewport-fit=cover">
-<title>{{ custom_title if custom_title else 'NHK — 3D Control Studio' }}</title>
+<meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover">
+<meta name="csrf-token" content="{{ csrf_token }}">
+<title>{{ custom_title if custom_title else 'NHK 3D' }}</title>
 <style>
 :root {
   --tg-bg: #000000;
@@ -12802,76 +12802,7 @@ html, body {
   border-radius: 999px; transition: width 0.28s ease;
 }
 
-/* ==================== NHK 3D HOLO-CUBE & LUXURY SPECULAR RIM BUTTONS ==================== */
-.nhk-3d-stage-wrap {
-  position: relative;
-  display: flex; align-items: center; justify-content: center; gap: 14px;
-  padding: 6px 10px;
-  perspective: 900px;
-}
-.nhk-3d-viewport {
-  width: 54px; height: 54px;
-  position: relative;
-  transform-style: preserve-3d;
-  display: inline-flex; align-items: center; justify-content: center;
-  flex-shrink: 0;
-  cursor: pointer;
-}
-.nhk-3d-orbit-ring {
-  position: absolute; inset: -7px;
-  border-radius: 50%;
-  border: 1.5px dashed rgba(56, 189, 248, 0.55);
-  transform-style: preserve-3d;
-  pointer-events: none;
-}
-.nhk-3d-orbit-ring.ring-a {
-  animation: nhkOrbitA 6s linear infinite;
-  box-shadow: 0 0 14px rgba(56, 189, 248, 0.28);
-}
-.nhk-3d-orbit-ring.ring-b {
-  inset: -11px;
-  border: 1.5px solid rgba(244, 114, 182, 0.42);
-  animation: nhkOrbitB 8s linear infinite reverse;
-}
-@keyframes nhkOrbitA {
-  0% { transform: rotateX(68deg) rotateY(15deg) rotateZ(0deg); }
-  100% { transform: rotateX(68deg) rotateY(15deg) rotateZ(360deg); }
-}
-@keyframes nhkOrbitB {
-  0% { transform: rotateX(-58deg) rotateY(28deg) rotateZ(0deg); }
-  100% { transform: rotateX(-58deg) rotateY(28deg) rotateZ(360deg); }
-}
-.nhk-3d-cube {
-  width: 34px; height: 34px;
-  position: relative;
-  transform-style: preserve-3d;
-  animation: nhkCubeSpin 9s cubic-bezier(0.45, 0.05, 0.55, 0.95) infinite;
-}
-@keyframes nhkCubeSpin {
-  0%   { transform: rotateX(-18deg) rotateY(0deg) rotateZ(0deg); }
-  25%  { transform: rotateX(18deg) rotateY(90deg) rotateZ(4deg); }
-  50%  { transform: rotateX(-16deg) rotateY(180deg) rotateZ(-4deg); }
-  75%  { transform: rotateX(20deg) rotateY(270deg) rotateZ(4deg); }
-  100% { transform: rotateX(-18deg) rotateY(360deg) rotateZ(0deg); }
-}
-.nhk-cube-face {
-  position: absolute; width: 34px; height: 34px;
-  border-radius: 8px;
-  background: linear-gradient(135deg, rgba(0, 122, 255, 0.82) 0%, rgba(42, 171, 238, 0.72) 55%, rgba(139, 92, 246, 0.82) 100%);
-  border: 1px solid rgba(255, 255, 255, 0.55);
-  box-shadow: 0 0 16px rgba(42, 171, 238, 0.45), inset 0 0 8px rgba(255, 255, 255, 0.35);
-  display: flex; align-items: center; justify-content: center;
-  font-size: 9.5px; font-weight: 900; color: #ffffff; letter-spacing: 0.6px;
-  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.65);
-  backface-visibility: visible;
-}
-.nhk-cube-face.face-front  { transform: translateZ(17px); }
-.nhk-cube-face.face-back   { transform: rotateY(180deg) translateZ(17px); }
-.nhk-cube-face.face-right  { transform: rotateY(90deg) translateZ(17px); }
-.nhk-cube-face.face-left   { transform: rotateY(-90deg) translateZ(17px); }
-.nhk-cube-face.face-top    { transform: rotateX(90deg) translateZ(17px); }
-.nhk-cube-face.face-bottom { transform: rotateX(-90deg) translateZ(17px); }
-
+/* ==================== LUXURY SPECULAR RIM BUTTONS ==================== */
 /* Luxury Specular Rim & Liquid Glass Interactive Buttons */
 .btn, .tg-btn-login, .tg-nav-pill-btn {
   --mx: 50%;
@@ -12953,8 +12884,8 @@ html, body {
 <body>
   <div class="tg-loader-overlay" id="tgLoginLoader">
     <div style="display:flex;align-items:center;gap:6px">
-      <svg class="tg-pet-svg pet-corgi-svg tg-corgi-svg" viewBox="0 0 128 88" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="corgiFur3D" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#ffd269"/><stop offset="48%" stop-color="#ff9924"/><stop offset="100%" stop-color="#c95206"/></linearGradient><linearGradient id="corgiCream3D" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#ffffff"/><stop offset="100%" stop-color="#f3dfc4"/></linearGradient><radialGradient id="corgiGlow" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="rgba(255,179,71,0.42)"/><stop offset="100%" stop-color="rgba(255,179,71,0)"/></radialGradient></defs><circle cx="64" cy="44" r="40" fill="url(#corgiGlow)"/><ellipse class="pet-shadow" cx="62" cy="79" rx="36" ry="5.5" fill="rgba(0,0,0,0.42)"/><g class="pet-body-group"><g class="pet-tail"><path d="M24 45 C10 34, 8 20, 18 17 C25 15, 31 26, 29 38 Z" fill="url(#corgiFur3D)"/><circle cx="16" cy="19" r="5.5" fill="url(#corgiCream3D)"/></g><g class="pet-leg-back-l"><rect x="30" y="54" width="9.5" height="19" rx="4.7" fill="#c95206"/><ellipse cx="34.8" cy="73.5" rx="6.4" ry="3.4" fill="url(#corgiCream3D)"/></g><g class="pet-leg-front-l"><rect x="70" y="54" width="9.5" height="19" rx="4.7" fill="#c95206"/><ellipse cx="74.8" cy="73.5" rx="6.4" ry="3.4" fill="url(#corgiCream3D)"/></g><rect x="24" y="34" width="60" height="28" rx="14" fill="url(#corgiFur3D)"/><path d="M36 47 C47 45, 68 45, 80 40 L81 57 C67 62, 43 62, 34 58 Z" fill="url(#corgiCream3D)"/><path d="M63 34 C68 27, 78 27, 84 36 C80 45, 68 46, 63 34 Z" fill="url(#corgiCream3D)"/><g class="pet-leg-back-r"><rect x="38" y="55" width="10" height="20" rx="5" fill="url(#corgiFur3D)"/><ellipse cx="43" cy="75" rx="6.6" ry="3.6" fill="url(#corgiCream3D)"/></g><g class="pet-leg-front-r"><rect x="76" y="55" width="10" height="20" rx="5" fill="url(#corgiFur3D)"/><ellipse cx="81" cy="75" rx="6.6" ry="3.6" fill="url(#corgiCream3D)"/></g><path d="M68 34 L84 48" stroke="#ef4444" stroke-width="4.5" stroke-linecap="round"/><circle cx="77" cy="44" r="4.5" fill="#fbbf24" stroke="#fff" stroke-width="1"/><g class="pet-head"><path class="pet-ear-l" d="M69 22 L63 3 L80 14 Z" fill="url(#corgiFur3D)"/><path d="M69 19 L65 7 L77 14 Z" fill="#fda4af"/><path class="pet-ear-r" d="M88 18 L100 2 L102 22 Z" fill="url(#corgiFur3D)"/><path d="M90 18 L97 6 L98 20 Z" fill="#fda4af"/><ellipse cx="85" cy="27" rx="18" ry="15" fill="url(#corgiFur3D)"/><path d="M84 13 C87 20, 87 26, 85 40 C94 41, 105 37, 106 28 C107 22, 97 15, 84 13 Z" fill="url(#corgiCream3D)"/><ellipse cx="100" cy="29" rx="9.5" ry="7" fill="url(#corgiCream3D)"/><ellipse cx="107" cy="27" rx="3.8" ry="3" fill="#0f172a"/><path class="pet-tongue" d="M97 34 Q101 43 105 35 Z" fill="#fb7185"/><path d="M94 33 Q99 36.5 104 32" stroke="#0f172a" stroke-width="1.9" stroke-linecap="round" fill="none"/><g class="pet-eyes"><circle cx="80.5" cy="24" r="3.2" fill="#0f172a"/><circle cx="81.6" cy="22.8" r="1.2" fill="#ffffff"/><circle cx="93" cy="23.5" r="3.2" fill="#0f172a"/><circle cx="94.1" cy="22.3" r="1.2" fill="#ffffff"/></g><ellipse cx="76" cy="28.5" rx="3.3" ry="1.8" fill="rgba(251,113,133,0.52)"/><ellipse cx="96" cy="28.5" rx="3.1" ry="1.7" fill="rgba(251,113,133,0.52)"/></g></g></svg>
-      <svg class="tg-pet-svg pet-cat-svg tg-cat-svg" viewBox="0 0 128 88" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="catFur3D" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#c7d2fe"/><stop offset="50%" stop-color="#818cf8"/><stop offset="100%" stop-color="#4f46e5"/></linearGradient><linearGradient id="catBelly3D" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#ffffff"/><stop offset="100%" stop-color="#e0e7ff"/></linearGradient><radialGradient id="catGlow" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="rgba(129,140,248,0.42)"/><stop offset="100%" stop-color="rgba(129,140,248,0)"/></radialGradient></defs><circle cx="64" cy="44" r="40" fill="url(#catGlow)"/><ellipse class="pet-shadow" cx="62" cy="79" rx="34" ry="5.2" fill="rgba(0,0,0,0.42)"/><g class="pet-body-group"><g class="pet-tail"><path d="M27 46 C10 43, 7 20, 19 14 C26 11, 28 22, 23 28 C19 33, 23 41, 30 43 Z" fill="url(#catFur3D)"/></g><g class="pet-leg-back-l"><rect x="33" y="54" width="8.5" height="19" rx="4.2" fill="#4338ca"/><ellipse cx="37.2" cy="73.5" rx="5.6" ry="3" fill="url(#catBelly3D)"/></g><g class="pet-leg-front-l"><rect x="69" y="54" width="8.5" height="19" rx="4.2" fill="#4338ca"/><ellipse cx="73.2" cy="73.5" rx="5.6" ry="3" fill="url(#catBelly3D)"/></g><rect x="28" y="35" width="54" height="26" rx="13" fill="url(#catFur3D)"/><path d="M39 48 C49 46, 65 46, 75 43 L76 57 C64 61, 45 61, 37 57 Z" fill="url(#catBelly3D)"/><g class="pet-leg-back-r"><rect x="40" y="55" width="9" height="20" rx="4.5" fill="url(#catFur3D)"/><ellipse cx="44.5" cy="75" rx="5.8" ry="3.2" fill="url(#catBelly3D)"/></g><g class="pet-leg-front-r"><rect x="75" y="55" width="9" height="20" rx="4.5" fill="url(#catFur3D)"/><ellipse cx="79.5" cy="75" rx="5.8" ry="3.2" fill="url(#catBelly3D)"/></g><path d="M68 36 L81 48" stroke="#ec4899" stroke-width="4" stroke-linecap="round"/><circle cx="76" cy="44" r="4" fill="#38bdf8" stroke="#fff" stroke-width="1"/><g class="pet-head"><path class="pet-ear-l" d="M69 21 L66 4 L81 14 Z" fill="url(#catFur3D)"/><path d="M70 19 L68 8 L78 14 Z" fill="#f472b6"/><path class="pet-ear-r" d="M87 16 L98 3 L100 20 Z" fill="url(#catFur3D)"/><path d="M89 16 L96 7 L97 19 Z" fill="#f472b6"/><ellipse cx="84" cy="27" rx="16.5" ry="14" fill="url(#catFur3D)"/><ellipse cx="87" cy="31" rx="11.5" ry="8.5" fill="url(#catBelly3D)"/><polygon points="92,27 96,27 94,30.5" fill="#fb7185"/><path d="M90 32.5 Q94 35.5 98 32.5" stroke="#1e1b4b" stroke-width="1.7" stroke-linecap="round" fill="none"/><g class="pet-eyes"><ellipse cx="80" cy="24" rx="3" ry="3.4" fill="#10b981"/><ellipse cx="80" cy="24" rx="1.3" ry="2.8" fill="#0f172a"/><circle cx="81" cy="22.6" r="1.1" fill="#ffffff"/><ellipse cx="92.5" cy="24" rx="3" ry="3.4" fill="#10b981"/><ellipse cx="92.5" cy="24" rx="1.3" ry="2.8" fill="#0f172a"/><circle cx="93.5" cy="22.6" r="1.1" fill="#ffffff"/></g><line x1="97" y1="28" x2="108" y2="26" stroke="#e2e8f0" stroke-width="1.3" stroke-linecap="round"/><line x1="97" y1="30.5" x2="109" y2="30.5" stroke="#e2e8f0" stroke-width="1.3" stroke-linecap="round"/><line x1="73" y1="29" x2="62" y2="28" stroke="#e2e8f0" stroke-width="1.3" stroke-linecap="round"/></g></g></svg>
+      
+      
     </div>
     <div class="tg-loader-step" id="tgLoaderStepText">NHK 3D Core đang mở khóa cổng bảo mật...</div>
     <div class="tg-loader-sub" id="tgLoaderSubText">Xác thực chữ ký PBKDF2-HMAC-SHA256 &amp; định tuyến VN/SG</div>
@@ -12967,34 +12898,30 @@ html, body {
     <div style="text-align:center">
       <div class="tg-top-pill">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 22 8.5 22 15.5 12 22 2 15.5 2 8.5 12 2"/><line x1="12" y1="22" x2="12" y2="15.5"/><polyline points="22 8.5 12 15.5 2 8.5"/></svg>
-        <span>NHK 3D QUANTUM STUDIO</span>
+        <span>NHK 3D</span>
       </div>
     </div>
 
-    <div class="tg-pet-stage-login nhk-3d-stage-wrap" id="tg-mascot-stage">
-      <svg class="tg-pet-svg pet-corgi-svg tg-corgi-svg" viewBox="0 0 128 88" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="corgiFur3D" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#ffd269"/><stop offset="48%" stop-color="#ff9924"/><stop offset="100%" stop-color="#c95206"/></linearGradient><linearGradient id="corgiCream3D" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#ffffff"/><stop offset="100%" stop-color="#f3dfc4"/></linearGradient><radialGradient id="corgiGlow" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="rgba(255,179,71,0.42)"/><stop offset="100%" stop-color="rgba(255,179,71,0)"/></radialGradient></defs><circle cx="64" cy="44" r="40" fill="url(#corgiGlow)"/><ellipse class="pet-shadow" cx="62" cy="79" rx="36" ry="5.5" fill="rgba(0,0,0,0.42)"/><g class="pet-body-group"><g class="pet-tail"><path d="M24 45 C10 34, 8 20, 18 17 C25 15, 31 26, 29 38 Z" fill="url(#corgiFur3D)"/><circle cx="16" cy="19" r="5.5" fill="url(#corgiCream3D)"/></g><g class="pet-leg-back-l"><rect x="30" y="54" width="9.5" height="19" rx="4.7" fill="#c95206"/><ellipse cx="34.8" cy="73.5" rx="6.4" ry="3.4" fill="url(#corgiCream3D)"/></g><g class="pet-leg-front-l"><rect x="70" y="54" width="9.5" height="19" rx="4.7" fill="#c95206"/><ellipse cx="74.8" cy="73.5" rx="6.4" ry="3.4" fill="url(#corgiCream3D)"/></g><rect x="24" y="34" width="60" height="28" rx="14" fill="url(#corgiFur3D)"/><path d="M36 47 C47 45, 68 45, 80 40 L81 57 C67 62, 43 62, 34 58 Z" fill="url(#corgiCream3D)"/><path d="M63 34 C68 27, 78 27, 84 36 C80 45, 68 46, 63 34 Z" fill="url(#corgiCream3D)"/><g class="pet-leg-back-r"><rect x="38" y="55" width="10" height="20" rx="5" fill="url(#corgiFur3D)"/><ellipse cx="43" cy="75" rx="6.6" ry="3.6" fill="url(#corgiCream3D)"/></g><g class="pet-leg-front-r"><rect x="76" y="55" width="10" height="20" rx="5" fill="url(#corgiFur3D)"/><ellipse cx="81" cy="75" rx="6.6" ry="3.6" fill="url(#corgiCream3D)"/></g><path d="M68 34 L84 48" stroke="#ef4444" stroke-width="4.5" stroke-linecap="round"/><circle cx="77" cy="44" r="4.5" fill="#fbbf24" stroke="#fff" stroke-width="1"/><g class="pet-head"><path class="pet-ear-l" d="M69 22 L63 3 L80 14 Z" fill="url(#corgiFur3D)"/><path d="M69 19 L65 7 L77 14 Z" fill="#fda4af"/><path class="pet-ear-r" d="M88 18 L100 2 L102 22 Z" fill="url(#corgiFur3D)"/><path d="M90 18 L97 6 L98 20 Z" fill="#fda4af"/><ellipse cx="85" cy="27" rx="18" ry="15" fill="url(#corgiFur3D)"/><path d="M84 13 C87 20, 87 26, 85 40 C94 41, 105 37, 106 28 C107 22, 97 15, 84 13 Z" fill="url(#corgiCream3D)"/><ellipse cx="100" cy="29" rx="9.5" ry="7" fill="url(#corgiCream3D)"/><ellipse cx="107" cy="27" rx="3.8" ry="3" fill="#0f172a"/><path class="pet-tongue" d="M97 34 Q101 43 105 35 Z" fill="#fb7185"/><path d="M94 33 Q99 36.5 104 32" stroke="#0f172a" stroke-width="1.9" stroke-linecap="round" fill="none"/><g class="pet-eyes"><circle cx="80.5" cy="24" r="3.2" fill="#0f172a"/><circle cx="81.6" cy="22.8" r="1.2" fill="#ffffff"/><circle cx="93" cy="23.5" r="3.2" fill="#0f172a"/><circle cx="94.1" cy="22.3" r="1.2" fill="#ffffff"/></g><ellipse cx="76" cy="28.5" rx="3.3" ry="1.8" fill="rgba(251,113,133,0.52)"/><ellipse cx="96" cy="28.5" rx="3.1" ry="1.7" fill="rgba(251,113,133,0.52)"/></g></g></svg>
-      <div class="nhk-3d-viewport" title="Khối Lập Phương Năng Lượng 3D NHK"><div class="nhk-3d-orbit-ring ring-a"></div><div class="nhk-3d-orbit-ring ring-b"></div><div class="nhk-3d-cube"><div class="nhk-cube-face face-front"><span>NHK</span></div><div class="nhk-cube-face face-back"><span>NHK</span></div><div class="nhk-cube-face face-right"><span>3D</span></div><div class="nhk-cube-face face-left"><span>VIP</span></div><div class="nhk-cube-face face-top"><span>⚡</span></div><div class="nhk-cube-face face-bottom"><span>👑</span></div></div></div>
-      <svg class="tg-pet-svg pet-cat-svg tg-cat-svg" viewBox="0 0 128 88" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="catFur3D" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#c7d2fe"/><stop offset="50%" stop-color="#818cf8"/><stop offset="100%" stop-color="#4f46e5"/></linearGradient><linearGradient id="catBelly3D" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#ffffff"/><stop offset="100%" stop-color="#e0e7ff"/></linearGradient><radialGradient id="catGlow" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="rgba(129,140,248,0.42)"/><stop offset="100%" stop-color="rgba(129,140,248,0)"/></radialGradient></defs><circle cx="64" cy="44" r="40" fill="url(#catGlow)"/><ellipse class="pet-shadow" cx="62" cy="79" rx="34" ry="5.2" fill="rgba(0,0,0,0.42)"/><g class="pet-body-group"><g class="pet-tail"><path d="M27 46 C10 43, 7 20, 19 14 C26 11, 28 22, 23 28 C19 33, 23 41, 30 43 Z" fill="url(#catFur3D)"/></g><g class="pet-leg-back-l"><rect x="33" y="54" width="8.5" height="19" rx="4.2" fill="#4338ca"/><ellipse cx="37.2" cy="73.5" rx="5.6" ry="3" fill="url(#catBelly3D)"/></g><g class="pet-leg-front-l"><rect x="69" y="54" width="8.5" height="19" rx="4.2" fill="#4338ca"/><ellipse cx="73.2" cy="73.5" rx="5.6" ry="3" fill="url(#catBelly3D)"/></g><rect x="28" y="35" width="54" height="26" rx="13" fill="url(#catFur3D)"/><path d="M39 48 C49 46, 65 46, 75 43 L76 57 C64 61, 45 61, 37 57 Z" fill="url(#catBelly3D)"/><g class="pet-leg-back-r"><rect x="40" y="55" width="9" height="20" rx="4.5" fill="url(#catFur3D)"/><ellipse cx="44.5" cy="75" rx="5.8" ry="3.2" fill="url(#catBelly3D)"/></g><g class="pet-leg-front-r"><rect x="75" y="55" width="9" height="20" rx="4.5" fill="url(#catFur3D)"/><ellipse cx="79.5" cy="75" rx="5.8" ry="3.2" fill="url(#catBelly3D)"/></g><path d="M68 36 L81 48" stroke="#ec4899" stroke-width="4" stroke-linecap="round"/><circle cx="76" cy="44" r="4" fill="#38bdf8" stroke="#fff" stroke-width="1"/><g class="pet-head"><path class="pet-ear-l" d="M69 21 L66 4 L81 14 Z" fill="url(#catFur3D)"/><path d="M70 19 L68 8 L78 14 Z" fill="#f472b6"/><path class="pet-ear-r" d="M87 16 L98 3 L100 20 Z" fill="url(#catFur3D)"/><path d="M89 16 L96 7 L97 19 Z" fill="#f472b6"/><ellipse cx="84" cy="27" rx="16.5" ry="14" fill="url(#catFur3D)"/><ellipse cx="87" cy="31" rx="11.5" ry="8.5" fill="url(#catBelly3D)"/><polygon points="92,27 96,27 94,30.5" fill="#fb7185"/><path d="M90 32.5 Q94 35.5 98 32.5" stroke="#1e1b4b" stroke-width="1.7" stroke-linecap="round" fill="none"/><g class="pet-eyes"><ellipse cx="80" cy="24" rx="3" ry="3.4" fill="#10b981"/><ellipse cx="80" cy="24" rx="1.3" ry="2.8" fill="#0f172a"/><circle cx="81" cy="22.6" r="1.1" fill="#ffffff"/><ellipse cx="92.5" cy="24" rx="3" ry="3.4" fill="#10b981"/><ellipse cx="92.5" cy="24" rx="1.3" ry="2.8" fill="#0f172a"/><circle cx="93.5" cy="22.6" r="1.1" fill="#ffffff"/></g><line x1="97" y1="28" x2="108" y2="26" stroke="#e2e8f0" stroke-width="1.3" stroke-linecap="round"/><line x1="97" y1="30.5" x2="109" y2="30.5" stroke="#e2e8f0" stroke-width="1.3" stroke-linecap="round"/><line x1="73" y1="29" x2="62" y2="28" stroke="#e2e8f0" stroke-width="1.3" stroke-linecap="round"/></g></g></svg>
-    </div>
+    
 
-    <div class="tg-auth-title">{{ custom_title if custom_title else 'Bảng Điều Khiển Hệ Thống' }}</div>
-    <div class="tg-auth-sub">Không Gian Điều Khiển 3D NHK • Phản Hồi Lệnh Tốc Độ 0ms</div>
+    <div class="tg-auth-title">{{ custom_title if custom_title else 'Đăng nhập' }}</div>
+    <div class="tg-auth-sub">Đăng nhập để quản lý hệ thống</div>
 
     {% if error %}<div class="tg-err-banner">{{ error }}</div>{% endif %}
 
     <form method="POST" action="/login" id="tgLoginForm" onsubmit="return handleTelegramLoginSubmit(event)">
-      <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token', '') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <div class="tg-input-group">
         <label class="tg-input-label">Mật khẩu xác thực</label>
         <div class="tg-input-wrap">
           <span class="tg-input-icon">
             <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
           </span>
-          <input class="tg-input" type="password" name="password" placeholder="Nhập khóa truy cập..." required autofocus>
+          <input class="tg-input" type="password" name="password" placeholder="Nhập mật khẩu..." required autofocus>
         </div>
       </div>
       <button class="tg-btn-login" type="submit">
-        <span>Khởi Động Không Gian Điều Khiển</span>
+        <span>Đăng nhập</span>
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
       </button>
     </form>
@@ -13021,11 +12948,11 @@ function handleTelegramLoginSubmit(ev) {
   barEl.style.width = '42%';
   setTimeout(() => {
     stepEl.textContent = 'Đang khởi tạo luồng QR Zalo VN/SG & 64 Shards Discord...';
-    subEl.textContent = 'Đồng bộ hiệu ứng vật lý 3D Python & luồng ưu tiên 0ms';
+    subEl.textContent = 'Đang mở bảng điều khiển...';
     barEl.style.width = '82%';
   }, 180);
   setTimeout(() => {
-    stepEl.textContent = 'Hoàn tất! Đang mở Bảng Điều Khiển...';
+    stepEl.textContent = 'Đang mở bảng điều khiển...';
     barEl.style.width = '100%';
     document.getElementById('tgLoginForm').submit();
   }, 360);
@@ -13039,8 +12966,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="vi">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,minimum-scale=1.0,user-scalable=no,viewport-fit=cover">
-<title>{{ custom_title if custom_title else 'NHK — 3D Control Studio' }}</title>
+<meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover">
+<meta name="csrf-token" content="{{ csrf_token }}">
+<title>{{ custom_title if custom_title else 'NHK 3D' }}</title>
 <style>
 :root {
   --bg: #000000;
@@ -13443,7 +13371,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
   display: inline-block; animation: pawBounce 0.6s infinite alternate;
 }
 .paw-dot:nth-child(2) { animation-delay: 0.15s; }
-.paw-dot:nth-child(3) { animation-delay: 0.30s; }
+.paw-dot:nth-child(3) { animation-delay: 0.3độ trễ thấp; }
 @keyframes pawBounce {
   from { transform: translateY(2px) scale(0.75); opacity: 0.45; }
   to { transform: translateY(-2px) scale(1.15); opacity: 1; }
@@ -13568,10 +13496,10 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
 .tab-pane { display: none; will-change: transform, opacity; }
 .tab-pane.active {
   display: block;
-  animation: tgPaneSlideIn 0.30s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  animation: tgPaneSlideIn 0.3độ trễ thấp cubic-bezier(0.22, 1, 0.36, 1) forwards;
 }
 .tab-pane.slide-from-left {
-  animation: tgPaneFromLeft 0.30s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  animation: tgPaneFromLeft 0.3độ trễ thấp cubic-bezier(0.22, 1, 0.36, 1) forwards;
 }
 @keyframes tgPaneSlideIn {
   from { opacity: 0; transform: translateX(16px) scale(0.994); }
@@ -13681,76 +13609,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
   box-shadow: 0 24px 60px rgba(0, 0, 0, 0.6);
 }
 
-/* ==================== NHK 3D HOLO-CUBE & LUXURY SPECULAR RIM BUTTONS ==================== */
-.nhk-3d-stage-wrap {
-  position: relative;
-  display: flex; align-items: center; justify-content: center; gap: 14px;
-  padding: 6px 10px;
-  perspective: 900px;
-}
-.nhk-3d-viewport {
-  width: 54px; height: 54px;
-  position: relative;
-  transform-style: preserve-3d;
-  display: inline-flex; align-items: center; justify-content: center;
-  flex-shrink: 0;
-  cursor: pointer;
-}
-.nhk-3d-orbit-ring {
-  position: absolute; inset: -7px;
-  border-radius: 50%;
-  border: 1.5px dashed rgba(56, 189, 248, 0.55);
-  transform-style: preserve-3d;
-  pointer-events: none;
-}
-.nhk-3d-orbit-ring.ring-a {
-  animation: nhkOrbitA 6s linear infinite;
-  box-shadow: 0 0 14px rgba(56, 189, 248, 0.28);
-}
-.nhk-3d-orbit-ring.ring-b {
-  inset: -11px;
-  border: 1.5px solid rgba(244, 114, 182, 0.42);
-  animation: nhkOrbitB 8s linear infinite reverse;
-}
-@keyframes nhkOrbitA {
-  0% { transform: rotateX(68deg) rotateY(15deg) rotateZ(0deg); }
-  100% { transform: rotateX(68deg) rotateY(15deg) rotateZ(360deg); }
-}
-@keyframes nhkOrbitB {
-  0% { transform: rotateX(-58deg) rotateY(28deg) rotateZ(0deg); }
-  100% { transform: rotateX(-58deg) rotateY(28deg) rotateZ(360deg); }
-}
-.nhk-3d-cube {
-  width: 34px; height: 34px;
-  position: relative;
-  transform-style: preserve-3d;
-  animation: nhkCubeSpin 9s cubic-bezier(0.45, 0.05, 0.55, 0.95) infinite;
-}
-@keyframes nhkCubeSpin {
-  0%   { transform: rotateX(-18deg) rotateY(0deg) rotateZ(0deg); }
-  25%  { transform: rotateX(18deg) rotateY(90deg) rotateZ(4deg); }
-  50%  { transform: rotateX(-16deg) rotateY(180deg) rotateZ(-4deg); }
-  75%  { transform: rotateX(20deg) rotateY(270deg) rotateZ(4deg); }
-  100% { transform: rotateX(-18deg) rotateY(360deg) rotateZ(0deg); }
-}
-.nhk-cube-face {
-  position: absolute; width: 34px; height: 34px;
-  border-radius: 8px;
-  background: linear-gradient(135deg, rgba(0, 122, 255, 0.82) 0%, rgba(42, 171, 238, 0.72) 55%, rgba(139, 92, 246, 0.82) 100%);
-  border: 1px solid rgba(255, 255, 255, 0.55);
-  box-shadow: 0 0 16px rgba(42, 171, 238, 0.45), inset 0 0 8px rgba(255, 255, 255, 0.35);
-  display: flex; align-items: center; justify-content: center;
-  font-size: 9.5px; font-weight: 900; color: #ffffff; letter-spacing: 0.6px;
-  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.65);
-  backface-visibility: visible;
-}
-.nhk-cube-face.face-front  { transform: translateZ(17px); }
-.nhk-cube-face.face-back   { transform: rotateY(180deg) translateZ(17px); }
-.nhk-cube-face.face-right  { transform: rotateY(90deg) translateZ(17px); }
-.nhk-cube-face.face-left   { transform: rotateY(-90deg) translateZ(17px); }
-.nhk-cube-face.face-top    { transform: rotateX(90deg) translateZ(17px); }
-.nhk-cube-face.face-bottom { transform: rotateX(-90deg) translateZ(17px); }
-
+/* ==================== LUXURY SPECULAR RIM BUTTONS ==================== */
 /* Luxury Specular Rim & Liquid Glass Interactive Buttons */
 .btn, .tg-btn-login, .tg-nav-pill-btn {
   --mx: 50%;
@@ -13827,15 +13686,84 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
 }
 .tab-count.zero-val, .tab-count.zero-badge { display: none !important; }
 
+/* NHK 3D refresh: restrained liquid-glass layers and consistent focus states. */
+:root {
+  --surface-glass: rgba(28, 30, 36, 0.76);
+  --glass-edge: rgba(255, 255, 255, 0.14);
+  --glass-highlight: rgba(255, 255, 255, 0.07);
+}
+.panel, .tg-pet-companion-bar, .kpi-box, .tg-search-bar {
+  background: linear-gradient(145deg, var(--glass-highlight), transparent 50%), var(--surface-glass);
+  border-color: var(--glass-edge);
+  box-shadow: 0 10px 30px rgba(0,0,0,.16), inset 0 1px 0 rgba(255,255,255,.045);
+}
+@supports ((backdrop-filter: blur(12px)) or (-webkit-backdrop-filter: blur(12px))) {
+  .panel, .tg-pet-companion-bar, .tg-search-bar, .tg-bottom-bar, .tg-nav-right-group {
+    -webkit-backdrop-filter: blur(18px) saturate(135%);
+    backdrop-filter: blur(18px) saturate(135%);
+  }
+}
+button, a.btn, .sub-tab, .nav-tab, .acc-pill, .kpi-box {
+  -webkit-tap-highlight-color: transparent;
+}
+button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
+  outline: 2px solid var(--tg-cyan);
+  outline-offset: 2px;
+}
+#tgPageBootLoader::before {
+  content: ""; width: 34px; height: 34px; border-radius: 50%;
+  border: 3px solid rgba(42,171,238,.18); border-top-color: var(--tg-cyan);
+  box-shadow: 0 0 24px rgba(42,171,238,.16);
+  animation: nhkLoaderSpin .8s linear infinite;
+}
+@keyframes nhkLoaderSpin { to { transform: rotate(360deg); } }
+.tab-pane.active .panel { animation: nhkCardEnter .28s cubic-bezier(.2,.8,.2,1) both; }
+.tab-pane.active .panel:nth-child(2) { animation-delay: 35ms; }
+.tab-pane.active .panel:nth-child(3) { animation-delay: 6độ trễ thấp; }
+@keyframes nhkCardEnter { from { opacity: 0; transform: translateY(7px); } to { opacity: 1; transform: translateY(0); } }
+.tg-nav-pill-btn, .btn { transition: transform .18s ease, box-shadow .22s ease, border-color .22s ease, background-color .22s ease; }
+.tg-nav-pill-btn:active, .btn:active { transform: translateY(1px) scale(.98); }
+
+@media (max-width: 560px) {
+  .container { padding: 6px 10px calc(150px + env(safe-area-inset-bottom, 0px)); }
+  .tg-top-status-row { display: grid; grid-template-columns: auto minmax(0,1fr); align-items: center; gap: 6px; overflow: hidden; }
+  .tg-capsule-telemetry { min-width: 0; max-width: 100%; overflow: hidden; padding: 5px 8px; gap: 4px; }
+  #liveHangStateBadge { display: none; }
+  #liveRpmVal { display: none; }
+  .tg-navbar { display: grid; grid-template-columns: minmax(0,1fr); row-gap: 8px; padding-top: 7px; }
+  .tg-nav-left-brand { width: 100%; }
+  .tg-nav-actions-right { width: 100%; justify-content: flex-end; gap: 6px; }
+  .tg-nav-right-group { margin-left: auto; }
+  .tg-nav-title { font-size: 15px; }
+  .tg-nav-subtitle { font-size: 10px; }
+  .tg-pet-companion-bar { padding: 10px 12px; }
+  .tg-pet-duo-stage { flex: 1 1 100%; }
+  .tg-pet-speech-title { font-size: 12px; }
+  .tg-search-bar { gap: 8px; padding: 9px 10px; }
+  .tg-search-input { min-width: 0; font-size: 14px; }
+  .tg-bottom-dock-wrap { padding: 0 8px; bottom: calc(6px + env(safe-area-inset-bottom, 0px)); }
+  .tg-bottom-bar { height: 64px; }
+  .nav-tab .tg-tab-lbl { font-size: 10px; }
+  .nav-tab svg { width: 19px; height: 19px; }
+  .data-table { min-width: 580px; }
+  .panel { border-radius: 17px; }
+}
+@media (max-width: 380px) {
+  .tg-capsule-brand { font-size: 10px; padding: 4px 7px; }
+  .tg-capsule-telemetry { font-size: 10px; }
+  .tg-nav-pill-btn { padding: 6px 9px; }
+  .kpi-box { min-height: 72px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; transition-duration: .01ms !important; }
+}
+
 </style>
 </head>
 <body data-theme="tg_dark">
 <div id="tgPageBootLoader">
-  <div class="tg-boot-pets">
-    <svg class="tg-pet-svg pet-corgi-svg tg-corgi-svg" viewBox="0 0 128 88" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="corgiFur3D" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#ffd269"/><stop offset="48%" stop-color="#ff9924"/><stop offset="100%" stop-color="#c95206"/></linearGradient><linearGradient id="corgiCream3D" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#ffffff"/><stop offset="100%" stop-color="#f3dfc4"/></linearGradient><radialGradient id="corgiGlow" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="rgba(255,179,71,0.42)"/><stop offset="100%" stop-color="rgba(255,179,71,0)"/></radialGradient></defs><circle cx="64" cy="44" r="40" fill="url(#corgiGlow)"/><ellipse class="pet-shadow" cx="62" cy="79" rx="36" ry="5.5" fill="rgba(0,0,0,0.42)"/><g class="pet-body-group"><g class="pet-tail"><path d="M24 45 C10 34, 8 20, 18 17 C25 15, 31 26, 29 38 Z" fill="url(#corgiFur3D)"/><circle cx="16" cy="19" r="5.5" fill="url(#corgiCream3D)"/></g><g class="pet-leg-back-l"><rect x="30" y="54" width="9.5" height="19" rx="4.7" fill="#c95206"/><ellipse cx="34.8" cy="73.5" rx="6.4" ry="3.4" fill="url(#corgiCream3D)"/></g><g class="pet-leg-front-l"><rect x="70" y="54" width="9.5" height="19" rx="4.7" fill="#c95206"/><ellipse cx="74.8" cy="73.5" rx="6.4" ry="3.4" fill="url(#corgiCream3D)"/></g><rect x="24" y="34" width="60" height="28" rx="14" fill="url(#corgiFur3D)"/><path d="M36 47 C47 45, 68 45, 80 40 L81 57 C67 62, 43 62, 34 58 Z" fill="url(#corgiCream3D)"/><path d="M63 34 C68 27, 78 27, 84 36 C80 45, 68 46, 63 34 Z" fill="url(#corgiCream3D)"/><g class="pet-leg-back-r"><rect x="38" y="55" width="10" height="20" rx="5" fill="url(#corgiFur3D)"/><ellipse cx="43" cy="75" rx="6.6" ry="3.6" fill="url(#corgiCream3D)"/></g><g class="pet-leg-front-r"><rect x="76" y="55" width="10" height="20" rx="5" fill="url(#corgiFur3D)"/><ellipse cx="81" cy="75" rx="6.6" ry="3.6" fill="url(#corgiCream3D)"/></g><path d="M68 34 L84 48" stroke="#ef4444" stroke-width="4.5" stroke-linecap="round"/><circle cx="77" cy="44" r="4.5" fill="#fbbf24" stroke="#fff" stroke-width="1"/><g class="pet-head"><path class="pet-ear-l" d="M69 22 L63 3 L80 14 Z" fill="url(#corgiFur3D)"/><path d="M69 19 L65 7 L77 14 Z" fill="#fda4af"/><path class="pet-ear-r" d="M88 18 L100 2 L102 22 Z" fill="url(#corgiFur3D)"/><path d="M90 18 L97 6 L98 20 Z" fill="#fda4af"/><ellipse cx="85" cy="27" rx="18" ry="15" fill="url(#corgiFur3D)"/><path d="M84 13 C87 20, 87 26, 85 40 C94 41, 105 37, 106 28 C107 22, 97 15, 84 13 Z" fill="url(#corgiCream3D)"/><ellipse cx="100" cy="29" rx="9.5" ry="7" fill="url(#corgiCream3D)"/><ellipse cx="107" cy="27" rx="3.8" ry="3" fill="#0f172a"/><path class="pet-tongue" d="M97 34 Q101 43 105 35 Z" fill="#fb7185"/><path d="M94 33 Q99 36.5 104 32" stroke="#0f172a" stroke-width="1.9" stroke-linecap="round" fill="none"/><g class="pet-eyes"><circle cx="80.5" cy="24" r="3.2" fill="#0f172a"/><circle cx="81.6" cy="22.8" r="1.2" fill="#ffffff"/><circle cx="93" cy="23.5" r="3.2" fill="#0f172a"/><circle cx="94.1" cy="22.3" r="1.2" fill="#ffffff"/></g><ellipse cx="76" cy="28.5" rx="3.3" ry="1.8" fill="rgba(251,113,133,0.52)"/><ellipse cx="96" cy="28.5" rx="3.1" ry="1.7" fill="rgba(251,113,133,0.52)"/></g></g></svg>
-    <svg class="tg-pet-svg pet-cat-svg tg-cat-svg" viewBox="0 0 128 88" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="catFur3D" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#c7d2fe"/><stop offset="50%" stop-color="#818cf8"/><stop offset="100%" stop-color="#4f46e5"/></linearGradient><linearGradient id="catBelly3D" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#ffffff"/><stop offset="100%" stop-color="#e0e7ff"/></linearGradient><radialGradient id="catGlow" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="rgba(129,140,248,0.42)"/><stop offset="100%" stop-color="rgba(129,140,248,0)"/></radialGradient></defs><circle cx="64" cy="44" r="40" fill="url(#catGlow)"/><ellipse class="pet-shadow" cx="62" cy="79" rx="34" ry="5.2" fill="rgba(0,0,0,0.42)"/><g class="pet-body-group"><g class="pet-tail"><path d="M27 46 C10 43, 7 20, 19 14 C26 11, 28 22, 23 28 C19 33, 23 41, 30 43 Z" fill="url(#catFur3D)"/></g><g class="pet-leg-back-l"><rect x="33" y="54" width="8.5" height="19" rx="4.2" fill="#4338ca"/><ellipse cx="37.2" cy="73.5" rx="5.6" ry="3" fill="url(#catBelly3D)"/></g><g class="pet-leg-front-l"><rect x="69" y="54" width="8.5" height="19" rx="4.2" fill="#4338ca"/><ellipse cx="73.2" cy="73.5" rx="5.6" ry="3" fill="url(#catBelly3D)"/></g><rect x="28" y="35" width="54" height="26" rx="13" fill="url(#catFur3D)"/><path d="M39 48 C49 46, 65 46, 75 43 L76 57 C64 61, 45 61, 37 57 Z" fill="url(#catBelly3D)"/><g class="pet-leg-back-r"><rect x="40" y="55" width="9" height="20" rx="4.5" fill="url(#catFur3D)"/><ellipse cx="44.5" cy="75" rx="5.8" ry="3.2" fill="url(#catBelly3D)"/></g><g class="pet-leg-front-r"><rect x="75" y="55" width="9" height="20" rx="4.5" fill="url(#catFur3D)"/><ellipse cx="79.5" cy="75" rx="5.8" ry="3.2" fill="url(#catBelly3D)"/></g><path d="M68 36 L81 48" stroke="#ec4899" stroke-width="4" stroke-linecap="round"/><circle cx="76" cy="44" r="4" fill="#38bdf8" stroke="#fff" stroke-width="1"/><g class="pet-head"><path class="pet-ear-l" d="M69 21 L66 4 L81 14 Z" fill="url(#catFur3D)"/><path d="M70 19 L68 8 L78 14 Z" fill="#f472b6"/><path class="pet-ear-r" d="M87 16 L98 3 L100 20 Z" fill="url(#catFur3D)"/><path d="M89 16 L96 7 L97 19 Z" fill="#f472b6"/><ellipse cx="84" cy="27" rx="16.5" ry="14" fill="url(#catFur3D)"/><ellipse cx="87" cy="31" rx="11.5" ry="8.5" fill="url(#catBelly3D)"/><polygon points="92,27 96,27 94,30.5" fill="#fb7185"/><path d="M90 32.5 Q94 35.5 98 32.5" stroke="#1e1b4b" stroke-width="1.7" stroke-linecap="round" fill="none"/><g class="pet-eyes"><ellipse cx="80" cy="24" rx="3" ry="3.4" fill="#10b981"/><ellipse cx="80" cy="24" rx="1.3" ry="2.8" fill="#0f172a"/><circle cx="81" cy="22.6" r="1.1" fill="#ffffff"/><ellipse cx="92.5" cy="24" rx="3" ry="3.4" fill="#10b981"/><ellipse cx="92.5" cy="24" rx="1.3" ry="2.8" fill="#0f172a"/><circle cx="93.5" cy="22.6" r="1.1" fill="#ffffff"/></g><line x1="97" y1="28" x2="108" y2="26" stroke="#e2e8f0" stroke-width="1.3" stroke-linecap="round"/><line x1="97" y1="30.5" x2="109" y2="30.5" stroke="#e2e8f0" stroke-width="1.3" stroke-linecap="round"/><line x1="73" y1="29" x2="62" y2="28" stroke="#e2e8f0" stroke-width="1.3" stroke-linecap="round"/></g></g></svg>
-  </div>
-  <div style="font-size:13.5px;font-weight:700;color:var(--txt)">Đang khởi chạy động cơ NHK 3D &amp; Luồng Phản Hồi 0ms...</div>
+  
+  <div style="font-size:13.5px;font-weight:700;color:var(--txt)">Đang tải giao diện...</div>
 </div>
 
 <div id="toastBox"></div>
@@ -13844,7 +13772,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
 <div class="tg-modal-backdrop" id="bulk500BoxModal">
   <div class="tg-modal-card">
     <div class="panel-hd">
-      <span class="panel-title">Nạp Nhanh 500 Box Tuần Hoàn Siêu Tốc</span>
+      <span class="panel-title">Nhập danh sách phòng </span>
       <button type="button" class="btn btn-sm" onclick="closeBulk500BoxModal()">Đóng</button>
     </div>
     <div class="panel-body">
@@ -13855,7 +13783,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
         <div>
           <label class="field-lbl">Nền tảng</label>
           <select class="sel" id="bulk500PlatformSelect">
-            <option value="discord_channel">Discord (1 Acc chạy 500 Box)</option>
+            <option value="discord_channel">Discord (nhiều phòng)</option>
             <option value="group">Zalo Nhóm</option>
             <option value="messenger_thread">Messenger Box</option>
           </select>
@@ -13882,7 +13810,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
         <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 22 8.5 22 15.5 12 22 2 15.5 2 8.5 12 2"/><line x1="12" y1="22" x2="12" y2="15.5"/><polyline points="22 8.5 12 15.5 2 8.5"/></svg>
         <span>NHK 3D</span>
       </div>
-      <div class="tg-capsule-telemetry" onclick="checkWebPingNow(true)" title="NHK 3D Telemetry • Bấm để đo Ping thời gian thực">
+      <div class="tg-capsule-telemetry" onclick="checkWebPingNow(true)" title="Chạm để kiểm tra kết nối">
         <span class="dot-online" id="headerPingDot"></span>
         <span>Ping: <b id="headerPingText">-- ms</b></span>
         <span>•</span>
@@ -13905,7 +13833,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
       </label>
       <div class="tg-nav-title-block">
         <div class="tg-nav-title" id="headerBrandTitle">{{ custom_title if custom_title else 'Chat & Tài Khoản' }}</div>
-        <div class="tg-nav-subtitle">Điều phối đa tài khoản • VN &amp; SG 24/7</div>
+        <div class="tg-nav-subtitle">Quản lý tài khoản • Trạng thái trực tiếp</div>
       </div>
     </div>
 
@@ -13916,7 +13844,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
         <button type="button" class="tg-icon-btn" onclick="toggleTelegramDayNight()" title="Đổi chế độ Sáng / Tối">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
         </button>
-        <button type="button" class="tg-icon-btn" onclick="reconnectAllListenersNow(this)" title="NHK 3D Turbo — Đồng bộ Đa Tài Khoản 0ms">
+        <button type="button" class="tg-icon-btn" onclick="reconnectAllListenersNow(this)" title="Đồng bộ kết nối">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
         </button>
         <a href="/logout" class="tg-icon-btn" title="Đăng xuất">
@@ -13931,24 +13859,13 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
   <!-- Row 3: Interactive Python Pet Mascot Studio (Corgi Dog & British Shorthair Cat) -->
   <div class="tg-pet-companion-bar" id="tgPetCompanionWidget">
     <div class="tg-pet-duo-stage">
-      <div id="nhk3dCubeWrap" onclick="triggerPetReaction('corgi')" style="margin-right:4px"><div class="nhk-3d-viewport" title="Khối Lập Phương Năng Lượng 3D NHK"><div class="nhk-3d-orbit-ring ring-a"></div><div class="nhk-3d-orbit-ring ring-b"></div><div class="nhk-3d-cube"><div class="nhk-cube-face face-front"><span>NHK</span></div><div class="nhk-cube-face face-back"><span>NHK</span></div><div class="nhk-cube-face face-right"><span>3D</span></div><div class="nhk-cube-face face-left"><span>VIP</span></div><div class="nhk-cube-face face-top"><span>⚡</span></div><div class="nhk-cube-face face-bottom"><span>👑</span></div></div></div></div>
-      <div id="petCorgiWrap" onclick="triggerPetReaction('corgi')" title="NHK 3D">
-        <svg class="tg-pet-svg pet-corgi-svg tg-corgi-svg" viewBox="0 0 128 88" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="corgiFur3D" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#ffd269"/><stop offset="48%" stop-color="#ff9924"/><stop offset="100%" stop-color="#c95206"/></linearGradient><linearGradient id="corgiCream3D" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#ffffff"/><stop offset="100%" stop-color="#f3dfc4"/></linearGradient><radialGradient id="corgiGlow" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="rgba(255,179,71,0.42)"/><stop offset="100%" stop-color="rgba(255,179,71,0)"/></radialGradient></defs><circle cx="64" cy="44" r="40" fill="url(#corgiGlow)"/><ellipse class="pet-shadow" cx="62" cy="79" rx="36" ry="5.5" fill="rgba(0,0,0,0.42)"/><g class="pet-body-group"><g class="pet-tail"><path d="M24 45 C10 34, 8 20, 18 17 C25 15, 31 26, 29 38 Z" fill="url(#corgiFur3D)"/><circle cx="16" cy="19" r="5.5" fill="url(#corgiCream3D)"/></g><g class="pet-leg-back-l"><rect x="30" y="54" width="9.5" height="19" rx="4.7" fill="#c95206"/><ellipse cx="34.8" cy="73.5" rx="6.4" ry="3.4" fill="url(#corgiCream3D)"/></g><g class="pet-leg-front-l"><rect x="70" y="54" width="9.5" height="19" rx="4.7" fill="#c95206"/><ellipse cx="74.8" cy="73.5" rx="6.4" ry="3.4" fill="url(#corgiCream3D)"/></g><rect x="24" y="34" width="60" height="28" rx="14" fill="url(#corgiFur3D)"/><path d="M36 47 C47 45, 68 45, 80 40 L81 57 C67 62, 43 62, 34 58 Z" fill="url(#corgiCream3D)"/><path d="M63 34 C68 27, 78 27, 84 36 C80 45, 68 46, 63 34 Z" fill="url(#corgiCream3D)"/><g class="pet-leg-back-r"><rect x="38" y="55" width="10" height="20" rx="5" fill="url(#corgiFur3D)"/><ellipse cx="43" cy="75" rx="6.6" ry="3.6" fill="url(#corgiCream3D)"/></g><g class="pet-leg-front-r"><rect x="76" y="55" width="10" height="20" rx="5" fill="url(#corgiFur3D)"/><ellipse cx="81" cy="75" rx="6.6" ry="3.6" fill="url(#corgiCream3D)"/></g><path d="M68 34 L84 48" stroke="#ef4444" stroke-width="4.5" stroke-linecap="round"/><circle cx="77" cy="44" r="4.5" fill="#fbbf24" stroke="#fff" stroke-width="1"/><g class="pet-head"><path class="pet-ear-l" d="M69 22 L63 3 L80 14 Z" fill="url(#corgiFur3D)"/><path d="M69 19 L65 7 L77 14 Z" fill="#fda4af"/><path class="pet-ear-r" d="M88 18 L100 2 L102 22 Z" fill="url(#corgiFur3D)"/><path d="M90 18 L97 6 L98 20 Z" fill="#fda4af"/><ellipse cx="85" cy="27" rx="18" ry="15" fill="url(#corgiFur3D)"/><path d="M84 13 C87 20, 87 26, 85 40 C94 41, 105 37, 106 28 C107 22, 97 15, 84 13 Z" fill="url(#corgiCream3D)"/><ellipse cx="100" cy="29" rx="9.5" ry="7" fill="url(#corgiCream3D)"/><ellipse cx="107" cy="27" rx="3.8" ry="3" fill="#0f172a"/><path class="pet-tongue" d="M97 34 Q101 43 105 35 Z" fill="#fb7185"/><path d="M94 33 Q99 36.5 104 32" stroke="#0f172a" stroke-width="1.9" stroke-linecap="round" fill="none"/><g class="pet-eyes"><circle cx="80.5" cy="24" r="3.2" fill="#0f172a"/><circle cx="81.6" cy="22.8" r="1.2" fill="#ffffff"/><circle cx="93" cy="23.5" r="3.2" fill="#0f172a"/><circle cx="94.1" cy="22.3" r="1.2" fill="#ffffff"/></g><ellipse cx="76" cy="28.5" rx="3.3" ry="1.8" fill="rgba(251,113,133,0.52)"/><ellipse cx="96" cy="28.5" rx="3.1" ry="1.7" fill="rgba(251,113,133,0.52)"/></g></g></svg>
-      </div>
-      <div id="petCatWrap" onclick="triggerPetReaction('cat')" title="NHK 3D">
-        <svg class="tg-pet-svg pet-cat-svg tg-cat-svg" viewBox="0 0 128 88" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="catFur3D" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#c7d2fe"/><stop offset="50%" stop-color="#818cf8"/><stop offset="100%" stop-color="#4f46e5"/></linearGradient><linearGradient id="catBelly3D" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#ffffff"/><stop offset="100%" stop-color="#e0e7ff"/></linearGradient><radialGradient id="catGlow" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="rgba(129,140,248,0.42)"/><stop offset="100%" stop-color="rgba(129,140,248,0)"/></radialGradient></defs><circle cx="64" cy="44" r="40" fill="url(#catGlow)"/><ellipse class="pet-shadow" cx="62" cy="79" rx="34" ry="5.2" fill="rgba(0,0,0,0.42)"/><g class="pet-body-group"><g class="pet-tail"><path d="M27 46 C10 43, 7 20, 19 14 C26 11, 28 22, 23 28 C19 33, 23 41, 30 43 Z" fill="url(#catFur3D)"/></g><g class="pet-leg-back-l"><rect x="33" y="54" width="8.5" height="19" rx="4.2" fill="#4338ca"/><ellipse cx="37.2" cy="73.5" rx="5.6" ry="3" fill="url(#catBelly3D)"/></g><g class="pet-leg-front-l"><rect x="69" y="54" width="8.5" height="19" rx="4.2" fill="#4338ca"/><ellipse cx="73.2" cy="73.5" rx="5.6" ry="3" fill="url(#catBelly3D)"/></g><rect x="28" y="35" width="54" height="26" rx="13" fill="url(#catFur3D)"/><path d="M39 48 C49 46, 65 46, 75 43 L76 57 C64 61, 45 61, 37 57 Z" fill="url(#catBelly3D)"/><g class="pet-leg-back-r"><rect x="40" y="55" width="9" height="20" rx="4.5" fill="url(#catFur3D)"/><ellipse cx="44.5" cy="75" rx="5.8" ry="3.2" fill="url(#catBelly3D)"/></g><g class="pet-leg-front-r"><rect x="75" y="55" width="9" height="20" rx="4.5" fill="url(#catFur3D)"/><ellipse cx="79.5" cy="75" rx="5.8" ry="3.2" fill="url(#catBelly3D)"/></g><path d="M68 36 L81 48" stroke="#ec4899" stroke-width="4" stroke-linecap="round"/><circle cx="76" cy="44" r="4" fill="#38bdf8" stroke="#fff" stroke-width="1"/><g class="pet-head"><path class="pet-ear-l" d="M69 21 L66 4 L81 14 Z" fill="url(#catFur3D)"/><path d="M70 19 L68 8 L78 14 Z" fill="#f472b6"/><path class="pet-ear-r" d="M87 16 L98 3 L100 20 Z" fill="url(#catFur3D)"/><path d="M89 16 L96 7 L97 19 Z" fill="#f472b6"/><ellipse cx="84" cy="27" rx="16.5" ry="14" fill="url(#catFur3D)"/><ellipse cx="87" cy="31" rx="11.5" ry="8.5" fill="url(#catBelly3D)"/><polygon points="92,27 96,27 94,30.5" fill="#fb7185"/><path d="M90 32.5 Q94 35.5 98 32.5" stroke="#1e1b4b" stroke-width="1.7" stroke-linecap="round" fill="none"/><g class="pet-eyes"><ellipse cx="80" cy="24" rx="3" ry="3.4" fill="#10b981"/><ellipse cx="80" cy="24" rx="1.3" ry="2.8" fill="#0f172a"/><circle cx="81" cy="22.6" r="1.1" fill="#ffffff"/><ellipse cx="92.5" cy="24" rx="3" ry="3.4" fill="#10b981"/><ellipse cx="92.5" cy="24" rx="1.3" ry="2.8" fill="#0f172a"/><circle cx="93.5" cy="22.6" r="1.1" fill="#ffffff"/></g><line x1="97" y1="28" x2="108" y2="26" stroke="#e2e8f0" stroke-width="1.3" stroke-linecap="round"/><line x1="97" y1="30.5" x2="109" y2="30.5" stroke="#e2e8f0" stroke-width="1.3" stroke-linecap="round"/><line x1="73" y1="29" x2="62" y2="28" stroke="#e2e8f0" stroke-width="1.3" stroke-linecap="round"/></g></g></svg>
-      </div>
       <div class="tg-pet-speech">
         <div class="tg-pet-speech-title">
-          <span id="petMoodText">NHK 3D Core • Trực chiến 24/7 (Phản hồi 0ms)</span>
+          <span class="dot-online"></span>
+          <span id="petMoodText">Theo dõi hoạt động</span>
         </div>
-        <div class="tg-pet-speech-sub mono" id="latestCmdBannerText">Sẵn sàng nhận lệnh • Ưu tiên phản hồi 0ms</div>
+        <div class="tg-pet-speech-sub mono" id="latestCmdBannerText">Sẵn sàng nhận thao tác</div>
       </div>
-    </div>
-    <div class="tg-pet-controls">
-      <button type="button" class="btn btn-sm" onclick="switchPetDisplayMode('duo')">2X</button>
-      <button type="button" class="btn btn-sm" onclick="switchPetDisplayMode('corgi')">#1</button>
-      <button type="button" class="btn btn-sm" onclick="switchPetDisplayMode('cat')">#2</button>
     </div>
   </div>
 
@@ -13956,7 +13873,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
   <div class="tg-search-wrap">
     <div class="tg-search-bar">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-      <input type="text" class="tg-search-input" id="globalTelegramSearchInput" placeholder="Tìm tài khoản, phòng chat hoặc gõ lệnh nhanh (.menu, .n, .g, .t)..." oninput="handleGlobalTelegramSearch(this.value)" onkeydown="if(event.key==='Enter'){dispatchGlobalSearchCommand(this.value)}">
+      <input type="text" class="tg-search-input" id="globalTelegramSearchInput" placeholder="Tìm tài khoản, phòng hoặc lệnh..." oninput="handleGlobalTelegramSearch(this.value)" onkeydown="if(event.key==='Enter'){dispatchGlobalSearchCommand(this.value)}">
       <button type="button" class="btn btn-primary btn-sm" onclick="dispatchGlobalSearchCommand(document.getElementById('globalTelegramSearchInput').value)">Chạy</button>
     </div>
   </div>
@@ -13996,7 +13913,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
       <span class="kpi-val" id="kpiAccCount">{{ accounts|length }}</span>
     </div>
     <div class="kpi-box">
-      <span class="kpi-label">Box đã chọn</span>
+      <span class="kpi-label">Phòng đã chọn</span>
       <span class="kpi-val" id="kpiTargetCount">0</span>
     </div>
     <div class="kpi-box">
@@ -14019,7 +13936,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>
               <span>Kết Nối Tài Khoản</span>
             </span>
-            <span class="badge badge-blue">VN &amp; SG Chính Chủ</span>
+            <span class="badge badge-blue">Kết nối tài khoản</span>
           </div>
           <div class="panel-body">
             <form method="POST" action="/account/add" onsubmit="return handleAccountFormSubmit(event)">
@@ -14047,7 +13964,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
                   <div class="qr-meta-strip">
                     <span class="badge badge-green" id="zaloQRVnBadge">Định vị VN &amp; SG Thật</span>
                     <span class="badge badge-blue" id="zaloQRCodeIdBadge">Sẵn sàng cấp QR</span>
-                    <span class="badge badge-gray" id="zaloQRImeiPreview">Giữ sống 24/7</span>
+                    <span class="badge badge-gray" id="zaloQRImeiPreview">Thiết bị Zalo</span>
                   </div>
 
                   <div class="qr-steps-bar">
@@ -14087,7 +14004,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
                   </div>
 
                   <div style="font-size:12px;color:var(--txt-muted);margin-bottom:10px;text-align:left;padding:9px 12px;border-radius:12px;background:var(--surface);border:1px solid var(--border-light)" id="zaloQRStatusText">
-                    Mỗi lần bấm <b>Tạo Mã QR</b> hệ thống tự động cấp một máy tính mới tại <b>Việt Nam / Singapore</b>. Khi quét mã và ấn <b>Đăng nhập</b> trên điện thoại, máy tính được giữ sống 24/7 trong tài khoản Zalo.
+                    Bấm <b>Tạo mã QR</b>, sau đó dùng ứng dụng Zalo trên điện thoại để quét và xác nhận đăng nhập.
                   </div>
 
                   <div id="zaloQRStageWrap" style="display:none">
@@ -14096,7 +14013,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
                       <img id="zaloQRImg" src="" alt="QR Zalo PC">
                     </div>
                     <div style="display:flex;justify-content:center;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap">
-                      <span class="badge badge-blue" id="zaloQRTimerBadge">Hiệu lực: 100s</span>
+                      <span class="badge badge-blue" id="zaloQRTimerBadge">Hiệu lực: 10độ trễ thấp</span>
                       <span class="badge badge-green" id="zaloQRLocationBadge">Đang định tuyến...</span>
                     </div>
                   </div>
@@ -14177,7 +14094,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
                   <button type="button" class="sub-tab" id="subDisNewAccBtn" onclick="switchDiscordRegTab('new_acc')">Tạo Hồ Sơ</button>
                 </div>
                 <div id="discordTokenBox">
-                  <label class="field-lbl">Danh sách Token Discord (1 Acc cân 500 Box hoặc nhiều Acc song song)</label>
+                  <label class="field-lbl">Token Discord</label>
                   <textarea class="txt" name="token" id="discordTokenInput" placeholder="Dán 1 hoặc nhiều Token Discord (mỗi dòng 1 Token)..."></textarea>
                   <div id="immortalVaultResultBox" style="display:none;margin:6px 0;padding:8px;border-radius:10px;font-size:12px;background:rgba(48,209,88,0.14);color:var(--green)"></div>
                   <div class="row-3" style="margin-top:6px">
@@ -14250,7 +14167,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
               <span>Trình Tạo Mã 2FA &amp; Tiện Ích Discord</span>
             </span>
-            <span class="badge badge-gray" id="totpTimerBadge">30s</span>
+            <span class="badge badge-gray" id="totpTimerBadge">3độ trễ thấp</span>
           </div>
           <div class="panel-body">
             <div style="display:flex;gap:6px;margin-bottom:8px">
@@ -14285,7 +14202,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
               <span>Danh Sách Tài Khoản ({{ accounts|length }})</span>
             </span>
             <div style="display:flex;gap:6px;flex-wrap:wrap">
-              <button class="btn btn-sm" type="button" onclick="reconnectAllListenersNow(this)">Làm mới phiên 24/7</button>
+              <button class="btn btn-sm" type="button" onclick="reconnectAllListenersNow(this)">Làm mới phiên</button>
               <button class="btn btn-primary btn-sm" type="button" onclick="openPerAccBoxSelector(null)">Chọn Phòng Chat</button>
             </div>
           </div>
@@ -14319,7 +14236,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
                         </td>
                         <td>
                           <div style="font-weight:600;color:var(--txt)">{{ a.name }}</div>
-                          <div style="font-size:11px;color:var(--txt-muted)">{{ a.pc_name or 'Thiết bị đang hoạt động 24/7' }}</div>
+                          <div style="font-size:11px;color:var(--txt-muted)">{{ a.pc_name or 'Thiết bị đang hoạt động' }}</div>
                         </td>
                         <td class="mono" style="font-size:11.5px">{{ a.uid or a.masked_uid }}</td>
                         <td>
@@ -14334,7 +14251,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
                           <div style="display:flex;gap:4px">
                             <button class="btn btn-sm" type="button" onclick="testSingleAccountSession({{ a.id }}, this)">Kiểm tra</button>
                             <button class="btn btn-sm" type="button" onclick="toggleAccCmd({{ a.id }}, {{ 0 if a.chat_cmd_enabled else 1 }})">{{ 'Tắt' if a.chat_cmd_enabled else 'Bật' }}</button>
-                            <a href="/account/delete/{{ a.id }}" class="btn btn-danger btn-sm">Xóa</a>
+                            <form method="POST" action="/account/delete/{{ a.id }}" style="display:inline"><button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('Xóa tài khoản này?')">Xóa</button></form>
                           </div>
                         </td>
                       </tr>
@@ -14357,7 +14274,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
           <div class="panel-hd">
             <span class="panel-title">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-              <span>Danh Sách Phòng Chat &amp; 500 Box Tuần Hoàn</span>
+              <span>Phòng chat</span>
             </span>
             <div style="display:flex;gap:4px;flex-wrap:wrap">
               <button class="btn btn-primary btn-sm" type="button" onclick="loadGroupsAndRooms(true, this)">Quét Toàn Bộ</button>
@@ -14397,7 +14314,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
               <button type="button" class="btn btn-sm" onclick="addManualChannelId()">+ Thêm ID</button>
             </div>
             <div class="scroll-area" id="targetListContainer" style="max-height:420px">
-              <div style="padding:20px;text-align:center;color:var(--txt-muted)">Bấm "Quét Toàn Bộ" để tải danh sách phòng chat của các tài khoản.</div>
+              <div style="padding:20px;text-align:center;color:var(--txt-muted)">Chọn Quét để tải danh sách phòng chat.</div>
             </div>
           </div>
         </div>
@@ -14446,9 +14363,9 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
           <div class="panel-hd">
             <span class="panel-title">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
-              <span>Điều Phối Gửi Tin Siêu Tốc (Zalo 0ms &amp; Discord 500 Box)</span>
+              <span>Soạn và gửi tin</span>
             </span>
-            <span class="badge badge-green">64 Shards Không Độ Trễ</span>
+            <span class="badge badge-green">Đang hoạt động</span>
           </div>
           <div class="panel-body">
             <div style="margin-bottom:10px;padding:10px;background:var(--surface-sub);border:1px solid var(--border);border-radius:12px">
@@ -14474,7 +14391,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
 
             <div style="margin-bottom:10px;padding:10px;background:var(--surface-sub);border:1px solid var(--border);border-radius:12px">
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:4px">
-                <label class="field-lbl" style="margin:0;color:var(--tg-cyan)">Phòng mục tiêu (<span id="quickBoxSelectedCount">0</span> Box đã chọn):</label>
+                <label class="field-lbl" style="margin:0;color:var(--tg-cyan)">Phòng mục tiêu (<span id="quickBoxSelectedCount">0</span> Phòng đã chọn):</label>
                 <div style="display:flex;gap:4px;flex-wrap:wrap">
                   <button type="button" class="btn btn-primary btn-sm" id="btnQuickLoadBoxes" onclick="loadGroupsAndRooms(true, this)">Tải danh sách</button>
                   <button type="button" class="btn btn-sm" onclick="selectTopNTargets(100)">100 Box</button>
@@ -14496,13 +14413,13 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
             
             <div style="margin-bottom:10px;padding:10px;background:var(--surface-sub);border:1px solid var(--border);border-radius:12px">
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:4px">
-                <span class="field-lbl" style="margin:0;color:#38bdf8">Nạp Nhanh File PRX (.txt / .csv) &amp; Tự Khởi Chạy 0ms:</span>
+                <span class="field-lbl" style="margin:0;color:#38bdf8">Nạp danh sách Proxy</span>
                 <span class="badge badge-green" id="campPrxQuickBadge">PRX Auto-Start Sẵn Sàng</span>
               </div>
               <div class="prx-dropzone">
                 <input type="file" accept=".txt,.csv,.list,.conf" multiple onchange="uploadPrxFilesAndAutoStart(this)">
-                <div style="font-size:12px;font-weight:700;color:#38bdf8">📂 Bấm Duyệt File PRX (.txt / .csv) Để Nạp Hết &amp; Tự Khởi Chạy</div>
-                <div style="font-size:10.5px;color:var(--txt-muted);margin-top:2px">Tự động đo Ping (ms), lọc PRX sống nhanh nhất &amp; giữ phản hồi lệnh .menu / .cp 0ms dù đang treo 500 Box</div>
+                <div style="font-size:12px;font-weight:700;color:#38bdf8">📂 Bấm Duyệt File PRX (.txt / .csv) Để Nạp &amp; khởi chạy</div>
+                <div style="font-size:10.5px;color:var(--txt-muted);margin-top:2px">Đo Ping và sắp xếp proxy theo độ trễ</div>
               </div>
             </div>
 
@@ -14511,7 +14428,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
                 <label class="field-lbl">Chế độ gửi</label>
                 <select class="sel" id="cfgMode">
                   <option value="treo_nhay">Treo nhây từng dòng (.n)</option>
-                  <option value="sieu_xa_nhieu_nhom">Xả siêu tốc 500 Box (.xa)</option>
+                  <option value="sieu_xa_nhieu_nhom">Gửi nhiều phòng (.xa)</option>
                   <option value="combo_lien_thanh">Gửi gộp 3 câu/nhịp (.combo)</option>
                   <option value="treo_ngon">Treo ngôn nguyên bài (.g)</option>
                   <option value="fast">Gửi nhanh liên tục (.s)</option>
@@ -14602,9 +14519,9 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
             <div style="display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap">
               <button type="button" class="btn btn-sm" onclick="setGlobalIconZeroNow(0)">Tắt Icon (.icon 0)</button>
               <button type="button" class="btn btn-sm" onclick="setGlobalIconZeroNow(2)">Bật 2 Icon</button>
-              <button type="button" class="btn btn-primary btn-sm" onclick="document.getElementById('cfgDelay').value='0.0';syncWebRuntimeConfigLive()">Tốc Độ 0.0s (Không Độ Trễ)</button>
+              <button type="button" class="btn btn-primary btn-sm" onclick="document.getElementById('cfgDelay').value='0.0';syncWebRuntimeConfigLive()">Tốc Độ 0.độ trễ thấp (Đang hoạt động)</button>
               <button type="button" class="btn btn-sm" onclick="document.getElementById('cfgBatchCount').value='16'">16 Luồng</button>
-              <button type="button" class="btn btn-sm" onclick="document.getElementById('cfgBatchCount').value='64'">64 Luồng (500 Box)</button>
+              <button type="button" class="btn btn-sm" onclick="document.getElementById('cfgBatchCount').value='64'">64 luồng</button>
               <button type="button" class="btn btn-sm" onclick="document.getElementById('cfgBatchCount').value='100'">100 Luồng</button>
             </div>
 
@@ -14679,13 +14596,13 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
     </div>
   </section>
 
-  <!-- TAB 4: KHO FILE KỊCH BẢN -->
+  <!-- TAB 4: MẪU TIN -->
   <section id="tab-files" class="tab-pane">
     <div class="grid-12">
       <div class="col-5">
         <div class="panel">
           <div class="panel-hd">
-            <span class="panel-title">Tải Lên Hoặc Soạn Kịch Bản (.TXT)</span>
+            <span class="panel-title">Tạo mẫu tin (.txt)</span>
           </div>
           <div class="panel-body">
             <div style="margin-bottom:10px;padding:16px;border:1.5px dashed var(--tg-cyan);border-radius:14px;background:var(--surface-sub);text-align:center;position:relative">
@@ -14715,7 +14632,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
       <div class="col-7">
         <div class="panel">
           <div class="panel-hd">
-            <span class="panel-title">Danh Sách File Kịch Bản ({{ files|length }})</span>
+            <span class="panel-title">Mẫu tin ({{ files|length }})</span>
             <span class="badge badge-gray">Lệnh: .n &lt;số&gt; hoặc .g &lt;số&gt;</span>
           </div>
           <div class="panel-body" style="padding:0">
@@ -14739,7 +14656,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
                       <td style="font-weight:600">{{ f.filename }}</td>
                       <td class="mono">{{ f.lines_count }} dòng</td>
                       <td><code>.n {{ f.display_num }}</code> / <code>.g {{ f.display_num }}</code></td>
-                      <td><a href="/file/delete/{{ f.id }}" class="btn btn-danger btn-sm">Xóa</a></td>
+                      <td><form method="POST" action="/file/delete/{{ f.id }}" style="display:inline"><button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('Xóa mẫu tin này?')">Xóa</button></form></td>
                     </tr>
                   {% endfor %}
                 </tbody>
@@ -14753,6 +14670,23 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
 
   <!-- TAB 5: CÀI ĐẶT HỆ THỐNG, DANH MỤC API & PROXY POOL -->
   <section id="tab-shield" class="tab-pane">
+    <div class="panel" style="margin-bottom:12px">
+      <div class="panel-hd">
+        <span class="panel-title">Bảo mật tài khoản</span>
+        <span class="badge badge-blue">Mật khẩu quản trị</span>
+      </div>
+      <div class="panel-body">
+        <div class="row-3" style="align-items:end">
+          <div><label class="field-lbl" for="appCurrentPassword">Mật khẩu hiện tại</label><input class="inp" type="password" id="appCurrentPassword" autocomplete="current-password" placeholder="Nhập mật khẩu hiện tại"></div>
+          <div><label class="field-lbl" for="appNewPassword">Mật khẩu mới</label><input class="inp" type="password" id="appNewPassword" autocomplete="new-password" minlength="14" placeholder="Ít nhất 14 ký tự"></div>
+          <div><label class="field-lbl" for="appConfirmPassword">Xác nhận mật khẩu</label><input class="inp" type="password" id="appConfirmPassword" autocomplete="new-password" minlength="14" placeholder="Nhập lại mật khẩu"></div>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px">
+          <button type="button" class="btn btn-primary" onclick="changeAppPassword()">Đổi mật khẩu</button>
+          <span style="font-size:11.5px;color:var(--txt-muted)">Mật khẩu được băm ở máy chủ, không lưu dạng văn bản.</span>
+        </div>
+      </div>
+    </div>
     <div class="grid-12">
       <div class="col-6">
         <div class="panel">
@@ -14770,7 +14704,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
               <div style="padding:10px;border:1px solid var(--border);border-radius:12px;background:var(--surface-sub)">
                 <div style="font-size:11px;color:var(--txt-muted)">Luồng xử lý song song</div>
                 <div style="font-size:16px;font-weight:700;color:var(--tg-cyan)" id="pingThreadsVal">Hoạt động</div>
-                <span class="badge badge-blue">64 Shards / 500 Box</span>
+                <span class="badge badge-blue">64 luồng</span>
               </div>
             </div>
             <div class="row-2">
@@ -14788,16 +14722,16 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
 
             <div style="padding:12px;border:1px solid var(--border);border-radius:14px;background:var(--surface-sub)">
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:4px">
-                <span style="font-size:12.5px;font-weight:700;color:var(--tg-cyan)">Hệ Thống Proxy Pool &amp; Chuyển Mạch 0ms</span>
-                <span class="badge badge-green" id="prxStatusBadge">Direct Keep-Alive (0ms)</span>
+                <span style="font-size:12.5px;font-weight:700;color:var(--tg-cyan)">Hệ Thống Proxy Pool &amp; Chuyển Mạch độ trễ thấp</span>
+                <span class="badge badge-green" id="prxStatusBadge">Direct Keep-Alive (độ trễ thấp)</span>
               </div>
               <div style="font-size:11.5px;color:var(--txt-muted);margin-bottom:8px">
-                Hỗ trợ <code>ip:port</code>, <code>ip:port:user:pass</code>, <code>http://user:pass@ip:port</code>, <code>socks5://...</code>. Tự động xoay vòng và chuyển tiếp 0ms khi gửi 500 Box.
+                Hỗ trợ <code>ip:port</code>, <code>ip:port:user:pass</code>, <code>http://user:pass@ip:port</code>, <code>socks5://...</code>. Có thể tự chuyển sang proxy dự phòng khi kết nối lỗi.
               </div>
               
               <div class="prx-dropzone">
                 <input type="file" id="prxFileUploadInput" accept=".txt,.csv,.list,.conf" multiple onchange="uploadPrxFilesAndAutoStart(this)">
-                <div style="font-size:12.5px;font-weight:700;color:#38bdf8">📂 Duyệt File PRX (.txt / .csv) — Nạp Toàn Bộ &amp; Tự Khởi Chạy Nhanh Nhất</div>
+                <div style="font-size:12.5px;font-weight:700;color:#38bdf8">📂 Tải file Proxy (.txt / .csv)</div>
                 <div style="font-size:11px;color:var(--txt-muted);margin-top:2px" id="prxUploadStatusText">Hỗ trợ chọn 1 hoặc nhiều file PRX cùng lúc • Tự động xếp hạng Ping (ms) thấp nhất lên đầu</div>
               </div>
 
@@ -14819,8 +14753,8 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
       <div class="col-6">
         <div class="panel">
           <div class="panel-hd">
-            <span class="panel-title">Danh Mục Cổng API Đa Cụm (Zalo • Discord 500 Box • MQTT)</span>
-            <span class="badge badge-blue">Tự Động Cân Bằng Tải</span>
+            <span class="panel-title">Kết nối API</span>
+            <span class="badge badge-blue">Tự động</span>
           </div>
           <div class="panel-body" style="padding:0">
             <div class="scroll-area" id="apiGatewayDirectoryContainer" style="max-height:230px;border:none;border-radius:0">
@@ -14829,7 +14763,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
                   <div class="item-title">Zalo Group &amp; Mention Multi-Cluster</div>
                   <div class="item-sub"><code>https://tt-group-wpa.chat.zalo.me/api/group/sendmsg</code> • <code>/api/group/mention</code></div>
                 </div>
-                <span class="badge badge-green">0ms Keep-Alive</span>
+                <span class="badge badge-green">độ trễ thấp Keep-Alive</span>
               </div>
               <div class="list-item">
                 <div class="item-info">
@@ -14840,7 +14774,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
               </div>
               <div class="list-item">
                 <div class="item-info">
-                  <div class="item-title">Zalo WebSocket 24/7 Device Keeper</div>
+                  <div class="item-title">Zalo WebSocket</div>
                   <div class="item-sub"><code>wss://ws1.chat.zalo.me</code> • <code>wss://ws2..4.chat.zalo.me</code></div>
                 </div>
                 <span class="badge badge-blue">Giữ sống thiết bị</span>
@@ -14866,7 +14800,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
         <div class="panel">
           <div class="panel-hd">
             <span class="panel-title">Nhật Ký Lệnh Thời Gian Thực</span>
-            <span class="badge badge-green">Phản Hồi Tức Thì</span>
+            <span class="badge badge-green">Đang hoạt động</span>
           </div>
           <div class="panel-body" style="padding:0">
             <div class="scroll-area" id="cmdLogBox" style="max-height:220px;border:none"></div>
@@ -14882,31 +14816,31 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
   <nav class="tg-bottom-bar nav-tabs" id="tgBottomBar" aria-label="Điều hướng chính">
     <div class="tg-nav-pill-indicator" id="tgNavPill"></div>
 
-    <button type="button" class="nav-tab active" data-tab="tab-accounts" data-idx="0" data-title="Chat &amp; Tài Khoản" onclick="switchMainTab('tab-accounts', this)">
+    <button type="button" class="nav-tab active" data-tab="tab-accounts" data-idx="0" data-title="Tài khoản" onclick="switchMainTab('tab-accounts', this)">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
       <span class="tg-tab-lbl">Tài khoản</span>
       <span class="tab-count {% if not accounts %}zero-badge{% endif %}" id="dockAccBadge">{{ accounts|length }}</span>
     </button>
 
-    <button type="button" class="nav-tab" data-tab="tab-targets" data-idx="1" data-title="Phòng &amp; Kênh Chat" onclick="switchMainTab('tab-targets', this)">
+    <button type="button" class="nav-tab" data-tab="tab-targets" data-idx="1" data-title="Phòng" onclick="switchMainTab('tab-targets', this)">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
-      <span class="tg-tab-lbl">Phòng chat</span>
+      <span class="tg-tab-lbl">Phòng</span>
       <span class="tab-count zero-badge" id="dockTargetBadge">0</span>
     </button>
 
-    <button type="button" class="nav-tab" data-tab="tab-campaign" data-idx="2" data-title="Chiến Dịch Siêu Tốc" onclick="switchMainTab('tab-campaign', this)">
+    <button type="button" class="nav-tab" data-tab="tab-campaign" data-idx="2" data-title="Gửi tin" onclick="switchMainTab('tab-campaign', this)">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
-      <span class="tg-tab-lbl">Chiến dịch</span>
+      <span class="tg-tab-lbl">Gửi tin</span>
       <span class="tab-count zero-badge" id="dockTaskBadge">0</span>
     </button>
 
-    <button type="button" class="nav-tab" data-tab="tab-files" data-idx="3" data-title="Kho Kịch Bản (.TXT)" onclick="switchMainTab('tab-files', this)">
+    <button type="button" class="nav-tab" data-tab="tab-files" data-idx="3" data-title="Mẫu tin" onclick="switchMainTab('tab-files', this)">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
-      <span class="tg-tab-lbl">Kịch bản</span>
+      <span class="tg-tab-lbl">Mẫu tin</span>
       <span class="tab-count {% if not files %}zero-badge{% endif %}" id="dockFileBadge">{{ files|length }}</span>
     </button>
 
-    <button type="button" class="nav-tab" data-tab="tab-shield" data-idx="4" data-title="Cài Đặt &amp; Hệ Thống" onclick="switchMainTab('tab-shield', this)">
+    <button type="button" class="nav-tab" data-tab="tab-shield" data-idx="4" data-title="Cài đặt" onclick="switchMainTab('tab-shield', this)">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
       <span class="tg-tab-lbl">Cài đặt</span>
     </button>
@@ -14914,6 +14848,64 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
 </div>
 
 <script>
+// Automatically attach the CSRF token to same-origin fetch requests and normal POST forms.
+(function installCsrfProtection() {
+  const tokenMeta = document.querySelector('meta[name="csrf-token"]');
+  const csrfToken = tokenMeta ? tokenMeta.content : '';
+  const nativeFetch = window.fetch.bind(window);
+  window.fetch = function(input, init = {}) {
+    try {
+      const targetUrl = new URL(typeof input === 'string' ? input : input.url, window.location.href);
+      if (targetUrl.origin === window.location.origin && csrfToken) {
+        const inheritedHeaders = (input instanceof Request) ? input.headers : undefined;
+        const headers = new Headers(init.headers || inheritedHeaders || {});
+        headers.set('X-CSRF-Token', csrfToken);
+        init = {...init, headers};
+      }
+    } catch (_) {}
+    return nativeFetch(input, init);
+  };
+  document.addEventListener('submit', function(event) {
+    const form = event.target;
+    if (!(form instanceof HTMLFormElement) || (form.method || 'get').toLowerCase() !== 'post' || !csrfToken) return;
+    let hidden = form.querySelector('input[name="csrf_token"]');
+    if (!hidden) {
+      hidden = document.createElement('input');
+      hidden.type = 'hidden'; hidden.name = 'csrf_token';
+      form.appendChild(hidden);
+    }
+    hidden.value = csrfToken;
+  }, true);
+})();
+
+async function changeAppPassword() {
+  const current = document.getElementById('appCurrentPassword');
+  const next = document.getElementById('appNewPassword');
+  const confirm = document.getElementById('appConfirmPassword');
+  const currentPassword = current ? current.value : '';
+  const newPassword = next ? next.value : '';
+  const confirmPassword = confirm ? confirm.value : '';
+  if (!currentPassword || !newPassword || !confirmPassword) { showToast('Nhập đủ ba trường mật khẩu.'); return; }
+  if (newPassword.length < 14) { showToast('Mật khẩu mới cần ít nhất 14 ký tự.'); return; }
+  if (newPassword !== confirmPassword) { showToast('Mật khẩu xác nhận không khớp.'); return; }
+  const button = document.querySelector('button[onclick="changeAppPassword()"]');
+  if (button) { button.disabled = true; button.textContent = 'Đang đổi...'; }
+  try {
+    const response = await fetch('/api/security/change-password', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({current_password: currentPassword, new_password: newPassword, confirm_password: confirmPassword})
+    });
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || 'Không thể đổi mật khẩu.');
+    [current, next, confirm].forEach(el => { if (el) el.value = ''; });
+    showToast('Đã đổi mật khẩu quản trị. Hãy lưu mật khẩu mới ở nơi an toàn.');
+  } catch (error) {
+    showToast(error.message || 'Lỗi đổi mật khẩu.');
+  } finally {
+    if (button) { button.disabled = false; button.textContent = 'Đổi mật khẩu'; }
+  }
+}
+
 let ALL_TARGETS = [];
 let BY_ACCOUNT_BOXES = {};
 let SELECTED_TARGETS = new Map();
@@ -14928,7 +14920,7 @@ let ZALO_VAULT_CACHE = [];
 let CURRENT_TAB_INDEX = 0;
 let TG_SPRING_SAMPLES = [0, 0.25, 0.56, 0.81, 0.96, 1.03, 1.04, 1.02, 1.0, 1.0];
 
-const MINI_PET_LOADER_SVG = `<svg viewBox="0 0 36 24" fill="none" xmlns="http://www.w3.org/2000/svg"><ellipse cx="17" cy="14" rx="10" ry="5.5" fill="#ffb347"/><circle cx="27" cy="10" r="5.5" fill="#ffb347"/><polygon points="24,6 23,1 27,5" fill="#f58220"/><polygon points="28,5 31,1 31,7" fill="#f58220"/><circle cx="29" cy="9.5" r="1.1" fill="#1c1c1e"/><path d="M7 12 Q2 7 6 5" stroke="#ffb347" stroke-width="2.6" stroke-linecap="round"/><line x1="11" y1="18" x2="9" y2="23" stroke="#fff" stroke-width="2.2" stroke-linecap="round"/><line x1="15" y1="18" x2="16" y2="23" stroke="#fff" stroke-width="2.2" stroke-linecap="round"/><line x1="22" y1="18" x2="21" y2="23" stroke="#fff" stroke-width="2.2" stroke-linecap="round"/><line x1="25" y1="18" x2="27" y2="23" stroke="#fff" stroke-width="2.2" stroke-linecap="round"/></svg>`;
+const MINI_PET_LOADER_SVG = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>`;
 
 const MY_TAB_ID = 'tab_' + Math.random().toString(36).slice(2, 10) + '_' + Date.now();
 const LEADER_STORAGE_KEY = 'tg_leader_tab_state';
@@ -14939,16 +14931,7 @@ let _pendingRafStatus = null;
 
 function checkZaloRealGeoStatus(forceScan = false) { return checkZaloGeoStatus(forceScan); }
 function autoScanAndBindVnSgProxy(btnEl) { return scanAndLockRealVnSgRoute(btnEl); }
-function spawnPetBurstParticles(x, y, c) {
-  if (!x && !y) return;
-  const paw = document.createElement('span');
-  paw.className = 'tg-floating-paw';
-  paw.textContent = '🐾';
-  paw.style.left = x + 'px';
-  paw.style.top = y + 'px';
-  document.body.appendChild(paw);
-  setTimeout(() => paw.remove(), 700);
-}
+function spawnPetBurstParticles(x, y, c) {}
 
 // Theo dõi tọa độ chuột / ngón tay thời gian thực cho hiệu ứng nút bấm Specular Rim Luxury
 document.addEventListener('pointermove', (ev) => {
@@ -14960,22 +14943,7 @@ document.addEventListener('pointermove', (ev) => {
 }, {passive: true});
 
 // Đảm bảo 100% biểu tượng đồ họa SVG & Khối 3D NHK luôn xuất hiện rõ nét
-async function ensureNhkPetsAnd3DRendered() {
-  const cWrap = document.getElementById('petCorgiWrap');
-  const mWrap = document.getElementById('petCatWrap');
-  const nWrap = document.getElementById('nhk3dCubeWrap');
-  if (cWrap && cWrap.innerHTML.trim().length > 50 && mWrap && mWrap.innerHTML.trim().length > 50) return;
-  try {
-    const r = await fetch('/api/ui/pet_mascot?t=' + Date.now());
-    const d = await r.json();
-    if (d && d.ok) {
-      if (cWrap && d.corgi_svg) cWrap.innerHTML = d.corgi_svg;
-      if (mWrap && d.cat_svg) mWrap.innerHTML = d.cat_svg;
-      if (nWrap && d.nhk_3d_svg) nWrap.innerHTML = d.nhk_3d_svg;
-    }
-  } catch (e) {}
-}
-setTimeout(ensureNhkPetsAnd3DRendered, 80);
+async function ensureNhkPetsAnd3DRendered() {}
 
 // Tính năng Duyệt File PRX (.txt / .csv) nạp toàn bộ & tự khởi chạy chế độ phản hồi nhanh nhất
 async function uploadPrxFilesAndAutoStart(inputEl) {
@@ -14999,7 +14967,7 @@ async function uploadPrxFilesAndAutoStart(inputEl) {
       if (chk) chk.checked = true;
       if (d.snapshot) updateProxyBadgeUI(d.snapshot);
       if (stTxt) stTxt.textContent = d.message || `Đã nạp ${d.total} PRX & tự khởi chạy!`;
-      setPetCompanionMood(d.message || `Đã nạp & tự khởi chạy ${d.total} PRX siêu tốc!`);
+      setPetCompanionMood(d.message || `Đã nạp ${d.total} proxy.`);
       showToast(d.message || `Đã nạp & tự khởi chạy ${d.total} PRX!`);
       setTimeout(() => pollSystemStatus(true), 1500);
     } else {
@@ -15044,15 +15012,7 @@ function setDockBadgeCount(badgeId, countVal) {
     btn.appendChild(ripple);
     setTimeout(() => ripple.remove(), 580);
 
-    if (ev.clientX && ev.clientY) {
-      const paw = document.createElement('span');
-      paw.className = 'tg-floating-paw';
-      paw.textContent = Math.random() > 0.45 ? '🐾' : '✨';
-      paw.style.left = ev.clientX + 'px';
-      paw.style.top = ev.clientY + 'px';
-      document.body.appendChild(paw);
-      setTimeout(() => paw.remove(), 720);
-    }
+    
   }, {passive: true});
 
   fetch('/api/ui/physics').then(r => r.json()).then(d => {
@@ -15097,17 +15057,17 @@ function switchPetDisplayMode(mode) {
   if (!corgiW || !catW) return;
   corgiW.style.display = (mode === 'cat') ? 'none' : 'block';
   catW.style.display = (mode === 'corgi') ? 'none' : 'block';
-  if (mode === 'corgi') setPetCompanionMood('NHK 3D #1 đang trực chiến tốc độ 0ms!');
-  else if (mode === 'cat') setPetCompanionMood('NHK 3D #2 đang canh giữ kết nối VN & SG 24/7!');
-  else setPetCompanionMood('NHK 3D Core đang canh giữ phiên 24/7!');
+  if (mode === 'corgi') setPetCompanionMood('NHK 3D #1 đang trực chiến tốc độ độ trễ thấp!');
+  else if (mode === 'cat') setPetCompanionMood('Đang kiểm tra kết nối VN/SG.');
+  else setPetCompanionMood('Đang kiểm tra phiên đăng nhập.');
 }
 
 function triggerPetReaction(whichPet) {
   setPetTurboMode(true);
   setTimeout(() => setPetTurboMode(false), 1200);
   if (whichPet === 'corgi') {
-    setPetCompanionMood('NHK 3D Core đã sẵn sàng chạy đa Box 0s & giữ sống Zalo PC!');
-    showToast('NHK 3D Turbo 0ms đã kích hoạt!');
+    setPetCompanionMood('NHK 3D Core đã sẵn sàng chạy đa Box độ trễ thấp & giữ sống Zalo PC!');
+    showToast('NHK 3D Turbo độ trễ thấp đã kích hoạt!');
   } else {
     setPetCompanionMood('Đã kiểm tra định tuyến Việt Nam & Singapore an toàn 100%!');
     showToast('NHK 3D Core đang hoạt động ổn định 100%!');
@@ -15389,7 +15349,7 @@ function importBulk500BoxIds() {
   renderTargetList();
   updateTargetBadges();
   closeBulk500BoxModal();
-  showToast(`Đã nạp và chọn ${added} Box để chạy vòng lặp siêu tốc!`);
+  showToast(`Đã nạp và chọn ${added} Box để chạy vòng lặp !`);
 }
 
 function isCurrentTabLeader() {
@@ -15725,9 +15685,9 @@ async function pollZaloQRStatus() {
       document.getElementById('zaloCookieInput').value = d.cookies_str || '';
       document.getElementById('zaloQRExtractedImei').textContent = (d.imei || '').slice(0, 24) + '...';
       extBox.style.display = 'block';
-      setPetCompanionMood(`Tuyệt vời! Thiết bị ${d.pc_name} đã sống cố định 24/7 trong tài khoản ${d.display_name}!`);
+      setPetCompanionMood(`Đã đăng nhập thiết bị ${d.pc_name} cho tài khoản ${d.display_name}.`);
       loadZaloVaultRecords();
-      showToast('Đã đăng nhập & ghim máy tính sống 24/7 trong tài khoản Zalo!');
+      showToast('Đã đăng nhập thiết bị Zalo.');
       setTimeout(() => location.reload(), 1200);
     } else if (d.status === 'expired' || d.status === 'declined' || d.status === 'error') {
       clearInterval(ZALO_QR_POLL_TIMER);
@@ -15849,7 +15809,7 @@ async function testSingleAccountSession(accId, btnEl) {
 }
 
 async function reconnectAllListenersNow(btnEl) {
-  await withPetButtonLoading(btnEl, 'Đang đồng bộ 24/7...', async () => {
+  await withPetButtonLoading(btnEl, 'Đang đồng bộ...', async () => {
     try {
       const r = await fetch('/api/account/reconnect_all', {method: 'POST'});
       const d = await r.json();
@@ -16633,7 +16593,7 @@ async function launchCampaignTask(btnEl) {
     switchMainTab('tab-targets', document.querySelector('[data-tab="tab-targets"]'));
     return;
   }
-  await withPetButtonLoading(btnEl, 'Đang phóng 96 Shards 0s...', async () => {
+  await withPetButtonLoading(btnEl, 'Đang đồng bộ kết nối...', async () => {
     const selectedAccIds = Array.from(document.querySelectorAll('.camp-acc-chk:checked')).map(el => parseInt(el.value, 10)).filter(n => !isNaN(n));
     const batchCount = Math.max(1, Math.min(100, parseInt(document.getElementById('cfgBatchCount').value || '1', 10)));
     const payload = {
@@ -16661,7 +16621,7 @@ async function launchCampaignTask(btnEl) {
       const r = await fetch('/task/start', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
       const d = await r.json();
       if (d.ok) {
-        setPetCompanionMood(`NHK 3D đang chạy ${d.batch_count || 1} luồng trên ${targets.length} Box siêu tốc 0s!`);
+        setPetCompanionMood(`NHK 3D đang chạy ${d.batch_count || 1} luồng trên ${targets.length} Box  độ trễ thấp!`);
         showToast(`Đã khởi chạy ${d.batch_count || 1} luồng trên ${targets.length} Box!`);
         if (MULTI_TAB_BUS) MULTI_TAB_BUS.postMessage({type: 'FORCE_REFRESH'});
         pollSystemStatus(true);
@@ -16677,7 +16637,7 @@ function applyOptimisticStopUI(targetTid = null) {
     document.getElementById('kpiRunningTasks').textContent = '0';
     setDockBadgeCount('dockTaskBadge', 0);
     setPetTurboMode(false);
-    setPetCompanionMood('Đã dừng toàn bộ chiến dịch trong 0ms!');
+    setPetCompanionMood('Đã dừng toàn bộ chiến dịch trong độ trễ thấp!');
     const stateBadge = document.getElementById('liveHangStateBadge');
     if (stateBadge) {
       stateBadge.textContent = 'SẴN SÀNG';
@@ -16914,7 +16874,7 @@ function updateProxyBadgeUI(snap) {
   const fastTxt = snap.fastest_ms && snap.fastest_ms > 0 ? ` • Top: ${snap.fastest_ms}ms` : '';
   const txt = (snap.total > 0 && snap.enabled)
     ? `PRX AUTO-ON: ${snap.healthy}/${snap.total} Khỏe${fastTxt} • ${snap.routed_ok} gói`
-    : 'Direct Keep-Alive (0ms)';
+    : 'Direct Keep-Alive (độ trễ thấp)';
   const cls = (snap.total > 0 && snap.enabled) ? 'badge badge-green' : 'badge badge-blue';
   if (badge) { badge.textContent = txt; badge.className = cls; }
   if (cBadge) { cBadge.textContent = txt; cBadge.className = cls; }
@@ -17141,11 +17101,12 @@ def api_network_gateways():
 
 @app.context_processor
 def inject_nhk_3d_and_pets():
-    """Tự động bơm đồ họa 3D NHK & SVG vào mọi trang HTML (/login, /, errorhandler) để 100% luôn xuất hiện!"""
+    """Expose presentation assets and the per-session CSRF token to templates."""
     return {
         "corgi_svg": TelegramPetAnimationEngine.get_corgi_svg(),
         "cat_svg": TelegramPetAnimationEngine.get_cat_svg(),
         "nhk_3d_svg": TelegramPetAnimationEngine.get_nhk_3d_emblem_svg(),
+        "csrf_token": get_or_create_csrf_token(),
     }
 
 
@@ -17197,8 +17158,9 @@ def api_upload_proxies_file():
 
 @app.errorhandler(Exception)
 def handle_unexpected_error(e):
+    app.logger.exception("Unhandled application error on %s", request.path)
     if request.path.startswith("/api/") or request.path.startswith("/task/"):
-        return jsonify({"ok": False, "error": str(e)}), 200
+        return jsonify({"ok": False, "error": "Có lỗi khi xử lý yêu cầu. Vui lòng thử lại."}), 500
     try:
         has_logo = bool(get_setting("brand_logo_b64", "") or get_setting("brand_logo_url", ""))
         logo_ts = get_setting("brand_logo_ts", "1")
@@ -17219,6 +17181,7 @@ def handle_unexpected_error(e):
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
+    get_or_create_csrf_token()
     ip = get_client_ip()
     allowed, wait_s = check_ip_bruteforce(ip)
     has_logo = bool(get_setting("brand_logo_b64", "") or get_setting("brand_logo_url", ""))
@@ -17238,22 +17201,28 @@ def login():
     if request.method == "POST":
         pw = (request.form.get("password") or "").strip()
         is_valid = False
-        if pw and (pw == ACCESS_KEY or pw == DEFAULT_ADMIN_PASS):
-            is_valid = True
-        else:
+        try:
+            conn = db()
+            row = conn.execute("SELECT id, password FROM users WHERE username=?", (DEFAULT_ADMIN_USER,)).fetchone()
+            if row and verify_password_secure(row["password"], pw):
+                is_valid = True
+                # Upgrade a legacy password hash after a successful login.
+                if not str(row["password"]).startswith("pbkdf2v2$"):
+                    conn.execute("UPDATE users SET password=? WHERE id=?", (hash_password_secure(pw), row["id"]))
+                    conn.commit()
+            conn.close()
+        except Exception:
             try:
-                conn = db()
-                row = conn.execute("SELECT password FROM users WHERE username=?", (DEFAULT_ADMIN_USER,)).fetchone()
                 conn.close()
-                if row and verify_password_secure(row["password"], pw):
-                    is_valid = True
             except Exception:
                 pass
 
         if is_valid:
             record_login_result(ip, True)
+            session.clear()
             session.permanent = True
             session["logged_in"] = True
+            session["csrf_token"] = secrets.token_hex(32)
             return redirect("/")
 
         record_login_result(ip, False)
@@ -17273,6 +17242,32 @@ def login():
 def logout():
     session.clear()
     return redirect("/login")
+
+
+@app.route("/api/security/change-password", methods=["POST"])
+def api_change_admin_password():
+    payload = request.get_json(silent=True) or request.form
+    current_password = str(payload.get("current_password") or "")
+    new_password = str(payload.get("new_password") or "")
+    confirm_password = str(payload.get("confirm_password") or "")
+
+    if len(new_password) < 14:
+        return jsonify({"ok": False, "error": "Mật khẩu mới cần ít nhất 14 ký tự."}), 400
+    if new_password != confirm_password:
+        return jsonify({"ok": False, "error": "Mật khẩu xác nhận không khớp."}), 400
+    if hmac.compare_digest(current_password, new_password):
+        return jsonify({"ok": False, "error": "Mật khẩu mới phải khác mật khẩu hiện tại."}), 400
+
+    conn = db()
+    try:
+        row = conn.execute("SELECT id, password FROM users WHERE username=?", (DEFAULT_ADMIN_USER,)).fetchone()
+        if not row or not verify_password_secure(row["password"], current_password):
+            return jsonify({"ok": False, "error": "Mật khẩu hiện tại không đúng."}), 403
+        conn.execute("UPDATE users SET password=? WHERE id=?", (hash_password_secure(new_password), row["id"]))
+        conn.commit()
+        return jsonify({"ok": True, "message": "Đã đổi mật khẩu quản trị."})
+    finally:
+        conn.close()
 
 
 @app.route("/api/menu_banner.png")
@@ -17957,7 +17952,7 @@ def account_add():
     sync_all_zalo_listeners()
     return redirect("/")
 
-@app.route("/account/delete/<int:acc_id>")
+@app.route("/account/delete/<int:acc_id>", methods=["POST"])
 def account_delete(acc_id):
     if acc_id in ACTIVE_LISTENERS:
         ACTIVE_LISTENERS[acc_id].stop()
@@ -18211,7 +18206,7 @@ def file_create():
     conn.close()
     return redirect("/")
 
-@app.route("/file/delete/<int:fid>")
+@app.route("/file/delete/<int:fid>", methods=["POST"])
 def file_delete(fid):
     conn = db()
     row = conn.execute("SELECT filepath FROM files WHERE id=?", (fid,)).fetchone()
@@ -18661,7 +18656,7 @@ def ensure_telegram_bot_started():
     except Exception:
         pass
 
-if os.environ.get("DISABLE_TELEGRAM_BOT", "0") != "1":
+if TELEGRAM_BOT_TOKEN and os.environ.get("DISABLE_TELEGRAM_BOT", "0") != "1":
     threading.Thread(target=ensure_telegram_bot_started, daemon=True).start()
 
 if __name__ == "__main__":
