@@ -13,6 +13,7 @@ except ImportError:
     sys.modules["zalo_login"] = _zl_mod
 
 import os
+import gc
 import re
 import ssl
 import zlib
@@ -278,7 +279,7 @@ def _create_raw_sqlite_conn():
         raw.execute("PRAGMA synchronous=NORMAL;")
         raw.execute("PRAGMA temp_store=MEMORY;")
         raw.execute("PRAGMA busy_timeout=15000;")
-        raw.execute("PRAGMA cache_size=-32000;")
+        raw.execute("PRAGMA cache_size=-8000;")
         return raw
     except sqlite3.OperationalError:
         import tempfile
@@ -828,8 +829,8 @@ SYSTEM_RUNTIME_CONFIG = {
     "color_mode": "rainbow",
     "fixed_color": "red",
     "font_style": "big_bold",
-    "icon_count": 3,
-    "use_emoji": True,
+    "icon_count": 0,
+    "use_emoji": False,
     "is_heading": True,
     "antiband": True,
     "antidieall": True,
@@ -1223,18 +1224,10 @@ BROKEN_COLON_DASH_RE = re.compile(
 )
 
 def get_icon_hard(prev_icons=None):
-    pool = [ic for ic in ZALO_ICON_VIP if not prev_icons or ic not in prev_icons]
-    if not pool:
-        pool = ZALO_ICON_VIP
-    return random.choice(pool)
+    return ""
 
 def build_unique_zalo_icons(count):
-    if count <= 0:
-        return ""
-    chosen = []
-    for _ in range(count):
-        chosen.append(get_icon_hard(chosen[-2:]))
-    return " ".join(chosen)
+    return "" 
 
 def clean_corrupted_shortcuts(text):
     if not text:
@@ -1250,8 +1243,8 @@ def clean_corrupted_shortcuts(text):
             return LEGACY_SHORTCUT_TO_ICON_MAP[token.lower()]
         return get_icon_hard()
 
-    text = BROKEN_COLON_DASH_RE.sub(_replace_broken, text)
-    text = re.sub(r"(?<!\S)[:;]\-[A-Za-z0-9\*\?\!]*", lambda _: get_icon_hard(), text)
+    text = BROKEN_COLON_DASH_RE.sub("", text)
+    text = re.sub(r"(?<!\S)[:;]\-[A-Za-z0-9\*\?\!]*", "", text)
     return text
 
 def _is_emoji_or_zalo_shortcut_token(tk):
@@ -1537,22 +1530,6 @@ class WaveFairnessEngine:
 
     @classmethod
     def get_fair_pacing_pause(cls, task_key, acc_id, base_delay=0.0):
-        # Đã là Delay 0s thì bắn tốc độ tối đa không giữ nhịp chờ bất cứ tài khoản nào!
-        if float(base_delay or 0.0) <= 0.0:
-            return 0.0
-        d = cls._TASK_ACC_COUNTS.get(task_key)
-        if not d or len(d) <= 1:
-            return 0.0
-        now = time.time()
-        ts_map = cls._TASK_ACC_LAST_TS.get(task_key) or {}
-        active_vals = [cnt for aid_k, cnt in d.items() if (now - ts_map.get(aid_k, 0.0)) < 4.5]
-        if len(active_vals) <= 1:
-            return 0.0
-        my_cnt = d.get(int(acc_id), 0)
-        avg_cnt = sum(active_vals) / len(active_vals)
-        diff = my_cnt - avg_cnt
-        if diff >= 4:
-            return min(0.025, 0.006 * (diff - 2))
         return 0.0
 
 
@@ -1813,18 +1790,83 @@ class ProxyPoolEngine:
             cls._BAD_PROXIES[proxy_url] = time.time() + float(cooldown_sec)
             cls._rebuild_healthy_snapshot_unlocked()
 
+    PUBLIC_PROXY_FEEDS = (
+        "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=1500&country=SG,VN,HK,JP,TW&ssl=all&anonymity=all",
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    )
+    _AUTO_HARVEST_STARTED = False
+
+    @classmethod
+    def start_auto_proxy_harvester_background(cls):
+        with cls._LOCK:
+            if cls._AUTO_HARVEST_STARTED:
+                return
+            cls._AUTO_HARVEST_STARTED = True
+
+        def _harvest_loop():
+            time.sleep(2.5)
+            while True:
+                try:
+                    cls._ensure_loaded()
+                    if len(cls._HEALTHY_TUPLE) < 8:
+                        raw_candidates = []
+                        sess_h = requests.Session()
+                        for feed_u in cls.PUBLIC_PROXY_FEEDS:
+                            try:
+                                r_f = sess_h.get(feed_u, timeout=4.0)
+                                if r_f.status_code == 200 and r_f.text:
+                                    extracted = cls.extract_proxies_from_any_text(r_f.text)
+                                    raw_candidates.extend(extracted[:35])
+                            except Exception:
+                                pass
+                        if raw_candidates:
+                            unique_cands = list(dict.fromkeys(raw_candidates))[:48]
+                            fast_verified = []
+                            def _quick_probe(p_u):
+                                t0 = time.perf_counter()
+                                try:
+                                    px_s = cls._get_or_create_proxy_session(p_u)
+                                    r_p = px_s.get("https://discord.com/api/v9/experiments", timeout=(0.85, 1.15))
+                                    if r_p.status_code in (200, 401, 403, 429):
+                                        ms = round((time.perf_counter() - t0) * 1000.0, 1)
+                                        if ms <= 280.0:
+                                            return p_u, ms
+                                except Exception:
+                                    pass
+                                return None, 9999.0
+                            with ThreadPoolExecutor(max_workers=16) as hp:
+                                for pu_ok, ms_ok in hp.map(_quick_probe, unique_cands):
+                                    if pu_ok:
+                                        fast_verified.append((pu_ok, ms_ok))
+                            if fast_verified:
+                                with cls._LOCK:
+                                    ex_set = set(cls._PROXIES)
+                                    for pu_ok, ms_ok in fast_verified:
+                                        if pu_ok not in ex_set and len(cls._PROXIES) < 64:
+                                            cls._PROXIES.append(pu_ok)
+                                            ex_set.add(pu_ok)
+                                        cls._PROXY_LATENCY_MS[pu_ok] = ms_ok
+                                    cls._rebuild_healthy_snapshot_unlocked()
+                except Exception:
+                    pass
+                time.sleep(300.0)
+
+        threading.Thread(target=_harvest_loop, daemon=True).start()
+
     @classmethod
     def request_with_fast_failover(cls, session_obj, method, url, seed_key=None, priority_bypass=False, **kwargs):
-        if priority_bypass or not cls._PROXIES or not cls._ENABLED:
-            if "timeout" not in kwargs:
-                kwargs["timeout"] = (0.75, 1.65) if priority_bypass else (0.75, 1.45)
-            try:
-                resp_dir = session_obj.request(method, url, **kwargs)
-                if resp_dir.status_code != 429 or not cls._PROXIES or not cls._ENABLED:
-                    return resp_dir
-            except Exception:
-                if not cls._PROXIES or not cls._ENABLED:
-                    raise
+        # Ưu tiên số 1: Luồng Direct Multi-Edge Keep-Alive (0ms độ trễ trên cáp quang Singapore)
+        # Chỉ dùng Proxy siêu tốc (< 280ms) để phân tải tức thì khi cổng Direct báo 429 hoặc nghẽn!
+        if "timeout" not in kwargs:
+            kwargs["timeout"] = (0.65, 1.45) if priority_bypass else (0.75, 1.55)
+        try:
+            resp_dir = session_obj.request(method, url, **kwargs)
+            if resp_dir.status_code != 429 or not cls._PROXIES or not cls._ENABLED:
+                return resp_dir
+        except Exception:
+            if not cls._PROXIES or not cls._ENABLED:
+                raise
 
         cands = (
             cls.pick_fastest_proxy_candidates(seed_key=seed_key, max_candidates=1)
@@ -3414,15 +3456,10 @@ class Zalo:
             except Exception:
                 pass
         elif self.secret_key:
-            # Đã có sẵn khóa zpw_enk bất tử trong Vault/DB -> Giữ phiên sống 100% không bao giờ báo die!
             if not self.display_name:
-                self.display_name = f"Zalo_{self.uid[-4:]}" if self.uid else "Zalo PC"
-        elif self.cookies_dict.get("zpw_sek") or self.cookies_dict.get("zpsid"):
-            self.secret_key = self.secret_key or base64.b64encode(hashlib.sha256(f"zpw_enk_{self.imei}".encode("utf-8")).digest()[:16]).decode("utf-8")
-            self.uid = self.uid or f"vn_{zlib.crc32(self.imei.encode('utf-8')) & 0xFFFFFFFF}"
-            self.display_name = self.display_name or f"Zalo_{self.uid[-4:]}"
+                self.display_name = f"Zalo_{self.uid[-4:]}" if self.uid else "Zalo SG"
         else:
-            raise Exception(f"Phiên đăng nhập Zalo hết hạn hoặc Cookie/IMEI không khớp ({last_err or 'No zpw_enk'})")
+            raise Exception(f"DIE — Thiết bị máy tính đã đăng xuất khỏi tài khoản Zalo hoặc Cookie/IMEI đã hết hạn ({last_err or 'No zpw_enk'})")
 
         if self.uid:
             OWNER_UIDS_CACHE.add(self.uid)
@@ -5269,19 +5306,17 @@ class ZaloWebIDGenerator:
     - Đồng bộ tuyệt đối User-Agent và Sec-Ch-Ua (tự động lược bỏ Sec-Ch-Ua trên Firefox/Safari để id.zalo.me nhận diện đúng máy tính)."""
 
     @classmethod
-    def create_random_pc_device(cls, seed_salt="", region_code="VN", custom_pc_name=""):
+    def create_random_pc_device(cls, seed_salt="", region_code="SG", custom_pc_name=""):
         try:
             from zalo_login import build_vietnam_pc_identity
             return build_vietnam_pc_identity(
-                region_code=region_code, vn_region=region_code,
+                region_code="SG", vn_region="SG",
                 custom_pc_name=custom_pc_name, seed_salt=seed_salt
             )
         except Exception:
             rnd_tag = secrets.token_hex(2).upper()
-            is_sg = "SG" in str(region_code or "").upper()
-            pc_label = custom_pc_name.strip() if custom_pc_name else (
-                f"MACBOOK-PRO-SG-{rnd_tag} (macOS Sonoma SG)" if is_sg else f"ROG-ZEPHYRUS-HCM-{rnd_tag} (Windows 11 Pro VN)"
-            )
+            is_sg = True
+            pc_label = custom_pc_name.strip() if custom_pc_name else f"WORKSTATION-WIN11-SG-{rnd_tag} (Windows 11 Pro SG)" 
             ua = (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
                 if is_sg else
@@ -5878,8 +5913,8 @@ class ZaloQRLoginManager:
         pc_name = st.get("pc_name", "ASUS ROG Zephyrus G16 (Windows 11 Pro VN)")
         comp_name = st.get("computer_name") or "Web"
 
-        continue_url = "https://zalo.me/pc"
-        login_referer = "https://id.zalo.me/account?continue=https%3A%2F%2Fzalo.me%2Fpc"
+        continue_url = "https://chat.zalo.me/"
+        login_referer = "https://id.zalo.me/account?continue=https%3A%2F%2Fchat.zalo.me%2F"
         v_str = "2.3.10"
         qr_b64_raw = ""
         qr_code_id = ""
@@ -8673,8 +8708,8 @@ def box_target_worker(client, acc_id, plat, target, blocks, runtime_opts,
         antiband = bool(runtime_opts.get("antiband", True))
         antidieall = bool(runtime_opts.get("antidieall", True))
         delay = float(runtime_opts.get("delay", 0.0))
-        use_emoji = bool(runtime_opts.get("use_emoji", True))
-        icon_count = int(runtime_opts.get("icon_count", 3))
+        use_emoji = False
+        icon_count = 0
         is_heading = bool(runtime_opts.get("is_heading", True))
         mode = runtime_opts.get("mode", "fast")
         color_mode = runtime_opts.get("color_mode", "rainbow")
@@ -8737,8 +8772,6 @@ def box_target_worker(client, acc_id, plat, target, blocks, runtime_opts,
             if mode in ("raid_burst", "sieu_xa_nhieu_nhom"):
                 color_mode = "word_rainbow"
                 is_heading = True
-                if use_emoji and icon_count > 0:
-                    icon_count = max(icon_count, 4)
 
             if mode == "combo_lien_thanh" and len(blocks) >= 2:
                 c1 = strip_leading_line_number(blocks[(b_idx - 1) % len(blocks)])
@@ -9010,8 +9043,8 @@ def multi_box_shard_worker(client, acc_id, plat, shard_targets, blocks, runtime_
 
         antiband = bool(runtime_opts.get("antiband", True))
         delay = float(runtime_opts.get("delay", 0.0))
-        use_emoji = bool(runtime_opts.get("use_emoji", True))
-        icon_count = int(runtime_opts.get("icon_count", 3))
+        use_emoji = False
+        icon_count = 0
         is_heading = bool(runtime_opts.get("is_heading", True))
         mode = runtime_opts.get("mode", "fast")
         color_mode = runtime_opts.get("color_mode", "rainbow")
@@ -9026,8 +9059,6 @@ def multi_box_shard_worker(client, acc_id, plat, shard_targets, blocks, runtime_
         if mode in ("raid_burst", "sieu_xa_nhieu_nhom"):
             color_mode = "word_rainbow"
             is_heading = True
-            if use_emoji and icon_count > 0:
-                icon_count = max(icon_count, 4)
 
         fired_in_pass = 0
         for t in valid_targets:
@@ -9226,7 +9257,7 @@ def single_acc_multi_box_dispatcher(acc_dict, targets, blocks, runtime_opts, sto
     box_threads = []
     total_boxes = max(1, len(my_targets))
     cur_d_cfg = float(runtime_opts.get("delay", 0.0) or 0.0)
-    stagger_base = 0.0 if cur_d_cfg <= 0.05 else min(0.06, acc_idx * 0.01)
+    stagger_base = 0.0
 
     # Khi Delay == 0.0s (Siêu tốc không độ trễ): tự động nhân luồng song song cho từng Box
     # để dù gửi 1 box hay 200 box đồng loạt vẫn bắn song song tức thì không bao giờ phải chờ RTT của box trước!
@@ -9339,7 +9370,7 @@ def task_supervisor(tid, targets, blocks, runtime_opts, multi_acc, stop_ev, spec
             TASKS_RAM_STORE[tid]["dirty"] = True
     ACTIVE_TASKS.pop(tid, None)
 
-def start_task_programmatic(targets, blocks, delay=0.0, use_emoji=True, icon_count=3,
+def start_task_programmatic(targets, blocks, delay=0.0, use_emoji=False, icon_count=0,
                             tag_users=None, tag_all=False, is_heading=True, multi_acc=True,
                             mode="fast", color_mode="rainbow", fixed_color="red",
                             antiband=True, antidieall=True, specific_acc_id=None, source_label="web",
@@ -10838,8 +10869,6 @@ def parse_and_execute_inchat_command(
         delay_val = 0.0
         color_mode = "word_rainbow"
         is_heading = True
-        if use_emoji and icon_count > 0:
-            icon_count = max(icon_count, 4)
     elif chosen_mode == "auto_shuffle":
         chosen_mode = "treo_nhay"
     elif chosen_mode == "chao_mode":
@@ -12428,6 +12457,15 @@ def _init_ram_stores_from_db():
 
 def _listener_watchdog_loop():
     _init_ram_stores_from_db()
+    try:
+        ProxyPoolEngine.start_auto_proxy_harvester_background()
+    except Exception:
+        pass
+    try:
+        from zalo_login import ZaloPCSessionKeeper
+        ZaloPCSessionKeeper.ensure_vault_daemon_started(DB_PATH)
+    except Exception:
+        pass
     time.sleep(0.5)
     step_c = 0
     while True:
@@ -12436,6 +12474,18 @@ def _listener_watchdog_loop():
             _sync_epochs_from_db_background()
             if step_c % 2 == 0:
                 sync_all_zalo_listeners()
+            if step_c % 12 == 0:
+                try:
+                    from zalo_login import ZaloPCSessionKeeper
+                    ZaloPCSessionKeeper.restore_all_from_db(DB_PATH)
+                except Exception:
+                    pass
+                # Giải phóng bộ nhớ định kỳ giúp Render Free (512MB RAM) chạy 50+ Acc mượt mà không tốn GB
+                if len( DiscordClient._DISCORD_MSG_FORMAT_CACHE ) > 1200:
+                    DiscordClient._DISCORD_MSG_FORMAT_CACHE.clear()
+                if len( Zalo._ZALO_ADV_FORMAT_CACHE ) > 1200:
+                    Zalo._ZALO_ADV_FORMAT_CACHE.clear()
+                gc.collect()
             step_c += 1
         except Exception:
             pass
@@ -13838,14 +13888,14 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
 
                   <div class="row-2" style="text-align:left;margin-bottom:8px">
                     <div>
-                      <label class="field-lbl">Quốc gia &amp; Dàn máy tính luân phiên</label>
+                      <label class="field-lbl">Địa điểm cố định Singapore &amp; Dòng máy tính luân phiên</label>
                       <select class="sel" id="zaloVnRegionSelect">
-                        <option value="VN">Việt Nam — Xoay vòng 11 dòng máy PC/Mac</option>
-                        <option value="SG">Singapore — Xoay vòng 5 dòng máy PC/Mac</option>
-                        <option value="HCM">TP. Hồ Chí Minh — MacBook / ROG / Dell XPS</option>
-                        <option value="HN">Hà Nội — ROG Strix / ThinkPad / MacBook Air</option>
-                        <option value="DN">Đà Nẵng — MSI Titan / Mac Studio / HP Spectre</option>
-                        <option value="MAC">Apple macOS — MacBook Pro / Air / iMac / Studio</option>
+                        <option value="SG">🇸🇬 Singapore — Tự động xoay vòng 12 dòng máy PC/Mac</option>
+                        <option value="SG_VIP">🇸🇬 Singapore — Windows 11 Pro Workstation</option>
+                        <option value="SG_MAC">🇸🇬 Singapore — MacBook Pro 16 M3 Max / MacBook Air</option>
+                        <option value="SG_DELL">🇸🇬 Singapore — Dell Precision 5680 Workstation</option>
+                        <option value="SG_THINKPAD">🇸🇬 Singapore — ThinkPad Z16 Gen 2 Enterprise</option>
+                        <option value="SG_ASUS">🇸🇬 Singapore — ASUS ROG Zephyrus / ProArt OLED</option>
                       </select>
                     </div>
                     <div>
@@ -14063,9 +14113,12 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
               <span>Danh Sách Tài Khoản ({{ accounts|length }})</span>
             </span>
-            <div style="display:flex;gap:6px;flex-wrap:wrap">
-              <button class="btn btn-sm" type="button" onclick="reconnectAllListenersNow(this)">Làm mới phiên 24/7</button>
-              <button class="btn btn-primary btn-sm" type="button" onclick="openPerAccBoxSelector(null)">Chọn Phòng Chat</button>
+            <div style="display:flex;gap:4px;flex-wrap:wrap">
+              <button class="btn btn-success btn-sm" type="button" onclick="bulkSetAccountCmdPermission('enable_all', this)">✅ Bật Lệnh Tất Cả Acc</button>
+              <button class="btn btn-danger btn-sm" type="button" onclick="bulkSetAccountCmdPermission('disable_all', this)">🚫 Tắt Lệnh Tất Cả</button>
+              <button class="btn btn-sm" type="button" onclick="bulkSetAccountCmdPermission('allow_all_on', this)">🔓 Cho Nhóm Dùng Lệnh</button>
+              <button class="btn btn-primary btn-sm" type="button" onclick="checkAllAccountsLiveStatus(this)">🔍 Check Sống/Die Tất Cả</button>
+              <button class="btn btn-sm" type="button" onclick="reconnectAllListenersNow(this)">Làm mới 24/7</button>
             </div>
           </div>
           <div class="panel-body" style="padding:0">
@@ -14105,14 +14158,19 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
                           <button class="btn btn-primary btn-sm" type="button" onclick="openPerAccBoxSelector('{{ a.id }}')">Chọn Box</button>
                         </td>
                         <td>
-                          <span class="badge {{ 'badge-green' if a.chat_cmd_enabled else 'badge-gray' }}">
-                            {{ 'BẬT' if a.chat_cmd_enabled else 'TẮT' }}
-                          </span>
+                          <div style="display:flex;flex-direction:column;gap:4px;align-items:flex-start">
+                            <button type="button" id="btnAccCmd_{{ a.id }}" data-enabled="{{ 1 if a.chat_cmd_enabled else 0 }}" class="btn btn-sm {{ 'btn-success' if a.chat_cmd_enabled else '' }}" onclick="toggleAccCmdInstant({{ a.id }}, this)">
+                              {{ '🟢 Cho Phép Dùng Lệnh' if a.chat_cmd_enabled else '⚪ Đang Tắt Lệnh' }}
+                            </button>
+                            <button type="button" id="btnAccAllowAll_{{ a.id }}" data-allow="{{ 1 if a.allow_all_cmd else 0 }}" class="btn btn-sm" style="font-size:10.5px;padding:3px 8px" onclick="toggleAccAllowAllInstant({{ a.id }}, this)">
+                              {{ '👥 Mọi Người Dùng Lệnh' if a.allow_all_cmd else '🔒 Chỉ Chủ Acc & .cp' }}
+                            </button>
+                          </div>
                         </td>
                         <td>
-                          <div style="display:flex;gap:4px">
-                            <button class="btn btn-sm" type="button" onclick="testSingleAccountSession({{ a.id }}, this)">Kiểm tra</button>
-                            <button class="btn btn-sm" type="button" onclick="toggleAccCmd({{ a.id }}, {{ 0 if a.chat_cmd_enabled else 1 }})">{{ 'Tắt' if a.chat_cmd_enabled else 'Bật' }}</button>
+                          <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center">
+                            <span id="accLiveBadge_{{ a.id }}" class="badge badge-green">Sống 24/7</span>
+                            <button class="btn btn-sm" type="button" onclick="testSingleAccountSession({{ a.id }}, this)">🔍 Check Sống/Die</button>
                             <a href="/account/delete/{{ a.id }}" class="btn btn-danger btn-sm">Xóa</a>
                           </div>
                         </td>
@@ -14138,10 +14196,18 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
               <span>Danh Sách Phòng Chat &amp; 500 Box Tuần Hoàn</span>
             </span>
-            <div style="display:flex;gap:4px;flex-wrap:wrap">
+            <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center">
               <button class="btn btn-primary btn-sm" type="button" onclick="loadGroupsAndRooms(true, this)">Quét Toàn Bộ</button>
-              <button class="btn btn-success btn-sm" type="button" onclick="selectTopNTargets(500)">Chọn 500 Box</button>
-              <button class="btn btn-sm" type="button" onclick="openBulk500BoxModal()">+ Nạp 500 ID</button>
+              <button class="btn btn-sm" type="button" onclick="selectTopNTargets(1)">1 Box</button>
+              <button class="btn btn-sm" type="button" onclick="selectTopNTargets(5)">5 Box</button>
+              <button class="btn btn-sm" type="button" onclick="selectTopNTargets(10)">10 Box</button>
+              <button class="btn btn-sm" type="button" onclick="selectTopNTargets(20)">20 Box</button>
+              <button class="btn btn-sm" type="button" onclick="selectTopNTargets(50)">50 Box</button>
+              <button class="btn btn-sm" type="button" onclick="selectTopNTargets(100)">100 Box</button>
+              <button class="btn btn-success btn-sm" type="button" onclick="selectTopNTargets(500)">500 Box</button>
+              <input class="inp" type="number" min="1" max="2000" id="customBoxCountTab2" placeholder="Số Box..." style="width:78px;padding:4px 7px;font-size:11.5px">
+              <button class="btn btn-primary btn-sm" type="button" onclick="selectCustomNBoxes('customBoxCountTab2')">Chọn N Box</button>
+              <button class="btn btn-sm" type="button" onclick="openBulk500BoxModal()">+ Dán ID</button>
               <button class="btn btn-sm" type="button" onclick="selectAllTargets()">Chọn Hết</button>
               <button class="btn btn-sm" type="button" onclick="clearAllTargets()">Bỏ Chọn</button>
             </div>
@@ -14232,21 +14298,38 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
           <div class="panel-body">
             <div style="margin-bottom:10px;padding:10px;background:var(--surface-sub);border:1px solid var(--border);border-radius:12px">
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:4px">
-                <label class="field-lbl" style="margin:0">Tài khoản tham gia ({{ accounts|length }}):</label>
-                <div style="display:flex;gap:4px">
+                <label class="field-lbl" style="margin:0;color:var(--tg-cyan)">Tài khoản tham gia (<span id="selectedCampAccCountLabel">{{ accounts|length }}</span> / {{ accounts|length }} Acc):</label>
+                <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center">
+                  <button type="button" class="btn btn-sm" onclick="selectTopNCampaignAccs(1)">1 Acc</button>
+                  <button type="button" class="btn btn-sm" onclick="selectTopNCampaignAccs(5)">5 Acc</button>
+                  <button type="button" class="btn btn-sm" onclick="selectTopNCampaignAccs(10)">10 Acc</button>
+                  <button type="button" class="btn btn-sm" onclick="selectTopNCampaignAccs(20)">20 Acc</button>
+                  <button type="button" class="btn btn-sm" onclick="selectTopNCampaignAccs(50)">50 Acc</button>
+                  <input class="inp" type="number" min="1" max="500" id="customAccCountInput" placeholder="Số Acc..." style="width:74px;padding:4px 7px;font-size:11.5px">
+                  <button type="button" class="btn btn-primary btn-sm" onclick="selectCustomNCampaignAccs()">Chọn N Acc</button>
                   <button type="button" class="btn btn-sm" onclick="toggleSelectAllCampaignAccs(true)">Chọn hết</button>
                   <button type="button" class="btn btn-sm" onclick="toggleSelectAllCampaignAccs(false)">Bỏ chọn</button>
                 </div>
               </div>
-              <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px;max-height:110px;overflow-y:auto">
+              <div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px">
+                <button type="button" class="btn btn-success btn-sm" onclick="enableSelectedAccountsCmdOnly(this)">🎯 Cho Phép Các Acc Đang Chọn Sử Dụng Lệnh</button>
+                <button type="button" class="btn btn-sm" onclick="bulkSetAccountCmdPermission('enable_all', this)">✅ Bật Lệnh Tất Cả Acc</button>
+                <button type="button" class="btn btn-danger btn-sm" onclick="bulkSetAccountCmdPermission('disable_all', this)">🚫 Tắt Lệnh Tất Cả Acc</button>
+              </div>
+              <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px;max-height:135px;overflow-y:auto">
                 {% if not accounts %}
                   <div style="font-size:11.5px;color:var(--txt-muted)">Chưa có tài khoản kết nối.</div>
                 {% endif %}
                 {% for a in accounts %}
-                  <label class="chk-label" style="background:var(--surface);padding:5px 8px">
-                    <input type="checkbox" class="camp-acc-chk" value="{{ a.id }}" checked>
-                    <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">[{{ (a.platform or 'zalo')|upper }}] {{ a.name }}</span>
-                  </label>
+                  <div class="chk-label" style="background:var(--surface);padding:5px 8px;justify-content:space-between">
+                    <label style="display:flex;align-items:center;gap:6px;cursor:pointer;min-width:0;flex:1">
+                      <input type="checkbox" class="camp-acc-chk" value="{{ a.id }}" checked onchange="updateSelectedCampAccCount()">
+                      <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">[{{ (a.platform or 'zalo')|upper }}] {{ a.name }}</span>
+                    </label>
+                    <button type="button" id="campBtnAccCmd_{{ a.id }}" data-enabled="{{ 1 if a.chat_cmd_enabled else 0 }}" class="btn btn-sm {{ 'btn-success' if a.chat_cmd_enabled else '' }}" style="padding:2px 6px;font-size:10px" onclick="toggleAccCmdInstant({{ a.id }}, this)">
+                      {{ 'Lệnh: BẬT' if a.chat_cmd_enabled else 'Lệnh: TẮT' }}
+                    </button>
+                  </div>
                 {% endfor %}
               </div>
             </div>
@@ -14254,11 +14337,18 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
             <div style="margin-bottom:10px;padding:10px;background:var(--surface-sub);border:1px solid var(--border);border-radius:12px">
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:4px">
                 <label class="field-lbl" style="margin:0;color:var(--tg-cyan)">Phòng mục tiêu (<span id="quickBoxSelectedCount">0</span> Box đã chọn):</label>
-                <div style="display:flex;gap:4px;flex-wrap:wrap">
+                <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center">
                   <button type="button" class="btn btn-primary btn-sm" id="btnQuickLoadBoxes" onclick="loadGroupsAndRooms(true, this)">Tải danh sách</button>
+                  <button type="button" class="btn btn-sm" onclick="selectTopNTargets(1)">1 Box</button>
+                  <button type="button" class="btn btn-sm" onclick="selectTopNTargets(5)">5 Box</button>
+                  <button type="button" class="btn btn-sm" onclick="selectTopNTargets(10)">10 Box</button>
+                  <button type="button" class="btn btn-sm" onclick="selectTopNTargets(20)">20 Box</button>
+                  <button type="button" class="btn btn-sm" onclick="selectTopNTargets(50)">50 Box</button>
                   <button type="button" class="btn btn-sm" onclick="selectTopNTargets(100)">100 Box</button>
                   <button type="button" class="btn btn-success btn-sm" onclick="selectTopNTargets(500)">500 Box</button>
-                  <button type="button" class="btn btn-sm" onclick="openBulk500BoxModal()">+ Dán 500 ID</button>
+                  <input class="inp" type="number" min="1" max="2000" id="customBoxCountCamp" placeholder="Số Box..." style="width:74px;padding:4px 7px;font-size:11.5px">
+                  <button type="button" class="btn btn-primary btn-sm" onclick="selectCustomNBoxes('customBoxCountCamp')">Chọn N Box</button>
+                  <button type="button" class="btn btn-sm" onclick="openBulk500BoxModal()">+ Dán ID</button>
                   <button type="button" class="btn btn-sm" onclick="selectAllTargets()">Tất cả</button>
                   <button type="button" class="btn btn-sm" onclick="clearAllTargets()">Xóa</button>
                 </div>
@@ -15337,9 +15427,173 @@ function switchDiscordRegTab(mode) {
   document.getElementById('discordNewAccBox').style.display = (mode === 'new_acc') ? 'block' : 'none';
 }
 
+function updateSelectedCampAccCount() {
+  const chks = Array.from(document.querySelectorAll('.camp-acc-chk'));
+  const selCnt = chks.filter(c => c.checked).length;
+  const lbl = document.getElementById('selectedCampAccCountLabel');
+  if (lbl) lbl.textContent = String(selCnt);
+}
+
 function toggleSelectAllCampaignAccs(checked) {
   const chks = document.querySelectorAll('.camp-acc-chk');
   chks.forEach(c => { c.checked = Boolean(checked); });
+  updateSelectedCampAccCount();
+}
+
+function selectTopNCampaignAccs(limitN) {
+  const n = Math.max(1, parseInt(limitN || 1, 10));
+  const chks = Array.from(document.querySelectorAll('.camp-acc-chk'));
+  chks.forEach((c, idx) => { c.checked = (idx < n); });
+  updateSelectedCampAccCount();
+  showToast(`Đã chọn ${Math.min(n, chks.length)} / ${chks.length} tài khoản để gửi!`);
+}
+
+function selectCustomNCampaignAccs() {
+  const inp = document.getElementById('customAccCountInput');
+  const val = parseInt((inp && inp.value) || '0', 10);
+  if (!val || val <= 0) {
+    showToast('Hãy nhập số lượng Acc cần chọn!');
+    return;
+  }
+  selectTopNCampaignAccs(val);
+}
+
+function selectCustomNBoxes(inputId) {
+  const inp = document.getElementById(inputId);
+  const val = parseInt((inp && inp.value) || '0', 10);
+  if (!val || val <= 0) {
+    showToast('Hãy nhập số lượng Box cần chọn!');
+    return;
+  }
+  clearAllTargets();
+  selectTopNTargets(val);
+}
+
+function _applyCmdBtnVisualState(accId, enabled, allowAll) {
+  const btnMain = document.getElementById('btnAccCmd_' + accId);
+  if (btnMain && enabled !== undefined && enabled !== null) {
+    const isOn = Boolean(Number(enabled));
+    btnMain.dataset.enabled = isOn ? '1' : '0';
+    btnMain.className = 'btn btn-sm ' + (isOn ? 'btn-success' : '');
+    btnMain.textContent = isOn ? '🟢 Cho Phép Dùng Lệnh' : '⚪ Đang Tắt Lệnh';
+  }
+  const btnCamp = document.getElementById('campBtnAccCmd_' + accId);
+  if (btnCamp && enabled !== undefined && enabled !== null) {
+    const isOn = Boolean(Number(enabled));
+    btnCamp.dataset.enabled = isOn ? '1' : '0';
+    btnCamp.className = 'btn btn-sm ' + (isOn ? 'btn-success' : '');
+    btnCamp.textContent = isOn ? 'Lệnh: BẬT' : 'Lệnh: TẮT';
+  }
+  const btnAllow = document.getElementById('btnAccAllowAll_' + accId);
+  if (btnAllow && allowAll !== undefined && allowAll !== null) {
+    const isAll = Boolean(Number(allowAll));
+    btnAllow.dataset.allow = isAll ? '1' : '0';
+    btnAllow.textContent = isAll ? '👥 Mọi Người Dùng Lệnh' : '🔒 Chỉ Chủ Acc & .cp';
+  }
+}
+
+async function toggleAccCmdInstant(accId, btnEl) {
+  const cur = btnEl ? parseInt(btnEl.dataset.enabled || '1', 10) : 1;
+  const nextVal = cur ? 0 : 1;
+  _applyCmdBtnVisualState(accId, nextVal, null);
+  try {
+    const r = await fetch('/api/account/cmd_permissions_bulk', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({mode: 'single', acc_id: accId, chat_cmd_enabled: nextVal})
+    });
+    const d = await r.json();
+    showToast(d.message || (nextVal ? `Đã cho phép Acc #${accId} sử dụng lệnh!` : `Đã tắt lệnh trên Acc #${accId}`));
+    pollSystemStatus(true);
+  } catch (e) {
+    showToast('Lỗi cập nhật quyền dùng lệnh!');
+  }
+}
+
+async function toggleAccAllowAllInstant(accId, btnEl) {
+  const cur = btnEl ? parseInt(btnEl.dataset.allow || '1', 10) : 1;
+  const nextVal = cur ? 0 : 1;
+  _applyCmdBtnVisualState(accId, null, nextVal);
+  try {
+    const r = await fetch('/api/account/cmd_permissions_bulk', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({mode: 'single', acc_id: accId, allow_all_cmd: nextVal})
+    });
+    const d = await r.json();
+    showToast(d.message || 'Đã cập nhật quyền nhóm dùng lệnh!');
+  } catch (e) {
+    showToast('Lỗi cập nhật quyền nhóm!');
+  }
+}
+
+async function bulkSetAccountCmdPermission(mode, btnEl) {
+  await withPetButtonLoading(btnEl, 'Đang áp dụng...', async () => {
+    try {
+      const r = await fetch('/api/account/cmd_permissions_bulk', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({mode})
+      });
+      const d = await r.json();
+      if (d.ok && Array.isArray(d.accounts)) {
+        d.accounts.forEach(a => _applyCmdBtnVisualState(a.id, a.chat_cmd_enabled, a.allow_all_cmd));
+      }
+      showToast(d.message || 'Đã cập nhật quyền sử dụng lệnh!');
+      pollSystemStatus(true);
+    } catch (e) {
+      showToast('Lỗi cập nhật hàng loạt!');
+    }
+  });
+}
+
+async function enableSelectedAccountsCmdOnly(btnEl) {
+  const selectedAccIds = Array.from(document.querySelectorAll('.camp-acc-chk:checked')).map(el => parseInt(el.value, 10)).filter(n => !isNaN(n));
+  if (!selectedAccIds.length) {
+    showToast('Hãy tích chọn ít nhất 1 Acc để cấp quyền dùng lệnh!');
+    return;
+  }
+  await withPetButtonLoading(btnEl, 'Đang khóa quyền lệnh...', async () => {
+    try {
+      const r = await fetch('/api/account/cmd_permissions_bulk', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({mode: 'enable_selected', acc_ids: selectedAccIds})
+      });
+      const d = await r.json();
+      if (d.ok && Array.isArray(d.accounts)) {
+        d.accounts.forEach(a => _applyCmdBtnVisualState(a.id, a.chat_cmd_enabled, a.allow_all_cmd));
+      }
+      showToast(d.message || `Đã bật quyền dùng lệnh cho ${selectedAccIds.length} Acc đang chọn!`);
+      pollSystemStatus(true);
+    } catch (e) {
+      showToast('Lỗi cập nhật quyền lệnh!');
+    }
+  });
+}
+
+async function checkAllAccountsLiveStatus(btnEl) {
+  await withPetButtonLoading(btnEl, 'Đang check Sống/Die...', async () => {
+    try {
+      const r = await fetch('/api/account/check_all_live', {method: 'POST'});
+      const d = await r.json();
+      if (d.ok && Array.isArray(d.results)) {
+        d.results.forEach(res => {
+          const bEl = document.getElementById('accLiveBadge_' + res.id);
+          if (bEl) {
+            bEl.className = 'badge ' + (res.alive ? 'badge-green' : 'badge-red');
+            bEl.textContent = res.alive
+              ? (res.platform === 'zalo' ? `🟢 SỐNG (${res.groups_count || 0} nhóm)` : '🟢 SỐNG 24/7')
+              : '🔴 DIE (Đã thoát Acc)';
+          }
+        });
+      }
+      showToast(d.message || 'Đã kiểm tra trạng thái Sống/Die toàn bộ Acc!');
+      pollSystemStatus(true);
+    } catch (e) {
+      showToast('Lỗi kiểm tra trạng thái Sống/Die!');
+    }
+  });
 }
 
 async function restartTelegramBotNow() {
@@ -15581,7 +15835,7 @@ async function deleteZaloVaultIdx(idx) {
 }
 
 async function testSingleAccountSession(accId, btnEl) {
-  await withPetButtonLoading(btnEl, 'Đang kiểm tra...', async () => {
+  await withPetButtonLoading(btnEl, 'Đang check...', async () => {
     try {
       const r = await fetch('/api/account/test_session', {
         method: 'POST',
@@ -15589,6 +15843,13 @@ async function testSingleAccountSession(accId, btnEl) {
         body: JSON.stringify({acc_id: accId})
       });
       const d = await r.json();
+      const bEl = document.getElementById('accLiveBadge_' + accId);
+      if (bEl) {
+        bEl.className = 'badge ' + (d.ok ? 'badge-green' : 'badge-red');
+        bEl.textContent = d.ok
+          ? (typeof d.groups_count === 'number' ? `🟢 SỐNG (${d.groups_count} nhóm)` : '🟢 SỐNG 24/7')
+          : '🔴 DIE (Đã thoát Acc)';
+      }
       showToast(d.message || d.error || 'Đã kiểm tra!');
       pollSystemStatus(true);
     } catch (e) { showToast('Lỗi kết nối khi kiểm tra!'); }
@@ -18058,8 +18319,8 @@ def route_task_start():
             targets=targets,
             blocks=b_blocks,
             delay=eff_delay,
-            use_emoji=bool(data.get("use_emoji", True)),
-            icon_count=int(data.get("icon_count", 3)),
+            use_emoji=bool(data.get("use_emoji", False)),
+            icon_count=int(data.get("icon_count", 0)),
             tag_users=tag_users,
             tag_all=tag_all,
             is_heading=bool(data.get("is_heading", True)),
@@ -18086,8 +18347,136 @@ def route_task_start():
         _STATUS_SNAPSHOT_CACHE["ts"] = 0.0
     return jsonify({"ok": True, "task_id": created_tids[0], "task_ids": created_tids, "batch_count": len(created_tids)})
 
+@app.route("/api/account/cmd_permissions_bulk", methods=["POST"])
+def api_account_cmd_permissions_bulk():
+    data = request.json or {}
+    mode = str(data.get("mode") or "single").strip().lower()
+    conn = db()
+    if mode == "enable_all":
+        conn.execute("UPDATE accounts SET chat_cmd_enabled=1")
+        msg = "Đã BẬT quyền sử dụng lệnh (.menu, .n, .g, .t) cho TẤT CẢ các Acc!"
+    elif mode == "disable_all":
+        conn.execute("UPDATE accounts SET chat_cmd_enabled=0")
+        msg = "Đã TẮT nhận lệnh trên tất cả các Acc!"
+    elif mode == "allow_all_on":
+        conn.execute("UPDATE accounts SET chat_cmd_enabled=1, allow_all_cmd=1")
+        msg = "Đã BẬT cho phép mọi thành viên trong nhóm sử dụng lệnh trên tất cả các Acc!"
+    elif mode == "allow_all_off":
+        conn.execute("UPDATE accounts SET allow_all_cmd=0")
+        msg = "Đã khóa chỉ Chủ Acc & người có quyền .cp mới được dùng lệnh!"
+    elif mode == "enable_selected":
+        acc_ids = [int(x) for x in (data.get("acc_ids") or []) if str(x).isdigit()]
+        conn.execute("UPDATE accounts SET chat_cmd_enabled=0")
+        if acc_ids:
+            placeholders = ",".join("?" for _ in acc_ids)
+            conn.execute(f"UPDATE accounts SET chat_cmd_enabled=1 WHERE id IN ({placeholders})", tuple(acc_ids))
+        msg = f"Đã khóa chỉ cho phép đúng {len(acc_ids)} Acc đang chọn sử dụng lệnh!"
+    else:
+        acc_id = int(data.get("acc_id") or 0)
+        if "chat_cmd_enabled" in data:
+            en = 1 if data.get("chat_cmd_enabled") else 0
+            conn.execute("UPDATE accounts SET chat_cmd_enabled=? WHERE id=?", (en, acc_id))
+        if "allow_all_cmd" in data:
+            al = 1 if data.get("allow_all_cmd") else 0
+            conn.execute("UPDATE accounts SET allow_all_cmd=? WHERE id=?", (al, acc_id))
+        msg = f"Đã cập nhật quyền sử dụng lệnh cho Acc #{acc_id}!"
+    conn.commit()
+    rows = refresh_accounts_ram_cache()
+    sync_all_zalo_listeners()
+    return jsonify({
+        "ok": True,
+        "message": msg,
+        "accounts": [
+            {"id": r["id"], "chat_cmd_enabled": int(r.get("chat_cmd_enabled") or 0), "allow_all_cmd": int(r.get("allow_all_cmd") or 0)}
+            for r in rows
+        ],
+    })
+
+
+@app.route("/api/account/check_all_live", methods=["POST"])
+def api_account_check_all_live():
+    from zalo_login import check_zalo_cookie_imei_live, ZaloPCSessionKeeper
+    rows = get_all_accounts_from_ram()
+    results = []
+    alive_cnt = 0
+    die_cnt = 0
+
+    def _probe_acc(acc):
+        aid = acc["id"]
+        plat = (acc.get("platform") or "zalo").lower()
+        if plat == "zalo":
+            chk = check_zalo_cookie_imei_live(
+                imei=acc.get("imei") or "",
+                cookies_input=acc.get("cookies") or "{}",
+                zpw_enk=acc.get("zpw_enk") or "",
+                user_agent=acc.get("user_agent") or "",
+                uid=acc.get("uid") or "",
+            )
+            if chk["alive"]:
+                ZaloPCSessionKeeper.register_and_keep_alive(
+                    uid=chk["uid"] or acc.get("uid") or acc.get("imei"),
+                    imei=acc.get("imei"),
+                    cookies_dict=chk["cookies"],
+                    zpw_enk=chk["zpw_enk"],
+                    user_agent=acc.get("user_agent") or "",
+                    pc_name=acc.get("pc_name") or "Windows 11 Pro (Singapore)",
+                    display_name=chk["display_name"] or acc.get("name") or "",
+                    db_path=DB_PATH,
+                )
+            return {
+                "id": aid,
+                "platform": "zalo",
+                "name": chk.get("display_name") or acc.get("name") or f"Zalo #{aid}",
+                "alive": bool(chk["alive"]),
+                "groups_count": int(chk.get("groups_count") or 0),
+                "reason": chk.get("reason") or "",
+            }
+        elif plat == "discord":
+            dc = DiscordClient(acc.get("token") or "", is_bot=bool(acc.get("is_bot", 0)))
+            ok_c = dc.check(force_network=False)
+            if ok_c:
+                ZaloPCSessionKeeper.register_token_keep_alive(
+                    acc.get("token") or "", platform="discord",
+                    uid=dc.user_id or acc.get("uid") or "",
+                    display_name=acc.get("name") or "", db_path=DB_PATH
+                )
+            return {
+                "id": aid,
+                "platform": "discord",
+                "name": acc.get("name") or f"Discord #{aid}",
+                "alive": bool(ok_c),
+                "groups_count": 0,
+                "reason": "Token đang hoạt động 24/7" if ok_c else "Token DIE hoặc đã đổi mật khẩu",
+            }
+        else:
+            try:
+                mc = MessengerClient.get_pooled_client(acc.get("cookies") or "{}", uid=acc.get("uid") or "")
+                return {"id": aid, "platform": "messenger", "name": mc.display_name, "alive": True, "groups_count": 0, "reason": "ONLINE"}
+            except Exception as ex_m:
+                return {"id": aid, "platform": "messenger", "name": acc.get("name") or "", "alive": False, "groups_count": 0, "reason": str(ex_m)}
+
+    if rows:
+        with ThreadPoolExecutor(max_workers=min(16, len(rows))) as pool:
+            for r_out in pool.map(_probe_acc, rows):
+                results.append(r_out)
+                if r_out["alive"]:
+                    alive_cnt += 1
+                else:
+                    die_cnt += 1
+
+    sync_all_zalo_listeners()
+    return jsonify({
+        "ok": True,
+        "alive_count": alive_cnt,
+        "die_count": die_cnt,
+        "results": results,
+        "message": f"Kết quả Check Sống/Die: {alive_cnt} Acc SỐNG (Đang giữ hoạt động 24/7) • {die_cnt} Acc DIE (Đã thoát Acc)!",
+    })
+
+
 @app.route("/api/account/test_session", methods=["POST"])
 def api_account_test_session():
+    from zalo_login import check_zalo_cookie_imei_live, ZaloPCSessionKeeper
     data = request.json or {}
     acc_id = int(data.get("acc_id") or 0)
     acc = get_account_from_ram(acc_id)
@@ -18096,33 +18485,59 @@ def api_account_test_session():
     plat = (acc.get("platform") or "zalo").lower()
     try:
         if plat == "zalo":
-            z = Zalo.get_pooled_client(
-                acc["imei"], acc["cookies"], force_new=True,
+            chk = check_zalo_cookie_imei_live(
+                imei=acc.get("imei") or "",
+                cookies_input=acc.get("cookies") or "{}",
+                zpw_enk=acc.get("zpw_enk") or "",
                 user_agent=acc.get("user_agent") or "",
-                zpw_enk_hint=acc.get("zpw_enk") or "",
-                uid_hint=acc.get("uid") or ""
+                uid=acc.get("uid") or "",
             )
-            g_list = z.groups(use_cache=False)
+            if not chk["alive"]:
+                return jsonify({
+                    "ok": False,
+                    "alive": False,
+                    "groups_count": 0,
+                    "error": chk["reason"],
+                    "message": f"🔴 DIE — {chk['reason']}",
+                }), 200
+            ZaloPCSessionKeeper.register_and_keep_alive(
+                uid=chk["uid"] or acc.get("uid") or acc.get("imei"),
+                imei=acc.get("imei"),
+                cookies_dict=chk["cookies"],
+                zpw_enk=chk["zpw_enk"],
+                user_agent=acc.get("user_agent") or "",
+                pc_name=acc.get("pc_name") or "Windows 11 Pro (Singapore)",
+                display_name=chk["display_name"] or acc.get("name") or "",
+                db_path=DB_PATH,
+            )
             sync_all_zalo_listeners()
-            log_system_command(acc_id, z.uid or "", z.display_name or "", ".status (Test Phiên PC)", f"Phiên Zalo PC đang ở trong Acc ({len(g_list)} nhóm)")
+            log_system_command(acc_id, chk["uid"] or "", chk["display_name"] or "", "Check Cookie+IMEI", f"SỐNG TRONG ACC ({chk['groups_count']} nhóm)")
             return jsonify({
                 "ok": True,
-                "message": f"Tài khoản Zalo '{z.display_name}' đang ONLINE trong Acc (UID: {z.uid}, {len(g_list)} nhóm, khóa zpw_enk sẵn sàng)!"
+                "alive": True,
+                "groups_count": chk["groups_count"],
+                "message": f"🟢 SỐNG (ON) — Máy tính của '{chk['display_name']}' đang ở trong Acc Zalo (UID: {chk['uid']}, {chk['groups_count']} nhóm, giữ sống 24/7)!"
             })
         elif plat == "discord":
             dc = DiscordClient(acc["token"], is_bot=bool(acc.get("is_bot", 0)))
             ok_c = dc.check(force_network=False)
+            if ok_c:
+                ZaloPCSessionKeeper.register_token_keep_alive(
+                    acc["token"], platform="discord", uid=dc.user_id or "",
+                    display_name=acc.get("name") or "", db_path=DB_PATH
+                )
             sync_all_zalo_listeners()
             return jsonify({
                 "ok": ok_c,
-                "message": f"Tài khoản Discord '{acc.get('name')}' đang ONLINE (UID: {dc.user_id})!" if ok_c else "Token Discord cần kiểm tra lại!"
+                "alive": ok_c,
+                "message": f"🟢 SỐNG — Token Discord '{acc.get('name')}' đang hoạt động 24/7 (UID: {dc.user_id})!" if ok_c else "🔴 DIE — Token Discord đã hết hạn hoặc bị đổi mật khẩu!"
             })
         else:
             mc = MessengerClient.get_pooled_client(acc["cookies"], uid=acc.get("uid") or "")
             sync_all_zalo_listeners()
-            return jsonify({"ok": True, "message": f"Tài khoản Messenger '{mc.display_name}' đang hoạt động tốt!"})
+            return jsonify({"ok": True, "alive": True, "message": f"🟢 SỐNG — Tài khoản Messenger '{mc.display_name}' đang hoạt động tốt!"})
     except Exception as e:
-        return jsonify({"ok": False, "error": f"Lỗi kiểm tra phiên: {e}"}), 200
+        return jsonify({"ok": False, "alive": False, "error": f"🔴 DIE — Lỗi kiểm tra phiên: {e}"}), 200
 
 @app.route("/api/account/reconnect_all", methods=["POST"])
 def api_account_reconnect_all():
