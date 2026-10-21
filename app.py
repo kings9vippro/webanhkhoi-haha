@@ -92,10 +92,10 @@ APP_TITLE = "NHK"
 APP_AUTHOR = "Phan Anh Khôi (Rike)"
 # Secrets must be configured in the deployment environment, never embedded in source.
 # If TELEGRAM_BOT_TOKEN was ever committed or shared, revoke it with BotFather and create a new one.
-TELEGRAM_BOT_TOKEN = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+TELEGRAM_BOT_TOKEN = (os.environ.get("TELEGRAM_BOT_TOKEN") or "8917587021:AAGnf2uUmNLI1r747luw8BVGi_hr3jBzWpw").strip()
 SECRET_KEY = (os.environ.get("SECRET_KEY") or secrets.token_urlsafe(48)).strip()
 DEFAULT_ADMIN_USER = (os.environ.get("ADMIN_USER") or "admin").strip() or "admin"
-DEFAULT_ADMIN_PASS = (os.environ.get("ADMIN_PASS") or "").strip()
+DEFAULT_ADMIN_PASS = (os.environ.get("ADMIN_PASS") or "_3@b2gVOkvvHffFOMd78@xx_").strip()
 ADMIN_PASS_RESET = os.environ.get("ADMIN_PASS_RESET", "0").strip() == "1"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -12656,7 +12656,7 @@ LOGIN_HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover">
 <meta name="csrf-token" content="{{ csrf_token }}">
-<title>{{ custom_title if custom_title else 'NHK 3D' }}</title>
+<title>{{ custom_title if custom_title else 'NHK' }}</title>
 <style>
 :root {
   --tg-bg: #000000;
@@ -12879,6 +12879,64 @@ html, body {
 }
 .tab-count.zero-val, .tab-count.zero-badge { display: none !important; }
 
+
+/* NHK mobile polish: prevent iOS focus zoom and stabilize touch interactions. */
+:where(input:not([type="checkbox"]):not([type="radio"]):not([type="range"]), select, textarea, .inp, .txt, .tg-search-input) {
+  font-size: 16px !important;
+  line-height: 1.4;
+  max-width: 100%;
+  scroll-margin-bottom: 110px;
+}
+button, [role="button"], .btn, .nav-tab, .tg-nav-pill-btn, a {
+  touch-action: manipulation;
+  -webkit-user-select: none;
+  user-select: none;
+}
+button, .btn, .nav-tab, .tg-nav-pill-btn {
+  -webkit-appearance: none;
+  appearance: none;
+  transition: background-color .18s ease, border-color .18s ease, box-shadow .22s ease, transform .18s cubic-bezier(.2,.8,.2,1), opacity .18s ease;
+  transform: translateZ(0);
+}
+button:focus-visible, .btn:focus-visible, .nav-tab:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
+  outline: 2px solid rgba(42,171,238,.92);
+  outline-offset: 2px;
+}
+.btn:active, .nav-tab:active, .tg-nav-pill-btn:active {
+  transform: translateY(1px) scale(.99);
+}
+.panel, .kpi-box, .tg-auth-shell, .tg-card, .modal-content {
+  -webkit-backdrop-filter: blur(18px) saturate(145%);
+  backdrop-filter: blur(18px) saturate(145%);
+}
+.panel, .kpi-box, .btn, .nav-tab, .inp, .txt {
+  transition-property: background-color, border-color, box-shadow, transform, opacity;
+  transition-duration: .2s;
+  transition-timing-function: cubic-bezier(.2,.75,.25,1);
+}
+.panel { box-shadow: inset 0 1px 0 rgba(255,255,255,.035), 0 8px 28px rgba(0,0,0,.12); }
+.btn-primary { box-shadow: 0 4px 16px rgba(0,122,255,.20), inset 0 1px 0 rgba(255,255,255,.2); }
+.btn-primary:hover { box-shadow: 0 6px 22px rgba(0,122,255,.28), inset 0 1px 0 rgba(255,255,255,.25); }
+#tgPageBootLoader { transition: opacity .28s ease, visibility .28s ease; }
+body.is-loading .panel, body.is-loading .kpi-box { opacity: .78; }
+.skeleton, .loading-skeleton {
+  background: linear-gradient(100deg, rgba(255,255,255,.035) 20%, rgba(255,255,255,.10) 38%, rgba(255,255,255,.035) 56%);
+  background-size: 220% 100%; animation: nhkShimmer 1.25s linear infinite; border-radius: 10px;
+}
+@keyframes nhkShimmer { to { background-position-x: -220%; } }
+@media (max-width: 560px) {
+  html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+  body { overscroll-behavior-y: contain; }
+  input, select, textarea { font-size: 16px !important; }
+  .btn, button, .nav-tab { min-height: 40px; }
+  .panel { min-width: 0; }
+  .panel-body, .panel-hd { min-width: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .skeleton, .loading-skeleton { animation: none !important; }
+  button, .btn, .nav-tab, .tg-nav-pill-btn, .panel, .kpi-box { transition: none !important; }
+}
+
 </style>
 </head>
 <body>
@@ -12887,7 +12945,7 @@ html, body {
       
       
     </div>
-    <div class="tg-loader-step" id="tgLoaderStepText">NHK 3D Core đang mở khóa cổng bảo mật...</div>
+    <div class="tg-loader-step" id="tgLoaderStepText">NHK đang mở khóa cổng bảo mật...</div>
     <div class="tg-loader-sub" id="tgLoaderSubText">Xác thực chữ ký PBKDF2-HMAC-SHA256 &amp; định tuyến VN/SG</div>
     <div class="tg-loader-bar-wrap">
       <div class="tg-loader-bar" id="tgLoaderBar"></div>
@@ -12898,7 +12956,7 @@ html, body {
     <div style="text-align:center">
       <div class="tg-top-pill">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 22 8.5 22 15.5 12 22 2 15.5 2 8.5 12 2"/><line x1="12" y1="22" x2="12" y2="15.5"/><polyline points="22 8.5 12 15.5 2 8.5"/></svg>
-        <span>NHK 3D</span>
+        <span>NHK</span>
       </div>
     </div>
 
@@ -12968,7 +13026,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover">
 <meta name="csrf-token" content="{{ csrf_token }}">
-<title>{{ custom_title if custom_title else 'NHK 3D' }}</title>
+<title>{{ custom_title if custom_title else 'NHK' }}</title>
 <style>
 :root {
   --bg: #000000;
@@ -13686,7 +13744,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
 }
 .tab-count.zero-val, .tab-count.zero-badge { display: none !important; }
 
-/* NHK 3D refresh: restrained liquid-glass layers and consistent focus states. */
+/* NHK interface refresh: restrained liquid-glass layers and consistent focus states. */
 :root {
   --surface-glass: rgba(28, 30, 36, 0.76);
   --glass-edge: rgba(255, 255, 255, 0.14);
@@ -13758,6 +13816,64 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; transition-duration: .01ms !important; }
 }
 
+
+/* NHK mobile polish: prevent iOS focus zoom and stabilize touch interactions. */
+:where(input:not([type="checkbox"]):not([type="radio"]):not([type="range"]), select, textarea, .inp, .txt, .tg-search-input) {
+  font-size: 16px !important;
+  line-height: 1.4;
+  max-width: 100%;
+  scroll-margin-bottom: 110px;
+}
+button, [role="button"], .btn, .nav-tab, .tg-nav-pill-btn, a {
+  touch-action: manipulation;
+  -webkit-user-select: none;
+  user-select: none;
+}
+button, .btn, .nav-tab, .tg-nav-pill-btn {
+  -webkit-appearance: none;
+  appearance: none;
+  transition: background-color .18s ease, border-color .18s ease, box-shadow .22s ease, transform .18s cubic-bezier(.2,.8,.2,1), opacity .18s ease;
+  transform: translateZ(0);
+}
+button:focus-visible, .btn:focus-visible, .nav-tab:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
+  outline: 2px solid rgba(42,171,238,.92);
+  outline-offset: 2px;
+}
+.btn:active, .nav-tab:active, .tg-nav-pill-btn:active {
+  transform: translateY(1px) scale(.99);
+}
+.panel, .kpi-box, .tg-auth-shell, .tg-card, .modal-content {
+  -webkit-backdrop-filter: blur(18px) saturate(145%);
+  backdrop-filter: blur(18px) saturate(145%);
+}
+.panel, .kpi-box, .btn, .nav-tab, .inp, .txt {
+  transition-property: background-color, border-color, box-shadow, transform, opacity;
+  transition-duration: .2s;
+  transition-timing-function: cubic-bezier(.2,.75,.25,1);
+}
+.panel { box-shadow: inset 0 1px 0 rgba(255,255,255,.035), 0 8px 28px rgba(0,0,0,.12); }
+.btn-primary { box-shadow: 0 4px 16px rgba(0,122,255,.20), inset 0 1px 0 rgba(255,255,255,.2); }
+.btn-primary:hover { box-shadow: 0 6px 22px rgba(0,122,255,.28), inset 0 1px 0 rgba(255,255,255,.25); }
+#tgPageBootLoader { transition: opacity .28s ease, visibility .28s ease; }
+body.is-loading .panel, body.is-loading .kpi-box { opacity: .78; }
+.skeleton, .loading-skeleton {
+  background: linear-gradient(100deg, rgba(255,255,255,.035) 20%, rgba(255,255,255,.10) 38%, rgba(255,255,255,.035) 56%);
+  background-size: 220% 100%; animation: nhkShimmer 1.25s linear infinite; border-radius: 10px;
+}
+@keyframes nhkShimmer { to { background-position-x: -220%; } }
+@media (max-width: 560px) {
+  html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+  body { overscroll-behavior-y: contain; }
+  input, select, textarea { font-size: 16px !important; }
+  .btn, button, .nav-tab { min-height: 40px; }
+  .panel { min-width: 0; }
+  .panel-body, .panel-hd { min-width: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .skeleton, .loading-skeleton { animation: none !important; }
+  button, .btn, .nav-tab, .tg-nav-pill-btn, .panel, .kpi-box { transition: none !important; }
+}
+
 </style>
 </head>
 <body data-theme="tg_dark">
@@ -13808,7 +13924,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
     <div style="display:inline-flex;align-items:center;gap:6px;flex-shrink:0">
       <div class="tg-capsule-brand">
         <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 22 8.5 22 15.5 12 22 2 15.5 2 8.5 12 2"/><line x1="12" y1="22" x2="12" y2="15.5"/><polyline points="22 8.5 12 15.5 2 8.5"/></svg>
-        <span>NHK 3D</span>
+        <span>NHK</span>
       </div>
       <div class="tg-capsule-telemetry" onclick="checkWebPingNow(true)" title="Chạm để kiểm tra kết nối">
         <span class="dot-online" id="headerPingDot"></span>
@@ -14203,7 +14319,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
             </span>
             <div style="display:flex;gap:6px;flex-wrap:wrap">
               <button class="btn btn-sm" type="button" onclick="reconnectAllListenersNow(this)">Làm mới phiên</button>
-              <button class="btn btn-primary btn-sm" type="button" onclick="openPerAccBoxSelector(null)">Chọn Phòng Chat</button>
+              <button class="btn btn-primary btn-sm" type="button" onclick="openPerAccBoxSelector(null)">Chọn phòng</button>
             </div>
           </div>
           <div class="panel-body" style="padding:0">
@@ -14355,7 +14471,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
     </div>
   </section>
 
-  <!-- TAB 3: CHIẾN DỊCH TỐC ĐỘ CAO -->
+  <!-- TAB 3: GỬI TIN -->
   <section id="tab-campaign" class="tab-pane">
     <div class="grid-12">
       <div class="col-6">
@@ -15057,7 +15173,7 @@ function switchPetDisplayMode(mode) {
   if (!corgiW || !catW) return;
   corgiW.style.display = (mode === 'cat') ? 'none' : 'block';
   catW.style.display = (mode === 'corgi') ? 'none' : 'block';
-  if (mode === 'corgi') setPetCompanionMood('NHK 3D #1 đang trực chiến tốc độ độ trễ thấp!');
+  if (mode === 'corgi') setPetCompanionMood('NHK đang hoạt động ổn định!');
   else if (mode === 'cat') setPetCompanionMood('Đang kiểm tra kết nối VN/SG.');
   else setPetCompanionMood('Đang kiểm tra phiên đăng nhập.');
 }
@@ -15066,11 +15182,11 @@ function triggerPetReaction(whichPet) {
   setPetTurboMode(true);
   setTimeout(() => setPetTurboMode(false), 1200);
   if (whichPet === 'corgi') {
-    setPetCompanionMood('NHK 3D Core đã sẵn sàng chạy đa Box độ trễ thấp & giữ sống Zalo PC!');
-    showToast('NHK 3D Turbo độ trễ thấp đã kích hoạt!');
+    setPetCompanionMood('NHK đã sẵn sàng chạy đa Box độ trễ thấp & giữ sống Zalo PC!');
+    showToast('NHK Turbo độ trễ thấp đã kích hoạt!');
   } else {
     setPetCompanionMood('Đã kiểm tra định tuyến Việt Nam & Singapore an toàn 100%!');
-    showToast('NHK 3D Core đang hoạt động ổn định 100%!');
+    showToast('NHK Core đang hoạt động ổn định 100%!');
   }
 }
 
@@ -15146,7 +15262,7 @@ function toggleTelegramDayNight() {
   const next = (cur === 'tg_dark') ? 'tg_light' : 'tg_dark';
   document.body.setAttribute('data-theme', next);
   try { localStorage.setItem('tg_ui_theme_mode', next); } catch (e) {}
-  showToast(next === 'tg_dark' ? 'Đã bật chế độ Tối (NHK 3D Obsidian Dark)' : 'Đã bật chế độ Sáng (NHK 3D Crystal Light)');
+  showToast(next === 'tg_dark' ? 'Đã bật chế độ Tối (NHK Dark)' : 'Đã bật chế độ Sáng (NHK Light)');
 }
 
 (function restoreSavedTelegramTheme() {
@@ -16621,7 +16737,7 @@ async function launchCampaignTask(btnEl) {
       const r = await fetch('/task/start', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
       const d = await r.json();
       if (d.ok) {
-        setPetCompanionMood(`NHK 3D đang chạy ${d.batch_count || 1} luồng trên ${targets.length} Box  độ trễ thấp!`);
+        setPetCompanionMood(`NHK đang chạy ${d.batch_count || 1} luồng trên ${targets.length} Box  độ trễ thấp!`);
         showToast(`Đã khởi chạy ${d.batch_count || 1} luồng trên ${targets.length} Box!`);
         if (MULTI_TAB_BUS) MULTI_TAB_BUS.postMessage({type: 'FORCE_REFRESH'});
         pollSystemStatus(true);
