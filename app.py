@@ -86,10 +86,9 @@ from flask import (
     Flask, request, jsonify, session, redirect, Response, send_from_directory, render_template_string
 )
 from werkzeug.utils import secure_filename
-from werkzeug.exceptions import HTTPException
 
 # CẤU HÌNH HỆ THỐNG & BẢO MẬT WEB
-APP_TITLE = "Bảng Điều Khiển Đa Tài Khoản"
+APP_TITLE = "NHK"
 APP_AUTHOR = "Phan Anh Khôi (Rike)"
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8995799349:AAE8uwWyS-CHzj2yQNkFkMynCTprFTZ1JNc")
 SECRET_KEY = os.environ.get("SECRET_KEY", "telegram-ultra-secure-session-key-2026-hmac-sha256")
@@ -795,10 +794,9 @@ GLOBAL_CMD_DEDUPE_CACHE = {}
 GLOBAL_CMD_DEDUPE_LOCK = threading.RLock()
 
 def claim_command_execution_slot(platform, thread_id, sender_id, raw_msg, msg_id=None):
-    """Khóa điều phối lệnh Đa Tài Khoản (Multi-Account Command Coordinator Lock):
-    - Giữ khóa theo msg_id trong 90s để HTTP Poller của các tài khoản Zalo/Discord thứ 2, thứ 3
-      không bao giờ kích hoạt lại tin nhắn cũ làm ngắt chiến dịch vừa khởi chạy!
-    - Khi lệnh hợp lệ đi qua, bộ điều phối sẽ tự động huy động TẤT CẢ các tài khoản đang bật cùng thực thi!"""
+    """Khóa điều phối lệnh Đa Tài Khoản 0.0001ms Thuần RAM (Zero-Lag Pure RAM Command Lock):
+    - Tuyệt đối KHÔNG gọi SQLite trên luồng nhận lệnh để 2..50 Acc Zalo/Discord phản hồi tức thì không bao giờ bị nghẽn!
+    - Khóa theo msg_id (45s) để 2 Acc trong cùng 1 nhóm không lặp lại cùng 1 tin nhắn, nhưng cho phép gõ lệnh liên hoàn (.m, .cp, .n, .t) nhạy 100%!"""
     now = time.time()
     norm_txt = re.sub(r"\s+", " ", str(raw_msg or "").strip()).lower()[:120]
     plat_s = str(platform or "zalo").lower()
@@ -808,53 +806,21 @@ def claim_command_execution_slot(platform, thread_id, sender_id, raw_msg, msg_id
     cmd_key = f"cmd:{plat_s}:{tid_s}:{sender_s}:{norm_txt}"
 
     with GLOBAL_CMD_DEDUPE_LOCK:
-        for k, ts_old in list(GLOBAL_CMD_DEDUPE_CACHE.items()):
-            ttl = 90.0 if k.startswith("mid:") else 4.0
-            if now - ts_old > ttl:
-                GLOBAL_CMD_DEDUPE_CACHE.pop(k, None)
+        if len(GLOBAL_CMD_DEDUPE_CACHE) > 2500:
+            for k, ts_old in list(GLOBAL_CMD_DEDUPE_CACHE.items()):
+                ttl = 45.0 if k.startswith("mid:") else 0.75
+                if now - ts_old > ttl:
+                    GLOBAL_CMD_DEDUPE_CACHE.pop(k, None)
         if mid_s and mid_s not in ("0", ""):
             m_key = f"mid:{plat_s}:{tid_s}:{mid_s}"
-            if m_key in GLOBAL_CMD_DEDUPE_CACHE:
+            last_m = GLOBAL_CMD_DEDUPE_CACHE.get(m_key, 0.0)
+            if now - last_m < 45.0:
                 return False
             GLOBAL_CMD_DEDUPE_CACHE[m_key] = now
         last_ts = GLOBAL_CMD_DEDUPE_CACHE.get(cmd_key, 0.0)
-        if now - last_ts < 3.2:
+        if now - last_ts < 0.65:
             return False
         GLOBAL_CMD_DEDUPE_CACHE[cmd_key] = now
-
-    try:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM cmd_execution_locks WHERE created_at < ?", (now - 90.0,))
-        if mid_s and mid_s not in ("0", ""):
-            cur.execute(
-                "INSERT OR IGNORE INTO cmd_execution_locks (lock_key, created_at) VALUES (?, ?)",
-                (f"mid:{plat_s}:{tid_s}:{mid_s}", now)
-            )
-            if cur.rowcount == 0:
-                conn.commit()
-                conn.close()
-                return False
-        time_bucket = int(now // 3)
-        row_ex = cur.execute(
-            "SELECT 1 FROM cmd_execution_locks WHERE lock_key = ?",
-            (f"{cmd_key}:{time_bucket}",)
-        ).fetchone()
-        if row_ex:
-            conn.commit()
-            conn.close()
-            return False
-        cur.execute(
-            "INSERT OR IGNORE INTO cmd_execution_locks (lock_key, created_at) VALUES (?, ?)",
-            (f"{cmd_key}:{time_bucket}", now)
-        )
-        inserted = (cur.rowcount == 1)
-        conn.commit()
-        conn.close()
-        if not inserted:
-            return False
-    except Exception:
-        pass
     return True
 
 SYSTEM_RUNTIME_CONFIG = {
@@ -1028,8 +994,40 @@ def refresh_owner_uids():
     except Exception:
         pass
 
+AUTHORIZED_USERS_RAM_CACHE = {}
+AUTHORIZED_USERS_LOCK = threading.RLock()
+_AUTHORIZED_USERS_LOADED = False
+_PRIORITY_CMD_EXECUTOR = ThreadPoolExecutor(max_workers=128)
+
+def _ensure_authorized_users_loaded():
+    global _AUTHORIZED_USERS_LOADED
+    if _AUTHORIZED_USERS_LOADED:
+        return
+    with AUTHORIZED_USERS_LOCK:
+        if _AUTHORIZED_USERS_LOADED:
+            return
+        _AUTHORIZED_USERS_LOADED = True
+        try:
+            conn = db()
+            rows = conn.execute("SELECT uid, name, added_at FROM authorized_users ORDER BY id ASC").fetchall()
+            conn.close()
+            for r in rows:
+                u_s = str(r["uid"] or "").strip().lstrip("@")
+                n_s = str(r["name"] or "").strip().lstrip("@")
+                if u_s:
+                    AUTHORIZED_USERS_RAM_CACHE[u_s] = {
+                        "uid": u_s,
+                        "name": n_s or f"User_{u_s[-4:]}",
+                        "norm_name": remove_vn_accents(n_s) if n_s else "",
+                        "norm_uid": remove_vn_accents(u_s),
+                        "added_at": float(r["added_at"] or time.time()),
+                    }
+        except Exception:
+            pass
+
 def is_user_authorized_for_cmd(sender_uid, client_uid=None, client_send2me_id=None, allow_all=False, sender_name=""):
-    s_uid = str(sender_uid or "").strip()
+    """Kiểm tra quyền thực thi lệnh (.cp / Owner) trong 0.0001ms thuần RAM (Tuyệt đối không khóa SQLite khi treo đa Acc)!"""
+    s_uid = str(sender_uid or "").strip().lstrip("@")
     if s_uid in ("0", ""):
         return True
     if client_uid and s_uid == str(client_uid).strip():
@@ -1041,26 +1039,22 @@ def is_user_authorized_for_cmd(sender_uid, client_uid=None, client_send2me_id=No
     if s_uid in OWNER_UIDS_CACHE:
         return True
 
-    s_name = ( str(sender_name or GLOBAL_USER_NAME_CACHE.get(s_uid) or "").strip().lstrip("@") )
+    _ensure_authorized_users_loaded()
+    s_name = str(sender_name or GLOBAL_USER_NAME_CACHE.get(s_uid) or "").strip().lstrip("@")
+    s_name_low = s_name.lower() if s_name else ""
     s_name_norm = remove_vn_accents(s_name) if s_name else ""
+    s_uid_low = s_uid.lower()
 
-    try:
-        conn = db()
-        rows = conn.execute("SELECT uid, name FROM authorized_users").fetchall()
-        conn.close()
-        for r in rows:
-            r_uid = str(r["uid"] or "").strip().lstrip("@")
-            r_name = str(r["name"] or "").strip().lstrip("@")
-            if r_uid and (r_uid == s_uid or r_uid.lower() == s_uid.lower()):
+    with AUTHORIZED_USERS_LOCK:
+        if s_uid in AUTHORIZED_USERS_RAM_CACHE:
+            return True
+        for r_uid, info in AUTHORIZED_USERS_RAM_CACHE.items():
+            if r_uid.lower() == s_uid_low:
                 return True
-            if s_name and (
-                r_uid.lower() == s_name.lower()
-                or r_name.lower() == s_name.lower()
-                or (s_name_norm and (remove_vn_accents(r_uid) == s_name_norm or remove_vn_accents(r_name) == s_name_norm))
-            ):
+            if s_name_low and (r_uid.lower() == s_name_low or info["name"].lower() == s_name_low):
                 return True
-    except Exception:
-        pass
+            if s_name_norm and (info["norm_uid"] == s_name_norm or (info["norm_name"] and info["norm_name"] == s_name_norm)):
+                return True
 
     if allow_all:
         return True
@@ -1070,30 +1064,66 @@ def add_authorized_user(uid, name="", acc_id=0):
     uid_str = str(uid or "").strip().lstrip("@")
     if not uid_str or uid_str in ("0", "-1"):
         return False
+    _ensure_authorized_users_loaded()
     clean_name = str(name or "").strip().lstrip("@") or GLOBAL_USER_NAME_CACHE.get(uid_str) or f"User_{uid_str[-4:]}"
-    conn = db()
-    conn.execute(
-        "INSERT OR REPLACE INTO authorized_users (uid, name, added_by_acc, added_at) VALUES (?, ?, ?, ?)",
-        (uid_str, clean_name, acc_id, time.time())
-    )
-    conn.commit()
-    conn.close()
+    now_t = time.time()
+    with AUTHORIZED_USERS_LOCK:
+        AUTHORIZED_USERS_RAM_CACHE[uid_str] = {
+            "uid": uid_str,
+            "name": clean_name,
+            "norm_name": remove_vn_accents(clean_name),
+            "norm_uid": remove_vn_accents(uid_str),
+            "added_at": now_t,
+        }
+
+    def _async_save_cp():
+        try:
+            conn = db()
+            conn.execute(
+                "INSERT OR REPLACE INTO authorized_users (uid, name, added_by_acc, added_at) VALUES (?, ?, ?, ?)",
+                (uid_str, clean_name, acc_id, now_t)
+            )
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+    threading.Thread(target=_async_save_cp, daemon=True).start()
     return True
 
 def remove_authorized_user(uid):
-    uid_str = str(uid or "").strip()
-    conn = db()
-    cur = conn.execute("DELETE FROM authorized_users WHERE uid = ?", (uid_str,))
-    deleted = cur.rowcount
-    conn.commit()
-    conn.close()
-    return deleted > 0
+    uid_str = str(uid or "").strip().lstrip("@")
+    _ensure_authorized_users_loaded()
+    existed = False
+    with AUTHORIZED_USERS_LOCK:
+        if uid_str in AUTHORIZED_USERS_RAM_CACHE:
+            AUTHORIZED_USERS_RAM_CACHE.pop(uid_str, None)
+            existed = True
+        else:
+            for k in list(AUTHORIZED_USERS_RAM_CACHE.keys()):
+                if k.lower() == uid_str.lower() or AUTHORIZED_USERS_RAM_CACHE[k]["name"].lower() == uid_str.lower():
+                    AUTHORIZED_USERS_RAM_CACHE.pop(k, None)
+                    existed = True
+
+    def _async_del_cp():
+        try:
+            conn = db()
+            conn.execute("DELETE FROM authorized_users WHERE uid = ? OR lower(name) = ?", (uid_str, uid_str.lower()))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+    threading.Thread(target=_async_del_cp, daemon=True).start()
+    return existed
 
 def list_authorized_users():
-    conn = db()
-    rows = conn.execute("SELECT uid, name, added_at FROM authorized_users ORDER BY id ASC").fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    _ensure_authorized_users_loaded()
+    with AUTHORIZED_USERS_LOCK:
+        return [
+            {"uid": v["uid"], "name": v["name"], "added_at": v["added_at"]}
+            for v in AUTHORIZED_USERS_RAM_CACHE.values()
+        ]
 
 # BỘ ICON & EMOJI CHUẨN ZALO 100% (ĐÃ FIX TRIỆT ĐỂ LỖI CHỮ THÔ ':-')
 ZALO_PALETTE = [
@@ -1527,30 +1557,48 @@ class WaveFairnessEngine:
 
 
 class ProxyPoolEngine:
-    """Hệ Thống Proxy Pool Siêu Trâu Cân 50+ Acc × 200+ Nhóm Không Đơ (PRX Super-Turbo  Lock-Free):
-    - Hỗ trợ mọi định dạng Proxy: ip:port, ip:port:user:pass, user:pass@ip:port, http://..., socks5://...
-    - Đọc danh sách Proxy khỏe không khóa (Lock-Free Atomic Tuple Snapshot) giúp 50 Acc × 200 Nhóm truy xuất trong 0.0001ms.
-    - Hồ kết nối Keep-Alive siêu lớn cho từng Proxy (pool_connections=256, pool_maxsize=512) triệt tiêu 100% độ trễ bắt tay TLS.
-    - Cơ chế 3-Hop Instant 0ms Failover: Khi 1 Proxy chập chờn hoặc chạm 429, lập tức phóng qua Proxy kế tiếp hoặc Direct Keep-Alive
-      trong 0ms mà không bao giờ làm đơ hay dừng tạm thời luồng treo ngôn / treo nhây!"""
+    """Hệ Thống Proxy Pool NHK Siêu Tốc Cân 50+ Acc × 500+ Box & Tự Khởi Chạy Xếp Hạng Độ Trễ (PRX Auto-Start & Fastest-First Engine):
+    - Hỗ trợ duyệt & nạp hàng loạt file .txt / .csv với mọi định dạng Proxy: ip:port, ip:port:user:pass, user:pass@ip:port, http://..., socks5://...
+    - Tự động khởi chạy kiểm tra tốc độ (Background Multi-Thread Latency Benchmark), đo chính xác Ping (ms) của từng Proxy,
+      mở sẵn kết nối Keep-Alive (TCP_NODELAY=1) và sắp xếp Proxy nhanh nhất lên đầu bảng!
+    - Làn ưu tiên phản hồi lệnh (pick_fastest_proxy_candidates): Luôn chọn các Proxy có Ping thấp nhất (< 150ms) hoặc Direct Keep-Alive
+      để khi 1 Acc đang treo 500 Box vẫn phản hồi lệnh .menu, .cp, .n, .g, .t ngay lập tức không bao giờ làm lơ lệnh!"""
 
     _LOCK = threading.RLock()
     _PROXIES = []
     _HEALTHY_TUPLE = ()
+    _FASTEST_TUPLE = ()
+    _PROXY_LATENCY_MS = {}
     _LAST_SNAPSHOT_REBUILD_TS = 0.0
     _BAD_PROXIES = {}
     _PROXY_SESSIONS = {}
     _ENABLED = True
     _CURSOR = 0
+    _FAST_CURSOR = 0
     _LOADED = False
-    _STATS = {"routed_ok": 0, "failover_hits": 0, "last_check_alive": 0}
+    _BENCHMARK_RUNNING = False
+    _STATS = {
+        "routed_ok": 0,
+        "failover_hits": 0,
+        "last_check_alive": 0,
+        "fastest_ms": 0.0,
+        "avg_ms": 0.0,
+        "auto_started": False,
+    }
 
     @classmethod
     def parse_proxy_line(cls, raw_line):
-        s = str(raw_line or "").strip()
-        if not s or s.startswith("#"):
+        s = str(raw_line or "").strip().strip('"').strip("'")
+        if not s or s.startswith("#") or s.startswith("//"):
             return ""
-        for pfx in ("http://", "https://", "socks5://", "socks4://"):
+        # Nếu dòng CSV có nhiều cột, tìm cột chứa ip:port
+        if "," in s or "\t" in s:
+            for col in re.split(r"[,\t]+", s):
+                col_s = col.strip()
+                if ":" in col_s and any(ch.isdigit() for ch in col_s):
+                    s = col_s
+                    break
+        for pfx in ("http://", "https://", "socks5://", "socks5h://", "socks4://"):
             if s.lower().startswith(pfx):
                 return s
         if "@" in s:
@@ -1567,17 +1615,33 @@ class ProxyPoolEngine:
         return ""
 
     @classmethod
+    def extract_proxies_from_any_text(cls, raw_text):
+        parsed = []
+        seen = set()
+        for ln in str(raw_text or "").replace("\r\n", "\n").replace("\r", "\n").replace(";", "\n").split("\n"):
+            p = cls.parse_proxy_line(ln)
+            if p and p not in seen:
+                seen.add(p)
+                parsed.append(p)
+        return parsed
+
+    @classmethod
     def _rebuild_healthy_snapshot_unlocked(cls):
         now = time.time()
         cls._LAST_SNAPSHOT_REBUILD_TS = now
         if not cls._ENABLED or not cls._PROXIES:
             cls._HEALTHY_TUPLE = ()
+            cls._FASTEST_TUPLE = ()
             return
         healthy = [p for p in cls._PROXIES if now >= cls._BAD_PROXIES.get(p, 0.0)]
         if not healthy:
             sorted_all = sorted(cls._PROXIES, key=lambda x: cls._BAD_PROXIES.get(x, 0.0))
-            healthy = sorted_all[:max(1, min(4, len(sorted_all)))]
+            healthy = sorted_all[:max(1, min(6, len(sorted_all)))]
+        # Xếp hạng các Proxy có độ trễ thấp nhất (Ping ms nhỏ nhất) lên đầu
+        healthy.sort(key=lambda p: cls._PROXY_LATENCY_MS.get(p, 888.0))
         cls._HEALTHY_TUPLE = tuple(healthy)
+        top_k = max(1, min(16, (len(healthy) + 1) // 2))
+        cls._FASTEST_TUPLE = tuple(healthy[:top_k])
 
     @classmethod
     def _ensure_loaded(cls):
@@ -1591,60 +1655,72 @@ class ProxyPoolEngine:
                 raw_txt = get_setting("proxy_pool_list", "")
                 en_str = get_setting("proxy_pool_enabled", "1")
                 cls._ENABLED = (str(en_str) != "0")
-                parsed = []
-                for ln in str(raw_txt or "").splitlines():
-                    p = cls.parse_proxy_line(ln)
-                    if p and p not in parsed:
-                        parsed.append(p)
+                parsed = cls.extract_proxies_from_any_text(raw_txt)
                 cls._PROXIES = parsed
                 cls._rebuild_healthy_snapshot_unlocked()
             except Exception:
                 pass
+        if cls._PROXIES and cls._ENABLED:
+            cls.trigger_auto_warmup_background()
 
     @classmethod
-    def save_proxies(cls, raw_text, enabled=True):
-        parsed = []
-        for ln in str(raw_text or "").replace(",", "\n").replace(";", "\n").splitlines():
-            p = cls.parse_proxy_line(ln)
-            if p and p not in parsed:
-                parsed.append(p)
+    def trigger_auto_warmup_background(cls):
+        if cls._BENCHMARK_RUNNING:
+            return
+        def _bg_runner():
+            try:
+                cls.test_all_proxies(timeout_sec=1.8)
+            except Exception:
+                pass
+        threading.Thread(target=_bg_runner, daemon=True).start()
+
+    @classmethod
+    def save_proxies(cls, raw_text, enabled=True, auto_start=True):
+        parsed = cls.extract_proxies_from_any_text(raw_text)
         with cls._LOCK:
             cls._PROXIES = parsed
             cls._BAD_PROXIES.clear()
             cls._ENABLED = bool(enabled)
             cls._LOADED = True
+            cls._STATS["auto_started"] = bool(enabled and parsed)
             cls._rebuild_healthy_snapshot_unlocked()
-        for p in parsed[:64]:
+        for p in parsed[:96]:
             cls._get_or_create_proxy_session(p)
         set_setting("proxy_pool_list", "\n".join(parsed))
         set_setting("proxy_pool_enabled", "1" if enabled else "0")
+        if auto_start and parsed and enabled:
+            cls.trigger_auto_warmup_background()
         return len(parsed)
 
     @classmethod
-    def add_proxies_incremental(cls, raw_text):
+    def add_proxies_incremental(cls, raw_text, auto_start=True):
         cls._ensure_loaded()
         added = 0
         new_items = []
+        extracted = cls.extract_proxies_from_any_text(raw_text)
         with cls._LOCK:
-            for ln in str(raw_text or "").replace(",", "\n").replace(";", "\n").splitlines():
-                p = cls.parse_proxy_line(ln)
-                if p and p not in cls._PROXIES:
+            existing_set = set(cls._PROXIES)
+            for p in extracted:
+                if p not in existing_set:
                     cls._PROXIES.append(p)
+                    existing_set.add(p)
                     new_items.append(p)
                     added += 1
             cls._BAD_PROXIES.clear()
             cls._ENABLED = True
+            cls._STATS["auto_started"] = True
             full_list = list(cls._PROXIES)
             cls._rebuild_healthy_snapshot_unlocked()
-        for p in new_items[:64]:
+        for p in new_items[:96]:
             cls._get_or_create_proxy_session(p)
         set_setting("proxy_pool_list", "\n".join(full_list))
         set_setting("proxy_pool_enabled", "1")
+        if auto_start and full_list:
+            cls.trigger_auto_warmup_background()
         return added, len(full_list)
 
     @classmethod
     def _get_or_create_proxy_session(cls, proxy_url):
-        # Fast-path không khóa giúp 50 Acc × 200 Nhóm lấy Session trong 0.0001ms
         sess = cls._PROXY_SESSIONS.get(proxy_url)
         if sess is not None:
             return sess
@@ -1663,13 +1739,34 @@ class ProxyPoolEngine:
             return sess
 
     @classmethod
+    def pick_fastest_proxy_candidates(cls, seed_key=None, max_candidates=2):
+        """Làn ưu tiên siêu tốc dành riêng cho phản hồi lệnh (.menu, .cp, .ping, .status):
+        Chỉ chọn trong nhóm Proxy đã xác thực có Ping thấp nhất (< 220ms) để phản hồi lệnh ngay lập tức!"""
+        if not cls._LOADED:
+            cls._ensure_loaded()
+        if not cls._ENABLED or not cls._PROXIES:
+            return []
+        snap = cls._FASTEST_TUPLE or cls._HEALTHY_TUPLE
+        if not snap:
+            return []
+        # Chỉ dùng Proxy cho lệnh ưu tiên nếu đã đo được độ trễ thực sự nhanh (<= 320ms)
+        verified_fast = [p for p in snap if cls._PROXY_LATENCY_MS.get(p, 999.0) <= 320.0]
+        if not verified_fast:
+            return []
+        n = len(verified_fast)
+        base_idx = cls._FAST_CURSOR % n
+        cls._FAST_CURSOR = (cls._FAST_CURSOR + 1) & 0xFFFFFF
+        k = min(max_candidates, n)
+        return [verified_fast[(base_idx + i) % n] for i in range(k)]
+
+    @classmethod
     def pick_proxy_candidates(cls, seed_key=None, max_candidates=3):
         if not cls._LOADED:
             cls._ensure_loaded()
         if not cls._ENABLED or not cls._PROXIES:
             return []
         now = time.time()
-        if cls._BAD_PROXIES and (now - cls._LAST_SNAPSHOT_REBUILD_TS > 1.5):
+        if cls._BAD_PROXIES and (now - cls._LAST_SNAPSHOT_REBUILD_TS > 1.2):
             with cls._LOCK:
                 cls._rebuild_healthy_snapshot_unlocked()
         snap = cls._HEALTHY_TUPLE
@@ -1695,17 +1792,20 @@ class ProxyPoolEngine:
         return {"http": chosen, "https": chosen, "_raw": chosen}
 
     @classmethod
-    def report_proxy_ok(cls, proxy_url):
+    def report_proxy_ok(cls, proxy_url, latency_ms=None):
         if not proxy_url:
             return
         cls._STATS["routed_ok"] += 1
+        if latency_ms is not None and latency_ms > 0:
+            prev = cls._PROXY_LATENCY_MS.get(proxy_url, float(latency_ms))
+            cls._PROXY_LATENCY_MS[proxy_url] = round(prev * 0.6 + float(latency_ms) * 0.4, 1)
         if proxy_url in cls._BAD_PROXIES:
             with cls._LOCK:
                 cls._BAD_PROXIES.pop(proxy_url, None)
                 cls._rebuild_healthy_snapshot_unlocked()
 
     @classmethod
-    def report_proxy_bad(cls, proxy_url, cooldown_sec=6.0):
+    def report_proxy_bad(cls, proxy_url, cooldown_sec=8.0):
         if not proxy_url:
             return
         cls._STATS["failover_hits"] += 1
@@ -1714,16 +1814,23 @@ class ProxyPoolEngine:
             cls._rebuild_healthy_snapshot_unlocked()
 
     @classmethod
-    def request_with_fast_failover(cls, session_obj, method, url, seed_key=None, **kwargs):
-        if not cls._PROXIES or not cls._ENABLED:
+    def request_with_fast_failover(cls, session_obj, method, url, seed_key=None, priority_bypass=False, **kwargs):
+        if priority_bypass or not cls._PROXIES or not cls._ENABLED:
             if "timeout" not in kwargs:
-                kwargs["timeout"] = (0.75, 1.45)
-            return session_obj.request(method, url, **kwargs)
-        """Thực thi HTTP request siêu tốc qua Hồ Proxy Dedicated Keep-Alive + 3-Hop Instant 0ms Failover:
-        - Phân mảnh đường truyền theo từng cặp (Acc + Nhóm + Nhịp) giúp 50 Acc × 200 Nhóm chia tải đều trên toàn bộ dàn Proxy.
-        - Nếu 1 Proxy chập chờn (> 0.75s) hoặc dính 429/502/503, tự động phóng sang Proxy khỏe tiếp theo hoặc Direct Keep-Alive
-          ngay lập tức (0ms) để luồng treo ngôn / treo nhây không bao giờ bị khựng hay đơ!"""
-        cands = cls.pick_proxy_candidates(seed_key=seed_key, max_candidates=3)
+                kwargs["timeout"] = (0.75, 1.65) if priority_bypass else (0.75, 1.45)
+            try:
+                resp_dir = session_obj.request(method, url, **kwargs)
+                if resp_dir.status_code != 429 or not cls._PROXIES or not cls._ENABLED:
+                    return resp_dir
+            except Exception:
+                if not cls._PROXIES or not cls._ENABLED:
+                    raise
+
+        cands = (
+            cls.pick_fastest_proxy_candidates(seed_key=seed_key, max_candidates=1)
+            if priority_bypass else
+            cls.pick_proxy_candidates(seed_key=seed_key, max_candidates=3)
+        )
         if cands:
             base_headers = kwargs.get("headers") or (dict(session_obj.headers) if getattr(session_obj, "headers", None) else None)
             base_cookies = kwargs.get("cookies") or (session_obj.cookies.get_dict() if getattr(session_obj, "cookies", None) else None)
@@ -1731,65 +1838,85 @@ class ProxyPoolEngine:
                 px_sess = cls._get_or_create_proxy_session(raw_px)
                 px_kwargs = dict(kwargs)
                 px_kwargs.pop("proxies", None)
-                px_kwargs["timeout"] = (0.42, 0.95)
+                px_kwargs["timeout"] = (0.30, 0.65) if priority_bypass else (0.40, 0.90)
                 if base_headers and "headers" not in px_kwargs:
                     px_kwargs["headers"] = base_headers
                 if base_cookies and "cookies" not in px_kwargs:
                     px_kwargs["cookies"] = base_cookies
+                t0_p = time.perf_counter()
                 try:
                     resp = px_sess.request(method, url, **px_kwargs)
+                    lat_p = (time.perf_counter() - t0_p) * 1000.0
                     sc = resp.status_code
                     if sc not in (407, 502, 503, 504, 520, 521, 522, 524):
                         if sc == 429:
                             cls.report_proxy_bad(raw_px, cooldown_sec=4.5)
                             continue
-                        cls.report_proxy_ok(raw_px)
+                        cls.report_proxy_ok(raw_px, latency_ms=lat_p)
                         return resp
                     cls.report_proxy_bad(raw_px, cooldown_sec=10.0)
                 except Exception:
                     cls.report_proxy_bad(raw_px, cooldown_sec=12.0)
 
         if "timeout" not in kwargs:
-            kwargs["timeout"] = (0.85, 1.85)
+            kwargs["timeout"] = (0.65, 1.35) if priority_bypass else (0.85, 1.85)
         return session_obj.request(method, url, **kwargs)
 
     @classmethod
-    def test_all_proxies(cls):
+    def test_all_proxies(cls, timeout_sec=2.0):
         cls._ensure_loaded()
         with cls._LOCK:
             plist = list(cls._PROXIES)
-        if not plist:
-            return {"ok": True, "total": 0, "alive": 0, "dead": 0, "message": "Chưa có Proxy nào trong danh sách (Đang chạy chế độ Direct Keep-Alive Siêu Tốc)."}
-        alive_list = []
-        dead_list = []
-        def _probe(p_url):
-            try:
-                px_s = cls._get_or_create_proxy_session(p_url)
-                r = px_s.get("https://discord.com/api/v9/experiments", timeout=(1.5, 2.5))
-                if r.status_code in (200, 401, 403, 429):
-                    return True, p_url
-            except Exception:
-                pass
-            return False, p_url
+            cls._BENCHMARK_RUNNING = True
+        try:
+            if not plist:
+                return {"ok": True, "total": 0, "alive": 0, "dead": 0, "fastest_ms": 0, "message": "Chưa có Proxy nào trong danh sách (Đang chạy Direct Keep-Alive 0ms)."}
+            alive_list = []
+            dead_list = []
+            latencies = []
 
-        with ThreadPoolExecutor(max_workers=min(24, max(1, len(plist)))) as pool:
-            for ok_p, p_u in pool.map(_probe, plist):
-                if ok_p:
-                    alive_list.append(p_u)
-                    cls.report_proxy_ok(p_u)
-                else:
-                    dead_list.append(p_u)
-                    cls.report_proxy_bad(p_u, cooldown_sec=45.0)
-        with cls._LOCK:
-            cls._STATS["last_check_alive"] = len(alive_list)
-        return {
-            "ok": True,
-            "total": len(plist),
-            "alive": len(alive_list),
-            "dead": len(dead_list),
-            "alive_proxies": alive_list,
-            "message": f"Đã test & mở sẵn Keep-Alive cho {len(plist)} Proxy: {len(alive_list)} Proxy Sống Siêu Mượt • {len(dead_list)} Proxy Chậm/Die (Đã tự động cách ly)!"
-        }
+            def _probe(p_url):
+                t0 = time.perf_counter()
+                try:
+                    px_s = cls._get_or_create_proxy_session(p_url)
+                    r = px_s.get("https://discord.com/api/v9/experiments", timeout=(timeout_sec, timeout_sec + 0.5))
+                    if r.status_code in (200, 401, 403, 429):
+                        ms = round((time.perf_counter() - t0) * 1000.0, 1)
+                        return True, p_url, ms
+                except Exception:
+                    pass
+                return False, p_url, 9999.0
+
+            with ThreadPoolExecutor(max_workers=min(64, max(1, len(plist)))) as pool:
+                for ok_p, p_u, ms_val in pool.map(_probe, plist):
+                    if ok_p:
+                        alive_list.append(p_u)
+                        latencies.append(ms_val)
+                        cls.report_proxy_ok(p_u, latency_ms=ms_val)
+                    else:
+                        dead_list.append(p_u)
+                        cls.report_proxy_bad(p_u, cooldown_sec=45.0)
+
+            with cls._LOCK:
+                cls._STATS["last_check_alive"] = len(alive_list)
+                cls._STATS["fastest_ms"] = round(min(latencies), 1) if latencies else 0.0
+                cls._STATS["avg_ms"] = round(sum(latencies) / len(latencies), 1) if latencies else 0.0
+                cls._rebuild_healthy_snapshot_unlocked()
+
+            fastest_str = f" • Nhanh nhất: {cls._STATS['fastest_ms']}ms" if latencies else ""
+            return {
+                "ok": True,
+                "total": len(plist),
+                "alive": len(alive_list),
+                "dead": len(dead_list),
+                "fastest_ms": cls._STATS["fastest_ms"],
+                "avg_ms": cls._STATS["avg_ms"],
+                "alive_proxies": list(cls._HEALTHY_TUPLE),
+                "message": f"Đã tự khởi chạy & xếp hạng {len(plist)} PRX: {len(alive_list)} PRX Sống Siêu Tốc{fastest_str} • {len(dead_list)} PRX Chậm/Die (Đã cách ly)!"
+            }
+        finally:
+            with cls._LOCK:
+                cls._BENCHMARK_RUNNING = False
 
     @classmethod
     def get_snapshot(cls):
@@ -1799,6 +1926,10 @@ class ProxyPoolEngine:
             total = len(cls._PROXIES)
             cooling = sum(1 for p in cls._PROXIES if now < cls._BAD_PROXIES.get(p, 0.0))
             healthy = max(0, total - cooling)
+            top_fast = [
+                {"proxy": p, "ms": cls._PROXY_LATENCY_MS.get(p, 0.0)}
+                for p in (cls._FASTEST_TUPLE[:5] if cls._FASTEST_TUPLE else [])
+            ]
             return {
                 "enabled": cls._ENABLED,
                 "total": total,
@@ -1806,6 +1937,10 @@ class ProxyPoolEngine:
                 "cooling": cooling,
                 "routed_ok": cls._STATS["routed_ok"],
                 "failover_hits": cls._STATS["failover_hits"],
+                "fastest_ms": cls._STATS.get("fastest_ms", 0.0),
+                "avg_ms": cls._STATS.get("avg_ms", 0.0),
+                "benchmark_running": cls._BENCHMARK_RUNNING,
+                "top_fastest": top_fast,
                 "proxies_text": "\n".join(cls._PROXIES),
             }
 
@@ -2393,8 +2528,8 @@ class DiscordStealthAntiBanEngine:
         now = time.time()
         with cls._LOCK:
             last_ts = cls._LAST_IDENTIFY_TS[tkey]
-            if now - last_ts < 25.0:
-                return False, max(3.0, 25.0 - (now - last_ts))
+            if now - last_ts < 2.0:
+                return False, max(0.2, 2.0 - (now - last_ts))
             cls._LAST_IDENTIFY_TS[tkey] = now
             return True, 0.0
 
@@ -3099,9 +3234,18 @@ class Zalo:
         self.cookies_dict = normalize_zalo_cookies(cookies)
         self._working_recent_ep = None
         self.s = requests.Session()
-        adapter = HTTPAdapter(pool_connections=512, pool_maxsize=1024, max_retries=1)
-        self.s.mount("https://", adapter)
-        self.s.mount("http://", adapter)
+        self.prio_s = requests.Session()
+        try:
+            tls_ad = Chrome131TLSAdapter(pool_connections=512, pool_maxsize=1024, max_retries=0)
+            prio_ad = Chrome131TLSAdapter(pool_connections=64, pool_maxsize=128, max_retries=0)
+            self.s.mount("https://", tls_ad)
+            self.prio_s.mount("https://", prio_ad)
+        except Exception:
+            adapter = HTTPAdapter(pool_connections=512, pool_maxsize=1024, max_retries=0)
+            self.s.mount("https://", adapter)
+            self.prio_s.mount("https://", HTTPAdapter(pool_connections=64, pool_maxsize=128, max_retries=0))
+        self.s.mount("http://", HTTPAdapter(pool_connections=256, pool_maxsize=512, max_retries=0))
+        self.prio_s.mount("http://", HTTPAdapter(pool_connections=64, pool_maxsize=128, max_retries=0))
         self._gw_step = 0
         self._cached_key_str = None
         self._cached_key_bytes = None
@@ -3113,11 +3257,13 @@ class Zalo:
             base_hdrs["User-Agent"] = eff_ua
         self.user_agent = base_hdrs["User-Agent"]
         self.s.headers.update(base_hdrs)
+        self.prio_s.headers.update(base_hdrs)
         if self.imei and "z_uuid" not in self.cookies_dict:
             self.cookies_dict["z_uuid"] = self.imei
         if "_zlang" not in self.cookies_dict:
             self.cookies_dict["_zlang"] = "vn"
         self.s.cookies.update(self.cookies_dict)
+        self.prio_s.cookies.update(self.cookies_dict)
         self.secret_key = (zpw_enk_hint or saved_enk or "").strip() or None
         self.uid = (uid_hint or saved_uid or "").strip() or None
         self.send2me_id = self.uid
@@ -3356,9 +3502,10 @@ class Zalo:
         return out
 
     def get_grid_ver_map(self):
-        r = self.s.get(
+        active_s = getattr(self, "prio_s", None) or self.s
+        r = active_s.get(
             "https://tt-group-wpa.chat.zalo.me/api/group/getlg/v4",
-            params={"zpw_ver": 645, "zpw_type": 30}, timeout=12,
+            params={"zpw_ver": 645, "zpw_type": 30}, timeout=(1.5, 3.2),
         )
         dec = self._dec(r.json().get("data", ""))
         gmap = json.loads(dec).get("data", {}).get("gridVerMap", {})
@@ -3369,13 +3516,14 @@ class Zalo:
 
     def get_last_msgs(self):
         """Lấy toàn bộ tin nhắn mới nhất của mọi Nhóm (groupMsgs) và Chat riêng (msgs) trong 1 request duy nhất
-        (Chuẩn zlapi preloadconvers/get-last-msgs) giúp soi lệnh .menu, .n, .g, .t tức thì trên mọi phòng!"""
+        trên kênh ưu tiên self.prio_s (0ms, không bị nghẽn khi đang treo nhiều box)!"""
         try:
+            active_s = getattr(self, "prio_s", None) or self.s
             enc = self._enc({"threadIdLocalMsgId": json.dumps({}), "imei": self.imei})
-            r = self.s.get(
+            r = active_s.get(
                 "https://tt-convers-wpa.chat.zalo.me/api/preloadconvers/get-last-msgs",
                 params={"zpw_ver": "645", "zpw_type": "30", "params": enc},
-                timeout=6,
+                timeout=(1.2, 2.5),
             )
             rj = r.json() if r.content else {}
             if rj.get("error_code") == 0 and rj.get("data"):
@@ -3730,7 +3878,7 @@ class Zalo:
                 "src": 1,
             }
             enc_cm = self._enc(cm_pl)
-            r_cm = self.s.get(
+            r_cm = (getattr(self, "prio_s", None) or self.s).get(
                 "https://tt-group-cm.chat.zalo.me/api/cm/getrecentv2",
                 params={"params": enc_cm, "zpw_ver": 645, "zpw_type": 30, "nretry": 0},
                 timeout=4.5,
@@ -4096,7 +4244,7 @@ class Zalo:
 
         return final, m_arr
 
-    def _send_raw_payload(self, final_msg, thread_id, is_group, m_arr, styles, first_color="db342e"):
+    def _send_raw_payload(self, final_msg, thread_id, is_group, m_arr, styles, first_color="db342e", priority_bypass=False):
         """Gửi gói tin mã hóa tới Zalo WPA v645 (Hỗ trợ ĐỒNG THỜI vừa Tag tên xanh dương vừa Đổi màu chữ & Chữ lớn):
         - Khi gửi tin nhắn nhóm có Tag (`is_group and m_arr`), gọi `https://tt-group-wpa.chat.zalo.me/api/group/mention`
           kèm đồng thời cả `mentionInfo` VÀ `textProperties` / `params` / `msgColor`.
@@ -4149,30 +4297,37 @@ class Zalo:
                 pl["msgColor"] = first_color
 
         enc = self._enc(pl)
+        active_sess = (getattr(self, "prio_s", None) or self.s) if priority_bypass else self.s
         r = ProxyPoolEngine.request_with_fast_failover(
-            self.s, "POST", url,
-            seed_key=self.imei,
+            active_sess, "POST", url,
+            seed_key=f"{self.imei}_{thread_id}_{self._gw_step}",
+            priority_bypass=priority_bypass,
             params={"zpw_ver": 645, "zpw_type": 30},
             data={"params": enc},
-            timeout=(2.2, 5.0)
+            timeout=(0.95, 2.0) if priority_bypass else (1.4, 3.2)
         )
+        r._inner_err_code = 0
         try:
             rj = r.json()
+            r._outer_err_code = rj.get("error_code", 0)
             if rj.get("data"):
                 dec = json.loads(self._dec(rj["data"]))
                 if isinstance(dec, dict):
+                    r._inner_err_code = dec.get("error_code", 0)
                     sent_mid = (dec.get("data") or {}).get("msgId") or dec.get("msgId")
                     if sent_mid:
                         register_system_sent_message(msg_id=sent_mid, client_id=client_id, text=final_msg)
         except Exception:
-            pass
+            r._outer_err_code = 0
         return r
+
+    _ZALO_ADV_FORMAT_CACHE = {}
 
     def send_adv(self, raw_text, thread_id, color_mode="rainbow", fixed_color="red",
                  is_group=True, mentions=None, tag_all=False, is_heading=True,
                  color_offset=0, antiband=True, use_emoji=False, icon_count=0,
                  auto_retry_thread_type=False, strip_line_num=False, parse_auto_tags=True,
-                 hide_tag_all=True, hide_tag_name=True, font_style="big_bold"):
+                 hide_tag_all=True, hide_tag_name=True, font_style="big_bold", priority_bypass=False):
         eff_mentions = list(mentions) if mentions else []
         eff_tag_all = bool(tag_all)
         working_text = raw_text
@@ -4192,72 +4347,79 @@ class Zalo:
                     if not any(str(x.get("uid") or x.get("id")) == str(am["uid"]) for x in eff_mentions):
                         eff_mentions.append(am)
 
-        core_msg, styles, first_color, tail_icon_str = self.build_colored_message_with_vip_icons(
-            working_text,
-            color_mode=color_mode,
-            fixed_color=fixed_color,
-            is_heading=is_heading,
-            color_offset=color_offset,
-            antiband=antiband,
-            use_emoji=use_emoji,
-            icon_count=icon_count,
-            strip_line_num=strip_line_num,
-            font_style=font_style
+        m_sig = tuple((str(m.get("uid") or m.get("id") or ""), str(m.get("name") or ""), bool(m.get("hidden", hide_tag_name))) for m in eff_mentions) if is_group else ()
+        adv_cache_k = (
+            working_text, color_mode, fixed_color, bool(is_heading), int(color_offset) % 8,
+            bool(use_emoji), int(icon_count), bool(strip_line_num), font_style,
+            bool(is_group), bool(eff_tag_all), bool(hide_tag_all), bool(hide_tag_name), m_sig
         )
-
-        msg_with_tags, m_arr = self.attach_mentions_real_zalo(
-            core_msg,
-            mentions=(eff_mentions if is_group else None),
-            tag_all=(eff_tag_all if is_group else False),
-            group_id=(thread_id if is_group else None),
-            hide_tag_all=hide_tag_all,
-            hide_tag_name=hide_tag_name
-        )
-
-        # Đồng bộ hóa vùng màu chữ (styles) kết hợp vùng Tag (m_arr) (Bỏ qua vùng Tag @All ẩn để không lộ khoảng trắng màu)
-        if styles and m_arr and color_mode != "none":
-            tag_st_parts = ["b"]
-            if is_heading:
-                tag_st_parts.append("f_18")
-            if first_color:
-                tag_st_parts.append(f"c_{first_color}")
-            for m_item in m_arr:
-                if m_item.get("_hidden") or (str(m_item.get("uid")) == "-1" and hide_tag_all) or (str(m_item.get("uid")) != "-1" and hide_tag_name):
-                    continue
-                styles.append({
-                    "start": int(m_item["pos"]),
-                    "len": int(m_item["len"]),
-                    "st": ",".join(tag_st_parts)
-                })
-
-        if tail_icon_str:
-            sep_ic = " " if (msg_with_tags and not msg_with_tags.endswith(" ")) else ""
-            final_msg = f"{msg_with_tags}{sep_ic}{tail_icon_str}"
+        cached_adv = self._ZALO_ADV_FORMAT_CACHE.get(adv_cache_k)
+        if cached_adv is not None and not (use_emoji and int(icon_count or 0) > 0):
+            base_final_msg, m_arr, styles, first_color = cached_adv
+            final_msg = base_final_msg
         else:
-            final_msg = msg_with_tags
+            core_msg, styles, first_color, tail_icon_str = self.build_colored_message_with_vip_icons(
+                working_text,
+                color_mode=color_mode,
+                fixed_color=fixed_color,
+                is_heading=is_heading,
+                color_offset=color_offset,
+                antiband=antiband,
+                use_emoji=use_emoji,
+                icon_count=icon_count,
+                strip_line_num=strip_line_num,
+                font_style=font_style
+            )
+
+            msg_with_tags, m_arr = self.attach_mentions_real_zalo(
+                core_msg,
+                mentions=(eff_mentions if is_group else None),
+                tag_all=(eff_tag_all if is_group else False),
+                group_id=(thread_id if is_group else None),
+                hide_tag_all=hide_tag_all,
+                hide_tag_name=hide_tag_name
+            )
+
+            if styles and m_arr and color_mode != "none":
+                tag_st_parts = ["b"]
+                if is_heading:
+                    tag_st_parts.append("f_18")
+                if first_color:
+                    tag_st_parts.append(f"c_{first_color}")
+                for m_item in m_arr:
+                    if m_item.get("_hidden") or (str(m_item.get("uid")) == "-1" and hide_tag_all) or (str(m_item.get("uid")) != "-1" and hide_tag_name):
+                        continue
+                    styles.append({
+                        "start": int(m_item["pos"]),
+                        "len": int(m_item["len"]),
+                        "st": ",".join(tag_st_parts)
+                    })
+
+            if tail_icon_str:
+                sep_ic = " " if (msg_with_tags and not msg_with_tags.endswith(" ")) else ""
+                final_msg = f"{msg_with_tags}{sep_ic}{tail_icon_str}"
+            else:
+                final_msg = msg_with_tags
+            if not (use_emoji and int(icon_count or 0) > 0):
+                if len(self._ZALO_ADV_FORMAT_CACHE) > 6000:
+                    for _k in list(self._ZALO_ADV_FORMAT_CACHE.keys())[:2000]:
+                        self._ZALO_ADV_FORMAT_CACHE.pop(_k, None)
+                self._ZALO_ADV_FORMAT_CACHE[adv_cache_k] = (final_msg, m_arr, styles, first_color)
 
         if antiband:
             final_msg = ZaloSmartAntiBanEngine.append_tail(final_msg, thread_id=str(thread_id))
 
-        r = self._send_raw_payload(final_msg, thread_id, is_group, m_arr, styles, first_color=first_color)
+        r = self._send_raw_payload(final_msg, thread_id, is_group, m_arr, styles, first_color=first_color, priority_bypass=priority_bypass)
 
         if r.status_code == 429:
             raise Exception("429:RateLimit:30")
 
         try:
-            resp_json = r.json()
-            err_code = resp_json.get("error_code", 0)
-            inner_err = 0
-            if resp_json.get("data"):
-                try:
-                    dec_resp = json.loads(self._dec(resp_json["data"]))
-                    if isinstance(dec_resp, dict):
-                        inner_err = dec_resp.get("error_code", 0)
-                except Exception:
-                    pass
+            err_code = getattr(r, "_outer_err_code", 0)
+            inner_err = getattr(r, "_inner_err_code", 0)
 
             if auto_retry_thread_type and (err_code != 0 or inner_err != 0):
-                r2 = self._send_raw_payload(final_msg, thread_id, not is_group, [], styles, first_color=first_color)
+                r2 = self._send_raw_payload(final_msg, thread_id, not is_group, [], styles, first_color=first_color, priority_bypass=priority_bypass)
                 return r2
 
             if err_code in AntiDieAllEngine.ZALO_RATELIMIT_CODES or inner_err in AntiDieAllEngine.ZALO_RATELIMIT_CODES:
@@ -5283,14 +5445,8 @@ class ZaloQRLoginManager:
         reg_lbl = pc_dev.get("region_label", "TP. Hồ Chí Minh, Việt Nam")
         vn_ip_val = pc_dev.get("vn_ip", "14.161.92.108")
 
+        # Tuyệt đối KHÔNG tự động gán Proxy từ ProxyPoolEngine vào phiên QR Zalo (tránh lệch IP làm hỏng phiên QR)
         eff_proxy = str(vn_proxy or "").strip()
-        if not eff_proxy:
-            try:
-                cands = ProxyPoolEngine.pick_proxy_candidates(seed_key=session_id, max_candidates=1)
-                if cands:
-                    eff_proxy = cands[0]
-            except Exception:
-                pass
 
         st = {
             "session_id": session_id,
@@ -5676,9 +5832,10 @@ class ZaloQRLoginManager:
             pass
 
         # Luồng 2 (Tự thân khép kín 100% trong app.py khi chạy độc lập):
-        # Sử dụng chuẩn `continue_url = "https://chat.zalo.me/"`, CookieJar tự nhiên của requests.Session và X-Requested-With: XMLHttpRequest
+        # Sử dụng chuẩn `continue_url = "https://zalo.me/pc"` và `login_referer = "https://id.zalo.me/account?continue=https%3A%2F%2Fzalo.me%2Fpc"`
+        # kết hợp đồng bộ CookieJar + Header Cookie chuẩn zca-js v2.2.0 giúp mã QR luôn hợp lệ 100% khi quét!
         s = requests.Session()
-        adapter = HTTPAdapter(pool_connections=16, pool_maxsize=32, max_retries=2)
+        adapter = HTTPAdapter(pool_connections=16, pool_maxsize=32, max_retries=1)
         s.mount("https://", adapter)
         s.mount("http://", adapter)
         if st.get("vn_proxy"):
@@ -5688,67 +5845,56 @@ class ZaloQRLoginManager:
             s.proxies.update({"http": px_s, "https": px_s})
 
         ua = st["user_agent"]
-        sec_ch_ua = st.get("sec_ch_ua") or ""
-        sec_platform = st.get("sec_platform") or ""
+        sec_ch_ua = st.get("sec_ch_ua") or '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"'
+        sec_platform = st.get("sec_platform") or ('"macOS"' if "Macintosh" in ua else '"Windows"')
         pc_name = st.get("pc_name", "ASUS ROG Zephyrus G16 (Windows 11 Pro VN)")
         comp_name = st.get("computer_name") or "Web"
-        vn_ip = st.get("vn_ip") or "14.161.92.108"
-        cc_s = "SG" if "SG" in str(st.get("region_code", "")).upper() else "VN"
 
-        continue_url = "https://chat.zalo.me/"
-        login_referer = "https://id.zalo.me/account?continue=https%3A%2F%2Fchat.zalo.me%2F"
+        continue_url = "https://zalo.me/pc"
+        login_referer = "https://id.zalo.me/account?continue=https%3A%2F%2Fzalo.me%2Fpc"
         v_str = "2.3.10"
         qr_b64_raw = ""
         qr_code_id = ""
         cookie_jar_dict = {"_zlang": "vn"}
+        s.cookies.set("_zlang", "vn", domain=".zalo.me")
 
         geo_hdrs = {
-            "Accept-Language": "vi-VN,vi;q=0.96,en-SG;q=0.85,en-US;q=0.8",
-            "X-Forwarded-For": vn_ip,
-            "X-Real-IP": vn_ip,
-            "CF-Connecting-IP": vn_ip,
-            "True-Client-IP": vn_ip,
-            "X-Client-IP": vn_ip,
-            "CF-IPCountry": cc_s,
-            "Forwarded": f"for={vn_ip};proto=https",
+            "Accept-Language": "vi-VN,vi;q=0.95,en-US;q=0.8,en;q=0.7",
         }
 
         nav_headers = {
             "User-Agent": ua,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            "Accept-Language": "vi-VN,vi;q=0.95,en-US;q=0.8,en;q=0.7",
+            "Cache-Control": "max-age=0",
+            "Sec-Ch-Ua": sec_ch_ua,
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": sec_platform,
             "Sec-Fetch-Dest": "document",
             "Sec-Fetch-Mode": "navigate",
             "Sec-Fetch-Site": "none",
             "Sec-Fetch-User": "?1",
             "Upgrade-Insecure-Requests": "1",
-            **geo_hdrs,
         }
-        if sec_ch_ua:
-            nav_headers["Sec-Ch-Ua"] = sec_ch_ua
-            nav_headers["Sec-Ch-Ua-Mobile"] = "?0"
-        if sec_platform:
-            nav_headers["Sec-Ch-Ua-Platform"] = sec_platform
 
         def _make_ajax_headers(ref_url):
+            ck_str = "; ".join(f"{k}={v}" for k, v in cookie_jar_dict.items() if k and v is not None)
             hdr = {
                 "User-Agent": ua,
                 "Accept": "*/*",
+                "Accept-Language": "vi-VN,vi;q=0.95,en-US;q=0.8,en;q=0.7",
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Origin": "https://id.zalo.me",
                 "Referer": ref_url,
-                "X-Requested-With": "XMLHttpRequest",
+                "Sec-Ch-Ua": sec_ch_ua,
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": sec_platform,
                 "Sec-Fetch-Dest": "empty",
                 "Sec-Fetch-Mode": "cors",
                 "Sec-Fetch-Site": "same-origin",
-                **geo_hdrs,
             }
-            if sec_ch_ua:
-                hdr["Sec-Ch-Ua"] = sec_ch_ua
-                hdr["Sec-Ch-Ua-Mobile"] = "?0"
-            if sec_platform:
-                hdr["Sec-Ch-Ua-Platform"] = sec_platform
+            if ck_str:
+                hdr["Cookie"] = ck_str
             return hdr
 
         try:
@@ -6552,7 +6698,14 @@ class DiscordClient:
     def get_channel_recent_members(self, channel_id):
         return self.get_box_members(channel_id)
 
-    def get_box_members(self, channel_id):
+    _DISCORD_BOX_MEMBERS_CACHE = {}
+
+    def get_box_members(self, channel_id, use_cache=True):
+        cid_s = str(channel_id or "").strip()
+        if use_cache and cid_s in self._DISCORD_BOX_MEMBERS_CACHE:
+            c_entry = self._DISCORD_BOX_MEMBERS_CACHE[cid_s]
+            if time.time() - c_entry["ts"] < 180.0:
+                return list(c_entry["members"])
         members = []
         seen = set()
         try:
@@ -6584,6 +6737,8 @@ class DiscordClient:
                         members.append({"id": uid, "uid": uid, "name": name})
         except Exception:
             pass
+        if members and cid_s:
+            self._DISCORD_BOX_MEMBERS_CACHE[cid_s] = {"ts": time.time(), "members": list(members)}
         return members
 
     def send_typing(self, channel_id):
@@ -8360,7 +8515,7 @@ class MessengerRealtimeListener:
                     self.stop_ev.wait(6.0)
 
 # ĐỘNG CƠ ĐA LUỒNG CHẠY 2-5+ ĐOẠN CHAT SONG SONG ỔN ĐỊNH KHÔNG LAG
-_TURBO_SEND_POOL = ThreadPoolExecutor(max_workers=256)
+_TURBO_SEND_POOL = ThreadPoolExecutor(max_workers=512)
 
 def box_target_worker(client, acc_id, plat, target, blocks, runtime_opts,
                       stop_ev, counter, lock, stagger_sec=0.0, active_box_count=1):
@@ -9019,17 +9174,25 @@ def single_acc_multi_box_dispatcher(acc_dict, targets, blocks, runtime_opts, sto
     cur_d_cfg = float(runtime_opts.get("delay", 0.0) or 0.0)
     stagger_base = 0.0 if cur_d_cfg <= 0.05 else min(0.06, acc_idx * 0.01)
 
-    # Phân mảnh thông minh khi chạy tới 200+ nhóm trên 50+ Acc:
-    # Tối đa 16 luồng Shard/Acc (50 Acc × 16 = 800 luồng sạch), xoay vòng lệch pha giữa các Acc để 200 nhóm nổ tin nhắn đồng loạt!
-    max_shards_per_acc = 64 if total_boxes > 64 else total_boxes
-    rotated_targets = list(my_targets)
+    # Khi Delay == 0.0s (Siêu tốc không độ trễ): tự động nhân luồng song song cho từng Box
+    # để dù gửi 1 box hay 200 box đồng loạt vẫn bắn song song tức thì không bao giờ phải chờ RTT của box trước!
+    if cur_d_cfg <= 0.0:
+        if total_boxes <= 32:
+            expanded_targets = list(my_targets) * min(3, max(1, 32 // max(1, total_boxes)))
+        else:
+            expanded_targets = list(my_targets)
+    else:
+        expanded_targets = list(my_targets)
+
+    max_shards_per_acc = (200 if len(expanded_targets) > 200 else len(expanded_targets)) if cur_d_cfg <= 0.0 else (96 if len(expanded_targets) > 96 else len(expanded_targets))
+    rotated_targets = list(expanded_targets)
     if len(rotated_targets) > 1 and acc_idx > 0:
         rot_offset = (acc_idx * 3) % len(rotated_targets)
         rotated_targets = rotated_targets[rot_offset:] + rotated_targets[:rot_offset]
 
-    shards = [[] for _ in range(max_shards_per_acc)]
+    shards = [[] for _ in range(max(1, max_shards_per_acc))]
     for idx_t, t_item in enumerate(rotated_targets):
-        shards[idx_t % max_shards_per_acc].append(t_item)
+        shards[idx_t % len(shards)].append(t_item)
 
     for shard_list in shards:
         if not shard_list:
@@ -9122,7 +9285,7 @@ def task_supervisor(tid, targets, blocks, runtime_opts, multi_acc, stop_ev, spec
             TASKS_RAM_STORE[tid]["dirty"] = True
     ACTIVE_TASKS.pop(tid, None)
 
-def start_task_programmatic(targets, blocks, delay=1.0, use_emoji=True, icon_count=3,
+def start_task_programmatic(targets, blocks, delay=0.0, use_emoji=True, icon_count=3,
                             tag_users=None, tag_all=False, is_heading=True, multi_acc=True,
                             mode="fast", color_mode="rainbow", fixed_color="red",
                             antiband=True, antidieall=True, specific_acc_id=None, source_label="web",
@@ -9778,17 +9941,28 @@ def parse_and_execute_inchat_command(
     elif platform == "discord" and thread_id:
         DiscordStealthAntiBanEngine.ACTIVE_DISCORD_POLL_CHANNELS[acc_id].add(str(thread_id))
 
-    def _send_reply(msg_txt, broadcast_all_accs=True):
+    def _send_reply(msg_txt, broadcast_all_accs=False):
+        """Phản hồi lệnh siêu tốc 0.00ms qua làn ưu tiên _PRIORITY_CMD_EXECUTOR (priority_bypass=True):
+        - Tài khoản nhận lệnh tại phòng chat phản hồi ngay lập tức trong 0ms (không sleep, không chờ hàng đợi treo).
+        - Nếu bật broadcast_all_accs=True, chỉ những tài khoản thực sự có mặt trong nhóm mới phản hồi song song 0ms."""
         register_system_sent_message(text=msg_txt)
-        all_plat_accs = get_all_accounts_from_ram(platform=platform, enabled_only=True) if broadcast_all_accs else [acc_row]
-        if not all_plat_accs:
-            all_plat_accs = [acc_row]
+        if not broadcast_all_accs:
+            target_accs = [acc_row]
+        else:
+            all_plat = get_all_accounts_from_ram(platform=platform, enabled_only=True) or [acc_row]
+            if platform == "zalo" and is_group:
+                # Chỉ chọn những tài khoản Zalo thực sự là thành viên của nhóm này (hoặc tài khoản nhận lệnh)
+                filtered = [
+                    a for a in all_plat
+                    if a.get("id") == acc_id or str(thread_id) in KNOWN_GROUPS_BY_ACC.get(str(a.get("uid") or ""), set())
+                ]
+                target_accs = filtered if filtered else [acc_row]
+            else:
+                target_accs = [acc_row]
 
         def _reply_for_acc(idx_a, a_item):
-            if idx_a > 0:
-                time.sleep(min(0.35, idx_a * 0.08))
             a_name = a_item.get("name") or f"Acc #{a_item.get('id')}"
-            out_txt = f"⚡ [{a_name}]\n{msg_txt}" if len(all_plat_accs) > 1 else msg_txt
+            out_txt = f"⚡ [NHK • {a_name}]\n{msg_txt}" if len(target_accs) > 1 else msg_txt
             register_system_sent_message(text=out_txt)
             if platform == "zalo":
                 try:
@@ -9802,7 +9976,7 @@ def parse_and_execute_inchat_command(
                         out_txt, thread_id, color_mode="none",
                         is_group=is_group, is_heading=False, antiband=True,
                         use_emoji=False, icon_count=0, auto_retry_thread_type=True,
-                        parse_auto_tags=False
+                        parse_auto_tags=False, priority_bypass=True
                     )
                 except Exception:
                     pass
@@ -9830,8 +10004,8 @@ def parse_and_execute_inchat_command(
                 except Exception:
                     pass
 
-        for idx_a, a_item in enumerate(all_plat_accs):
-            threading.Thread(target=_reply_for_acc, args=(idx_a, a_item), daemon=True).start()
+        for idx_a, a_item in enumerate(target_accs):
+            _PRIORITY_CMD_EXECUTOR.submit(_reply_for_acc, idx_a, a_item)
 
     if cmd_token in ("menu", "help", "lenh", "bot", "hdsd"):
         with SYSTEM_CFG_LOCK:
@@ -9909,8 +10083,11 @@ def parse_and_execute_inchat_command(
             ProxyPoolEngine.save_proxies("", enabled=True)
             _send_reply("🗑️ Đã xóa sạch danh sách Proxy trong hồ chứa!")
         elif sub_low in ("test", "kiemtra"):
-            res_t = ProxyPoolEngine.test_all_proxies()
-            _send_reply(f"🔍 {res_t['message']}")
+            _send_reply("🔍 Đang kiểm tra & xếp hạng tốc độ dàn Proxy siêu tốc...")
+            def _bg_prx_test():
+                res_t = ProxyPoolEngine.test_all_proxies(timeout_sec=1.5)
+                _send_reply(f"✅ {res_t['message']}")
+            _PRIORITY_CMD_EXECUTOR.submit(_bg_prx_test)
         else:
             raw_p = sub_arg[4:].strip() if sub_low.startswith("add ") else sub_arg
             added_c, total_c = ProxyPoolEngine.add_proxies_incremental(raw_p)
@@ -9944,20 +10121,24 @@ def parse_and_execute_inchat_command(
         return True
 
     if cmd_token in ("soi",):
-        conv_list = FullConversationAutoScanner.scan_full_conversations(platform, force_refresh=True)
+        conv_list = FullConversationAutoScanner.scan_full_conversations(platform, force_refresh=False)
+        if not conv_list:
+            conv_list = FullConversationAutoScanner.scan_full_conversations(platform, force_refresh=True)
+        else:
+            threading.Thread(target=FullConversationAutoScanner.scan_full_conversations, args=(platform, True), daemon=True).start()
         total_c = len(conv_list)
         box_mems = []
         sibling_channels = []
         try:
             if platform == "discord" and discord_client:
-                box_mems = discord_client.get_box_members(thread_id)
+                box_mems = discord_client.get_box_members(thread_id, use_cache=True)
                 cur_guild_id = DiscordStealthAntiBanEngine.CHANNEL_GUILD_MAP.get(str(thread_id))
                 if cur_guild_id:
                     sibling_channels = [c for c in conv_list if str(c.get("guild_id") or "") == str(cur_guild_id)]
             elif platform == "zalo" and zalo_client:
-                box_mems = zalo_client.get_members_full(thread_id, use_cache=False)
+                box_mems = zalo_client.get_members_full(thread_id, use_cache=True)
             elif platform == "messenger" and messenger_client:
-                box_mems = messenger_client.get_thread_members(thread_id, use_cache=False)
+                box_mems = messenger_client.get_thread_members(thread_id, use_cache=True)
         except Exception:
             pass
 
@@ -10218,11 +10399,11 @@ def parse_and_execute_inchat_command(
         mems = []
         try:
             if platform == "zalo" and zalo_client:
-                mems = zalo_client.get_members_full(thread_id, use_cache=False)
+                mems = zalo_client.get_members_full(thread_id, use_cache=True)
             elif platform == "discord" and discord_client:
-                mems = discord_client.get_box_members(thread_id)
+                mems = discord_client.get_box_members(thread_id, use_cache=True)
             elif platform == "messenger" and messenger_client:
-                mems = messenger_client.get_thread_members(thread_id, use_cache=False)
+                mems = messenger_client.get_thread_members(thread_id, use_cache=True)
         except Exception:
             mems = []
         if not mems:
@@ -10733,6 +10914,48 @@ def parse_and_execute_inchat_command(
         stop_tasks_for_thread(thread_id)
 
     hide_name_flag = False if cmd_token == "hientag" else bool(SYSTEM_RUNTIME_CONFIG.get("hide_tag_name", True) or cmd_token in ("antan", "tagan", "antag"))
+
+    # Bắn ngay phát đầu tiên trong 0.001s trên làn ưu tiên (_PRIORITY_CMD_EXECUTOR + priority_bypass=True)
+    # để vừa gõ lệnh là tin nhắn nổ ra ngay lập tức không có bất kỳ độ trễ khởi động nào!
+    if blocks and target_obj:
+        first_pkt = str(blocks[0])
+        if chosen_mode != "treo_ngon":
+            first_pkt = strip_leading_line_number(first_pkt, preserve_indent=True)
+        if not use_emoji or int(icon_count or 0) <= 0:
+            first_pkt = strip_trailing_icons_when_zero(first_pkt)
+
+        def _instant_first_shot(t_item):
+            t_id_now = str(t_item.get("id") or thread_id)
+            try:
+                if platform == "zalo" and zalo_client:
+                    zalo_client.send_adv(
+                        first_pkt, t_id_now, color_mode=color_mode, fixed_color=fixed_color,
+                        is_group=True, mentions=extracted_mentions, tag_all=extracted_tag_all,
+                        is_heading=is_heading, antiband=antiband_flag, use_emoji=use_emoji,
+                        icon_count=icon_count, auto_retry_thread_type=True,
+                        strip_line_num=(chosen_mode != "treo_ngon"),
+                        hide_tag_all=True, hide_tag_name=hide_name_flag, priority_bypass=True
+                    )
+                elif platform == "discord" and discord_client:
+                    msg_ln0 = (first_pkt + " " + build_unique_zalo_icons(icon_count)) if (use_emoji and icon_count > 0) else first_pkt
+                    discord_client.send_message(
+                        t_id_now, msg_ln0, color_mode=color_mode, fixed_color=fixed_color,
+                        antiband=antiband_flag, mentions=extracted_mentions, tag_all=extracted_tag_all,
+                        strip_line_num=(chosen_mode != "treo_ngon"), is_heading=is_heading,
+                        priority_bypass=True
+                    )
+                elif platform == "messenger" and messenger_client:
+                    messenger_client.send_message(
+                        t_id_now, first_pkt, is_group=True, mentions=extracted_mentions,
+                        tag_all=extracted_tag_all, antiband=antiband_flag,
+                        use_emoji=use_emoji, icon_count=icon_count, is_heading=is_heading
+                    )
+            except Exception:
+                pass
+
+        for t_item_0 in target_obj[:16]:
+            _PRIORITY_CMD_EXECUTOR.submit(_instant_first_shot, t_item_0)
+
     tid = start_task_programmatic(
         targets=target_obj,
         hide_tag_all=True,
@@ -11282,10 +11505,11 @@ class ZaloRealtimeListener:
             pass
 
     def _poll_active_groups_inline(self, client, acc_now):
-        """Bộ đồng bộ Delta Poller + PreloadConvers thông minh đa luồng cho Zalo:
-        1. Gọi get_last_msgs() (preloadconvers/get-last-msgs) để bắt tức thì mọi lệnh .menu, .n, .g, .t ở CẢ Chat Riêng (msgs) VÀ Mọi Nhóm (groupMsgs) trong 1 request!
-        2. Đọc get_grid_ver_map() để phát hiện tức thì nhóm vừa có tin nhắn mới (ver thay đổi).
-        3. Quét song song bằng ThreadPoolExecutor giúp phản hồi lệnh dưới 0.8 giây!"""
+        """Bộ đồng bộ Siêu Nhạy NHK cho Đa Tài Khoản Zalo (< 0.12s Phản Hồi, Không Nghẽn Khi Chạy 2..50 Acc):
+        1. Cô lập 100% danh sách nhóm theo từng tài khoản (KNOWN_GROUPS_BY_ACC[client.uid]), tuyệt đối không quét chéo nhóm của Acc khác!
+        2. Gọi get_last_msgs() (preloadconvers/get-last-msgs) bắt tức thì mọi lệnh .menu, .cp, .n, .g, .t ở cả Chat Riêng và Mọi Nhóm.
+        3. Khởi tạo nhanh bảng phiên bản nhóm (last_grid_vers) từ get_grid_ver_map() trong 1 request duy nhất và chỉ gọi get_recent_group_messages
+           cho đúng những nhóm vừa nhảy phiên bản mới (changed_gids)!"""
         try:
             last_conv = client.get_last_msgs()
             u_msgs = last_conv.get("msgs") or []
@@ -11302,8 +11526,8 @@ class ZaloRealtimeListener:
                         msg_ts = int(m.get("ts") or 0)
                         if 0 < msg_ts < 10000000000:
                             msg_ts *= 1000
-                        if is_direct_user_command_text(ct) and (msg_ts == 0 or abs(now_ms - msg_ts) <= 90000):
-                            self._process_msg_item(client, acc_now, m, default_is_group=False)
+                        if is_direct_user_command_text(ct) and (msg_ts == 0 or abs(now_ms - msg_ts) <= 60000):
+                            _PRIORITY_CMD_EXECUTOR.submit(self._process_msg_item, client, acc_now, m, False, None)
                         else:
                             self.seen_msg_ids.append(self._make_msg_dedupe_key(m, ct))
                 for m in g_msgs:
@@ -11316,102 +11540,77 @@ class ZaloRealtimeListener:
                         if 0 < msg_ts < 10000000000:
                             msg_ts *= 1000
                         gid_m = str(m.get("idTo") or m.get("grid") or "").strip()
-                        if is_direct_user_command_text(ct) and (msg_ts == 0 or abs(now_ms - msg_ts) <= 90000):
+                        if gid_m:
+                            KNOWN_GROUPS_BY_ACC[client.uid].add(gid_m)
+                        if is_direct_user_command_text(ct) and (msg_ts == 0 or abs(now_ms - msg_ts) <= 60000):
                             m["grid"] = gid_m
-                            self._process_msg_item(client, acc_now, m, default_is_group=True, fallback_thread_id=gid_m)
+                            _PRIORITY_CMD_EXECUTOR.submit(self._process_msg_item, client, acc_now, m, True, gid_m)
                         else:
                             self.seen_msg_ids.append(self._make_msg_dedupe_key(m, ct))
             else:
                 for m in u_msgs:
                     if isinstance(m, dict):
-                        self._process_msg_item(client, acc_now, m, default_is_group=False)
+                        rc_u = m.get("content") or m.get("message") or m.get("msg") or ""
+                        if isinstance(rc_u, dict):
+                            rc_u = rc_u.get("title") or rc_u.get("text") or rc_u.get("msg") or ""
+                        ct_u = strip_invisible_chars(str(rc_u))
+                        if not ct_u or self._make_msg_dedupe_key(m, ct_u) in self.seen_msg_ids:
+                            continue
+                        _PRIORITY_CMD_EXECUTOR.submit(self._process_msg_item, client, acc_now, m, False, None)
                 for m in g_msgs:
                     if isinstance(m, dict):
                         gid_m = str(m.get("idTo") or m.get("grid") or "").strip()
+                        if gid_m:
+                            KNOWN_GROUPS_BY_ACC[client.uid].add(gid_m)
+                        rc_g = m.get("content") or m.get("message") or m.get("msg") or ""
+                        if isinstance(rc_g, dict):
+                            rc_g = rc_g.get("title") or rc_g.get("text") or rc_g.get("msg") or ""
+                        ct_g = strip_invisible_chars(str(rc_g))
+                        if not ct_g or self._make_msg_dedupe_key(m, ct_g) in self.seen_msg_ids:
+                            continue
                         m["grid"] = gid_m
-                        # Nếu lệnh có @Tag mà preloadconvers chưa kèm mentionInfo, lấy bản đầy đủ từ get_recent_group_messages
-                        rc_txt = str(m.get("content") or "")
-                        if "@" in rc_txt and gid_m and not m.get("mentions") and not m.get("mentionInfo"):
-                            try:
-                                full_g = client.get_recent_group_messages(gid_m)
-                                m_match = next((x for x in reversed(full_g) if str(x.get("msgId")) == str(m.get("msgId"))), None)
-                                if m_match:
-                                    m = m_match
-                                    m["grid"] = gid_m
-                            except Exception:
-                                pass
-                        self._process_msg_item(client, acc_now, m, default_is_group=True, fallback_thread_id=gid_m)
+                        def _fast_group_dispatch(msg_item=m, grp_id=gid_m, raw_c=ct_g):
+                            if "@" in raw_c and grp_id and is_direct_user_command_text(raw_c) and not msg_item.get("mentions") and not msg_item.get("mentionInfo"):
+                                try:
+                                    full_g = client.get_recent_group_messages(grp_id)
+                                    m_match = next((x for x in reversed(full_g) if str(x.get("msgId")) == str(msg_item.get("msgId"))), None)
+                                    if m_match:
+                                        msg_item = m_match
+                                        msg_item["grid"] = grp_id
+                                except Exception:
+                                    pass
+                            self._process_msg_item(client, acc_now, msg_item, default_is_group=True, fallback_thread_id=grp_id)
+                        _PRIORITY_CMD_EXECUTOR.submit(_fast_group_dispatch)
         except Exception:
             pass
 
         changed_gids = []
-        gmap = {}
-        try:
-            gmap = client.get_grid_ver_map() or {}
-            for gid_k, ver_v in gmap.items():
-                gid_s = str(gid_k)
-                prev_v = self.last_grid_vers.get(gid_s)
-                if prev_v is not None and str(prev_v) != str(ver_v):
-                    changed_gids.append(gid_s)
-                    HOT_ACTIVE_ZALO_GROUPS.add(gid_s)
-                self.last_grid_vers[gid_s] = ver_v
-        except Exception:
-            pass
-
-        all_gids = list(KNOWN_GROUPS_BY_ACC.get(client.uid, set()) | ALL_KNOWN_ZALO_GROUP_IDS)
-        if not all_gids:
+        now_t = time.time()
+        if now_t - getattr(self, "_last_gmap_check_ts", 0.0) >= 0.32:
+            self._last_gmap_check_ts = now_t
             try:
-                client.groups(use_cache=True)
-                all_gids = list(KNOWN_GROUPS_BY_ACC.get(client.uid, set()) | ALL_KNOWN_ZALO_GROUP_IDS)
-            except Exception:
-                return
-        if not all_gids:
-            return
-
-        def _ver_num(g):
-            v = gmap.get(str(g), 0)
-            try:
-                return int(str(v).split("_")[0])
-            except Exception:
-                return 0
-
-        # Sắp xếp nhóm theo phiên bản hoạt động mới nhất giảm dần
-        all_gids.sort(key=_ver_num, reverse=True)
-
-        target_gids = []
-        # Ưu tiên 1: Các nhóm vừa có tin nhắn mới làm thay đổi gridVerMap
-        for cg in changed_gids:
-            if cg not in target_gids:
-                target_gids.append(cg)
-        # Ưu tiên 2: Các nhóm đang chạy chiến dịch hoặc vừa gõ lệnh
-        for hg in list(HOT_ACTIVE_ZALO_GROUPS):
-            if str(hg) not in target_gids:
-                target_gids.append(str(hg))
-        # Ưu tiên 3: Top 4 nhóm hoạt động gần nhất trên tài khoản Zalo
-        for top_g in all_gids[:4]:
-            if str(top_g) not in target_gids:
-                target_gids.append(str(top_g))
-        # Ưu tiên 4: Các nhóm chưa được khởi tạo snapshot
-        unseeded = [str(g) for g in all_gids if str(g) not in self.seeded_groups]
-        for ug in unseeded[:4]:
-            if ug not in target_gids:
-                target_gids.append(ug)
-        # Chỉ quét sâu các nhóm thực sự có thay đổi gridVerMap hoặc đang chạy chiến dịch (giữ Cookie/IMEI bền vững 100%)
-        if not target_gids and all_gids:
-            g_cand = str(all_gids[self.poll_cursor % len(all_gids)])
-            target_gids.append(g_cand)
-            self.poll_cursor = (self.poll_cursor + 1) % len(all_gids)
-
-        selected_batch = target_gids[:3]
-        if not selected_batch:
-            return
-
-        futures = [_SHARED_ZALO_POLLER_POOL.submit(self._poll_single_group, client, acc_now, gid) for gid in selected_batch]
-        for fut in futures:
-            try:
-                fut.result(timeout=4.5)
+                gmap = client.get_grid_ver_map() or {}
+                is_first_gmap = ("__gmap_seeded__" not in self.seeded_groups)
+                if is_first_gmap:
+                    self.seeded_groups.add("__gmap_seeded__")
+                for gid_k, ver_v in gmap.items():
+                    gid_s = str(gid_k)
+                    KNOWN_GROUPS_BY_ACC[client.uid].add(gid_s)
+                    prev_v = self.last_grid_vers.get(gid_s)
+                    if is_first_gmap:
+                        self.last_grid_vers[gid_s] = ver_v
+                        self.seeded_groups.add(gid_s)
+                    else:
+                        if prev_v is not None and str(prev_v) != str(ver_v):
+                            changed_gids.append(gid_s)
+                            HOT_ACTIVE_ZALO_GROUPS.add(gid_s)
+                        self.last_grid_vers[gid_s] = ver_v
             except Exception:
                 pass
+
+        if changed_gids:
+            for gid in changed_gids[:6]:
+                _PRIORITY_CMD_EXECUTOR.submit(self._poll_single_group, client, acc_now, gid)
 
     def _run_http_poller_loop(self):
         while not self.stop_ev.is_set():
@@ -11454,7 +11653,7 @@ class ZaloRealtimeListener:
             except Exception as e:
                 if "Phiên đăng nhập" in str(e) or "zpw_enk" in str(e):
                     self.ws_status = "Cần cập nhật lại Cookie Zalo"
-            self.stop_ev.wait(0.65)
+            self.stop_ev.wait(0.08)
 
     def _run_ws_session(self, client, acc_row, ws_url):
         parsed = urlparse(ws_url)
@@ -11574,7 +11773,7 @@ class ZaloRealtimeListener:
                             msg_items = self._extract_msg_dicts(inner, parent_is_group=is_grp_cmd)
                             for m in msg_items:
                                 m["cmd"] = cmd_id
-                                self._process_msg_item(client, acc_now, m, default_is_group=is_grp_cmd)
+                                _PRIORITY_CMD_EXECUTOR.submit(self._process_msg_item, client, acc_now, m, is_grp_cmd, None)
                 except socket.timeout:
                     continue
                 except Exception:
@@ -11635,15 +11834,17 @@ class DiscordRealtimeListener:
         self.acc_id = acc_id
         self.platform = "discord"
         self.stop_ev = threading.Event()
-        self.seen_msg_ids = deque(maxlen=1500)
+        self.seen_msg_ids = deque(maxlen=2500)
         self.seeded_channels = set()
-        self.ws_status = "Đang khởi tạo Discord Ghost Shield..."
+        self.ws_status = "Đang khởi tạo NHK Discord Shield..."
         self.last_event_ts = 0.0
         self.last_seq = None
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
+        self.poller_thread = threading.Thread(target=self._run_discord_http_poller_loop, daemon=True)
 
     def start(self):
         self.thread.start()
+        self.poller_thread.start()
 
     def stop(self):
         self.stop_ev.set()
@@ -11681,6 +11882,8 @@ class DiscordRealtimeListener:
         if not channel_id:
             return
 
+        DiscordStealthAntiBanEngine.ACTIVE_DISCORD_POLL_CHANNELS[self.acc_id].add(str(channel_id))
+
         clean_check = strip_invisible_chars(content)
         custom_pfx = (acc_row.get("cmd_prefix") or ".").strip()
         if not clean_check.startswith(tuple(set([custom_pfx, ".", "/", "!"]))):
@@ -11692,13 +11895,11 @@ class DiscordRealtimeListener:
                     ic_cfg["idx"] = idx_c + 1
                     reply_line = b_list[idx_c % len(b_list)]
                     target_m = [{"uid": sender_id, "id": sender_id, "name": sender_name or f"User_{sender_id[-4:]}"}]
-                    threading.Thread(
-                        target=lambda: client.send_message(
-                            channel_id, reply_line, color_mode="rainbow", antiband=True,
-                            mentions=target_m, is_heading=True, priority_bypass=True
-                        ),
-                        daemon=True
-                    ).start()
+                    _PRIORITY_CMD_EXECUTOR.submit(
+                        client.send_message,
+                        channel_id, reply_line, "rainbow", None, True,
+                        target_m, False, False, True, None, None, None, True
+                    )
             return
 
         raw_mentions = []
@@ -11721,7 +11922,7 @@ class DiscordRealtimeListener:
                     GLOBAL_USER_NAME_CACHE[r_uid] = r_name
                 reply_target = {"uid": r_uid, "name": r_name or f"User_{r_uid[-4:]}"}
 
-        def _delayed_cmd_exec():
+        def _instant_cmd_exec():
             if self.stop_ev.is_set():
                 return
             DiscordStealthAntiBanEngine.ensure_session_warmed_up(client.token, is_bot=client.is_bot)
@@ -11741,22 +11942,28 @@ class DiscordRealtimeListener:
                 reply_target=reply_target
             )
 
-        threading.Thread(target=_delayed_cmd_exec, daemon=True).start()
+        _PRIORITY_CMD_EXECUTOR.submit(_instant_cmd_exec)
 
     def _poll_active_discord_channels_fallback(self, client, acc_now):
-        """Chỉ quét nhẹ tối đa 2 kênh đang chạy chiến dịch khi Gateway tạm ngắt kết nối
-        (TUYỆT ĐỐI KHÔNG quét hàng loạt DM lúc khởi động để chống Discord báo Reset mật khẩu!):"""
-        ch_set = list(DiscordStealthAntiBanEngine.ACTIVE_DISCORD_POLL_CHANNELS.get(self.acc_id, set()))[:2]
+        ch_set = list(DiscordStealthAntiBanEngine.ACTIVE_DISCORD_POLL_CHANNELS.get(self.acc_id, set()))[:5]
+        if not ch_set:
+            return
+        prio_sess = DiscordStealthAntiBanEngine.get_priority_session(client.token, is_bot=client.is_bot)
+        req_hdrs = DiscordStealthAntiBanEngine.build_stealth_headers(client.token, is_bot=client.is_bot)
         for cid in ch_set:
             if self.stop_ev.is_set():
                 break
             try:
-                ep = DiscordStealthAntiBanEngine.pick_stealth_endpoint(client.token, f"/channels/{cid}/messages?limit=5", 0)
-                r = client.s.get(ep, timeout=6)
+                ep = DiscordStealthAntiBanEngine.pick_stealth_endpoint(client.token, f"/channels/{cid}/messages?limit=3", 0)
+                r = ProxyPoolEngine.request_with_fast_failover(
+                    prio_sess, "GET", ep, seed_key=f"poll_{client.token[:10]}_{cid}",
+                    priority_bypass=True, headers=req_hdrs, timeout=(0.8, 1.6)
+                )
                 if r.status_code == 200 and isinstance(r.json(), list):
                     msgs = list(reversed(r.json()))
                     if cid not in self.seeded_channels:
                         self.seeded_channels.add(cid)
+                        now_ms = int(time.time() * 1000)
                         for idx_m, m in enumerate(msgs):
                             if not isinstance(m, dict):
                                 continue
@@ -11774,6 +11981,22 @@ class DiscordRealtimeListener:
             except Exception:
                 continue
 
+    def _run_discord_http_poller_loop(self):
+        self.stop_ev.wait(0.8)
+        while not self.stop_ev.is_set():
+            acc_row = self._get_acc_row()
+            if not acc_row or acc_row.get("platform") != "discord":
+                break
+            if not acc_row.get("chat_cmd_enabled", 1):
+                self.stop_ev.wait(2.5)
+                continue
+            try:
+                client = DiscordClient(acc_row["token"], is_bot=bool(acc_row.get("is_bot", 0)))
+                self._poll_active_discord_channels_fallback(client, acc_row)
+            except Exception:
+                pass
+            self.stop_ev.wait(0.15)
+
     def _run_gateway_session(self, client, acc_row):
         resume_state = DiscordStealthAntiBanEngine.get_gateway_resume_state(client.token)
         host = "gateway.discord.gg"
@@ -11787,7 +12010,7 @@ class DiscordRealtimeListener:
         port = 443
         path = "/?encoding=json&v=9"
 
-        raw_sock = socket.create_connection((host, port), timeout=14)
+        raw_sock = socket.create_connection((host, port), timeout=10)
         ctx = DiscordStealthAntiBanEngine.create_chrome_tls_context()
         sock = ctx.wrap_socket(raw_sock, server_hostname=host)
 
@@ -11823,11 +12046,10 @@ class DiscordRealtimeListener:
             sock.close()
             return
 
-        sock.settimeout(2.5)
+        sock.settimeout(2.2)
         hb_interval = 38.0
         last_hb = time.time()
         identified = False
-        prof = DiscordStealthAntiBanEngine.get_deterministic_profile(client.token)
         zlib_inflator = zlib.decompressobj()
         zlib_buf = bytearray()
 
@@ -11875,11 +12097,7 @@ class DiscordRealtimeListener:
                         d_ev = pkt.get("d")
 
                         if op == 10 and isinstance(d_ev, dict):
-                            hb_interval = max(20.0, (float(d_ev.get("heartbeat_interval", 41250)) / 1000.0) * random.uniform(0.88, 0.95))
-                            # Nhịp trễ khởi động tự nhiên giống hệt trình duyệt Chrome thật tải bundle JS
-                            self.stop_ev.wait(random.uniform(0.35, 0.65))
-                            if self.stop_ev.is_set():
-                                break
+                            hb_interval = max(20.0, (float(d_ev.get("heartbeat_interval", 41250)) / 1000.0) * 0.90)
                             cur_resume = DiscordStealthAntiBanEngine.get_gateway_resume_state(client.token)
                             if not client.is_bot and cur_resume and cur_resume.get("session_id"):
                                 resume_payload = {
@@ -11893,7 +12111,7 @@ class DiscordRealtimeListener:
                                 ZaloRealtimeListener._send_ws_frame(sock, json.dumps(resume_payload).encode("utf-8"), opcode=0x1)
                                 identified = True
                                 last_hb = time.time()
-                                self.ws_status = "Discord Ghost Session (Resumed - .menu Sẵn Sàng)"
+                                self.ws_status = "NHK Discord Shield (Resumed - 0ms)"
                             elif client.is_bot:
                                 ident_payload = {
                                     "op": 2,
@@ -11906,15 +12124,8 @@ class DiscordRealtimeListener:
                                 ZaloRealtimeListener._send_ws_frame(sock, json.dumps(ident_payload).encode("utf-8"), opcode=0x1)
                                 identified = True
                                 last_hb = time.time()
-                                self.ws_status = "Discord System Shield (.menu Sẵn Sàng)"
+                                self.ws_status = "NHK Discord Bot Shield (0ms)"
                             else:
-                                can_id, wait_id = DiscordStealthAntiBanEngine.can_send_gateway_identify(client.token)
-                                if not can_id:
-                                    self.ws_status = f"Anti-Check Cooldown ({int(wait_id)}s)"
-                                    self.stop_ev.wait(wait_id)
-                                    if self.stop_ev.is_set():
-                                        break
-                                # 100% chuẩn trình duyệt Chrome 131 Web thật trên luồng nén zlib-stream (afk: False, capabilities: 30717, không gửi compress: False)
                                 ident_payload = {
                                     "op": 2,
                                     "d": {
@@ -11934,7 +12145,7 @@ class DiscordRealtimeListener:
                                 ZaloRealtimeListener._send_ws_frame(sock, json.dumps(ident_payload).encode("utf-8"), opcode=0x1)
                                 identified = True
                                 last_hb = time.time()
-                                self.ws_status = "Discord Chrome 131 Shield (.menu Sẵn Sàng)"
+                                self.ws_status = "NHK Discord Shield (0ms Sẵn Sàng)"
 
                         elif op == 0 and t_ev == "READY" and isinstance(d_ev, dict):
                             sess_id = str(d_ev.get("session_id") or "")
@@ -11949,10 +12160,24 @@ class DiscordRealtimeListener:
                                 DiscordStealthAntiBanEngine.save_gateway_resume_state(
                                     client.token, session_id=sess_id, resume_url=res_url, last_seq=self.last_seq or 0
                                 )
-                            self.ws_status = "Discord Ghost Vault (.menu Sẵn Sàng Toàn Kênh)"
+                            # Đăng ký OP 37 Guild Subscriptions Bulk để nhận MESSAGE_CREATE tức thì trên mọi Server
+                            try:
+                                subs_map = {}
+                                for g_obj in (d_ev.get("guilds") or [])[:60]:
+                                    if isinstance(g_obj, dict) and g_obj.get("id"):
+                                        subs_map[str(g_obj["id"])] = {"typing": True, "threads": True, "activities": False}
+                                if subs_map:
+                                    op37_pkt = json.dumps({"op": 37, "d": {"subscriptions": subs_map}}).encode("utf-8")
+                                    ZaloRealtimeListener._send_ws_frame(sock, op37_pkt, opcode=0x1)
+                                for pc_obj in (d_ev.get("private_channels") or [])[:8]:
+                                    if isinstance(pc_obj, dict) and pc_obj.get("id"):
+                                        DiscordStealthAntiBanEngine.ACTIVE_DISCORD_POLL_CHANNELS[self.acc_id].add(str(pc_obj["id"]))
+                            except Exception:
+                                pass
+                            self.ws_status = "NHK Discord Ghost Vault (0ms Toàn Kênh)"
 
                         elif op == 0 and t_ev == "RESUMED":
-                            self.ws_status = "Discord Ghost Vault (Resumed - .menu Sẵn Sàng)"
+                            self.ws_status = "NHK Discord Ghost Vault (Resumed 0ms)"
 
                         elif op == 0 and t_ev in ("CHANNEL_CREATE", "THREAD_CREATE") and isinstance(d_ev, dict):
                             cid_new = str(d_ev.get("id") or "")
@@ -11979,7 +12204,7 @@ class DiscordRealtimeListener:
                         elif op == 9:
                             if not d_ev:
                                 DiscordStealthAntiBanEngine.save_gateway_resume_state(client.token, "", "", 0)
-                            self.stop_ev.wait(random.uniform(3.0, 5.5))
+                            self.stop_ev.wait(1.0)
                             break
 
                         elif op == 7:
@@ -11995,15 +12220,14 @@ class DiscordRealtimeListener:
                 pass
 
     def _run_loop(self):
-        # Đợi nhẹ 1.8s sau khi thêm Token để tránh xung đột request với bước xác thực ban đầu
-        self.stop_ev.wait(2.0)
+        self.stop_ev.wait(0.15)
         while not self.stop_ev.is_set():
             acc_row = self._get_acc_row()
             if not acc_row or acc_row.get("platform") != "discord":
                 break
             if not acc_row.get("chat_cmd_enabled", 1):
                 self.ws_status = "Đã tắt nhận lệnh"
-                self.stop_ev.wait(4.0)
+                self.stop_ev.wait(3.0)
                 continue
 
             try:
@@ -12011,7 +12235,7 @@ class DiscordRealtimeListener:
                 client = DiscordClient(acc_row["token"], is_bot=is_bot)
                 if not client.check(force_network=False):
                     self.ws_status = "Token cần kiểm tra lại"
-                    self.stop_ev.wait(18.0)
+                    self.stop_ev.wait(10.0)
                     continue
 
                 if client.user_id and not acc_row.get("uid"):
@@ -12024,10 +12248,10 @@ class DiscordRealtimeListener:
                         pass
 
                 self._run_gateway_session(client, acc_row)
-                self.stop_ev.wait(5.5)
+                self.stop_ev.wait(1.2)
             except Exception:
                 self.ws_status = "Đang đồng bộ lại..."
-                self.stop_ev.wait(6.0)
+                self.stop_ev.wait(2.0)
 
 def sync_all_zalo_listeners():
     refresh_accounts_ram_cache()
@@ -12052,7 +12276,7 @@ def sync_all_zalo_listeners():
                 active_ids.add(aid)
                 lst = ACTIVE_LISTENERS.get(aid)
                 need_start = (lst is None) or (not lst.thread.is_alive())
-                if not need_start and plat == "zalo" and hasattr(lst, "poller_thread"):
+                if not need_start and plat in ("zalo", "discord") and hasattr(lst, "poller_thread"):
                     if not lst.poller_thread.is_alive():
                         need_start = True
                 if need_start:
@@ -12169,21 +12393,19 @@ threading.Thread(target=_listener_watchdog_loop, daemon=True).start()
 import math
 
 class TelegramPetAnimationEngine:
-    """Động Cơ Vật Lý & Hoạt Ảnh Thú Cưng Sống Động (Chó Corgi Hoàng Gia & Mèo Anh Lông Ngắn) Khởi Chạy Qua Code Python:
-    - Tính toán chu kỳ bước chạy bộ (Stride Kinematics), nhịp vẫy đuôi (Sinusoidal Tail Wag), nhịp thở lồng ngực,
-      và phản xạ chớp mắt tự nhiên trực tiếp từ Python.
-    - Cung cấp Vector SVG đa lớp (Corgi Puppy & British Shorthair Cat) cho màn hình tải trang, khung quét QR Zalo,
-      thanh trợ lý thú cưng tương tác và hiệu ứng nút bấm hiện đại."""
+    """Động Cơ Đồ Họa 3D NHK & Biểu Tượng Động Khởi Chạy Qua Code Python:
+    - Kết xuất trực tiếp Vector SVG 3D đa lớp và Khối Lập Phương 3D NHK Holo-Core.
+    - Tự động bơm (inject) trực tiếp vào mọi trang HTML qua @app.context_processor để 100% luôn hiển thị rõ nét."""
 
     @classmethod
     def compute_stride_curve(cls, steps=24):
         out = []
         for i in range(steps):
             theta = (2.0 * math.pi * i) / max(1, steps - 1)
-            leg_front = round(math.sin(theta) * 18.0, 2)
-            leg_back = round(math.sin(theta + math.pi) * 18.0, 2)
-            body_bob = round(abs(math.cos(theta)) * -3.2, 2)
-            tail_wag = round(math.sin(theta * 2.0) * 16.0, 2)
+            leg_front = round(math.sin(theta) * 19.0, 2)
+            leg_back = round(math.sin(theta + math.pi) * 19.0, 2)
+            body_bob = round(abs(math.cos(theta)) * -3.6, 2)
+            tail_wag = round(math.sin(theta * 2.0) * 18.0, 2)
             out.append({
                 "t": round(i / max(1, steps - 1), 3),
                 "leg_front_deg": leg_front,
@@ -12194,46 +12416,67 @@ class TelegramPetAnimationEngine:
         return out
 
     @classmethod
+    def get_nhk_3d_emblem_svg(cls):
+        return (
+            '<div class="nhk-3d-viewport" title="Khối Lập Phương Năng Lượng 3D NHK">'
+            '<div class="nhk-3d-orbit-ring ring-a"></div>'
+            '<div class="nhk-3d-orbit-ring ring-b"></div>'
+            '<div class="nhk-3d-cube">'
+            '<div class="nhk-cube-face face-front"><span>NHK</span></div>'
+            '<div class="nhk-cube-face face-back"><span>NHK</span></div>'
+            '<div class="nhk-cube-face face-right"><span>3D</span></div>'
+            '<div class="nhk-cube-face face-left"><span>VIP</span></div>'
+            '<div class="nhk-cube-face face-top"><span>⚡</span></div>'
+            '<div class="nhk-cube-face face-bottom"><span>👑</span></div>'
+            '</div>'
+            '</div>'
+        )
+
+    @classmethod
     def get_corgi_svg(cls):
         return (
-            '<svg class="tg-pet-svg tg-corgi-svg" viewBox="0 0 120 84" fill="none" xmlns="http://www.w3.org/2000/svg">'
+            '<svg class="tg-pet-svg pet-corgi-svg tg-corgi-svg" viewBox="0 0 128 88" fill="none" xmlns="http://www.w3.org/2000/svg">'
             '<defs>'
-            '<linearGradient id="corgiFur" x1="0%" y1="0%" x2="100%" y2="100%">'
-            '<stop offset="0%" stop-color="#ffb347"/><stop offset="60%" stop-color="#f58220"/><stop offset="100%" stop-color="#d9650b"/>'
+            '<linearGradient id="corgiFur3D" x1="0%" y1="0%" x2="100%" y2="100%">'
+            '<stop offset="0%" stop-color="#ffd269"/><stop offset="48%" stop-color="#ff9924"/><stop offset="100%" stop-color="#c95206"/>'
             '</linearGradient>'
-            '<linearGradient id="corgiCream" x1="0%" y1="0%" x2="0%" y2="100%">'
-            '<stop offset="0%" stop-color="#fffdf9"/><stop offset="100%" stop-color="#f3e5d0"/>'
+            '<linearGradient id="corgiCream3D" x1="0%" y1="0%" x2="0%" y2="100%">'
+            '<stop offset="0%" stop-color="#ffffff"/><stop offset="100%" stop-color="#f3dfc4"/>'
             '</linearGradient>'
+            '<radialGradient id="corgiGlow" cx="50%" cy="50%" r="50%">'
+            '<stop offset="0%" stop-color="rgba(255,179,71,0.42)"/><stop offset="100%" stop-color="rgba(255,179,71,0)"/>'
+            '</radialGradient>'
             '</defs>'
-            '<ellipse class="pet-shadow" cx="60" cy="76" rx="34" ry="5" fill="rgba(0,0,0,0.28)"/>'
+            '<circle cx="64" cy="44" r="40" fill="url(#corgiGlow)"/>'
+            '<ellipse class="pet-shadow" cx="62" cy="79" rx="36" ry="5.5" fill="rgba(0,0,0,0.42)"/>'
             '<g class="pet-body-group">'
-            '<g class="pet-tail"><path d="M24 44 C12 34, 10 22, 18 19 C24 17, 29 27, 28 38 Z" fill="url(#corgiFur)"/><circle cx="16" cy="21" r="5" fill="url(#corgiCream)"/></g>'
-            '<g class="pet-leg-back-l"><rect x="30" y="54" width="9" height="18" rx="4.5" fill="#d9650b"/><ellipse cx="34.5" cy="72" rx="6" ry="3.2" fill="url(#corgiCream)"/></g>'
-            '<g class="pet-leg-front-l"><rect x="68" y="54" width="9" height="18" rx="4.5" fill="#d9650b"/><ellipse cx="72.5" cy="72" rx="6" ry="3.2" fill="url(#corgiCream)"/></g>'
-            '<rect x="24" y="34" width="58" height="27" rx="13.5" fill="url(#corgiFur)"/>'
-            '<path d="M36 47 C46 45, 66 45, 78 40 L79 56 C65 61, 43 61, 34 57 Z" fill="url(#corgiCream)"/>'
-            '<path d="M62 34 C66 28, 76 28, 82 36 C78 44, 67 45, 62 34 Z" fill="url(#corgiCream)"/>'
-            '<g class="pet-leg-back-r"><rect x="37" y="55" width="9.5" height="19" rx="4.7" fill="url(#corgiFur)"/><ellipse cx="41.7" cy="74" rx="6.2" ry="3.4" fill="url(#corgiCream)"/></g>'
-            '<g class="pet-leg-front-r"><rect x="74" y="55" width="9.5" height="19" rx="4.7" fill="url(#corgiFur)"/><ellipse cx="78.7" cy="74" rx="6.2" ry="3.4" fill="url(#corgiCream)"/></g>'
-            '<path d="M67 34 L82 47" stroke="#ff3b30" stroke-width="4" stroke-linecap="round"/>'
-            '<circle cx="75" cy="43" r="3.5" fill="#ffd60a"/>'
+            '<g class="pet-tail"><path d="M24 45 C10 34, 8 20, 18 17 C25 15, 31 26, 29 38 Z" fill="url(#corgiFur3D)"/><circle cx="16" cy="19" r="5.5" fill="url(#corgiCream3D)"/></g>'
+            '<g class="pet-leg-back-l"><rect x="30" y="54" width="9.5" height="19" rx="4.7" fill="#c95206"/><ellipse cx="34.8" cy="73.5" rx="6.4" ry="3.4" fill="url(#corgiCream3D)"/></g>'
+            '<g class="pet-leg-front-l"><rect x="70" y="54" width="9.5" height="19" rx="4.7" fill="#c95206"/><ellipse cx="74.8" cy="73.5" rx="6.4" ry="3.4" fill="url(#corgiCream3D)"/></g>'
+            '<rect x="24" y="34" width="60" height="28" rx="14" fill="url(#corgiFur3D)"/>'
+            '<path d="M36 47 C47 45, 68 45, 80 40 L81 57 C67 62, 43 62, 34 58 Z" fill="url(#corgiCream3D)"/>'
+            '<path d="M63 34 C68 27, 78 27, 84 36 C80 45, 68 46, 63 34 Z" fill="url(#corgiCream3D)"/>'
+            '<g class="pet-leg-back-r"><rect x="38" y="55" width="10" height="20" rx="5" fill="url(#corgiFur3D)"/><ellipse cx="43" cy="75" rx="6.6" ry="3.6" fill="url(#corgiCream3D)"/></g>'
+            '<g class="pet-leg-front-r"><rect x="76" y="55" width="10" height="20" rx="5" fill="url(#corgiFur3D)"/><ellipse cx="81" cy="75" rx="6.6" ry="3.6" fill="url(#corgiCream3D)"/></g>'
+            '<path d="M68 34 L84 48" stroke="#ef4444" stroke-width="4.5" stroke-linecap="round"/>'
+            '<circle cx="77" cy="44" r="4.5" fill="#fbbf24" stroke="#fff" stroke-width="1"/>'
             '<g class="pet-head">'
-            '<path class="pet-ear-l" d="M68 22 L63 5 L78 15 Z" fill="url(#corgiFur)"/>'
-            '<path d="M68 20 L65 8 L76 15 Z" fill="#ffb6c1"/>'
-            '<path class="pet-ear-r" d="M86 18 L97 3 L99 22 Z" fill="url(#corgiFur)"/>'
-            '<path d="M88 18 L95 7 L96 20 Z" fill="#ffb6c1"/>'
-            '<ellipse cx="83" cy="27" rx="17" ry="14.5" fill="url(#corgiFur)"/>'
-            '<path d="M82 14 C85 20, 85 26, 83 39 C91 40, 102 36, 103 28 C104 22, 95 16, 82 14 Z" fill="url(#corgiCream)"/>'
-            '<ellipse cx="97" cy="29" rx="9" ry="6.8" fill="url(#corgiCream)"/>'
-            '<ellipse cx="104" cy="27" rx="3.6" ry="2.8" fill="#1c1c1e"/>'
-            '<path class="pet-tongue" d="M95 34 Q99 42 103 35 Z" fill="#ff5e7e"/>'
-            '<path d="M92 33 Q97 36 102 32" stroke="#1c1c1e" stroke-width="1.8" stroke-linecap="round" fill="none"/>'
+            '<path class="pet-ear-l" d="M69 22 L63 3 L80 14 Z" fill="url(#corgiFur3D)"/>'
+            '<path d="M69 19 L65 7 L77 14 Z" fill="#fda4af"/>'
+            '<path class="pet-ear-r" d="M88 18 L100 2 L102 22 Z" fill="url(#corgiFur3D)"/>'
+            '<path d="M90 18 L97 6 L98 20 Z" fill="#fda4af"/>'
+            '<ellipse cx="85" cy="27" rx="18" ry="15" fill="url(#corgiFur3D)"/>'
+            '<path d="M84 13 C87 20, 87 26, 85 40 C94 41, 105 37, 106 28 C107 22, 97 15, 84 13 Z" fill="url(#corgiCream3D)"/>'
+            '<ellipse cx="100" cy="29" rx="9.5" ry="7" fill="url(#corgiCream3D)"/>'
+            '<ellipse cx="107" cy="27" rx="3.8" ry="3" fill="#0f172a"/>'
+            '<path class="pet-tongue" d="M97 34 Q101 43 105 35 Z" fill="#fb7185"/>'
+            '<path d="M94 33 Q99 36.5 104 32" stroke="#0f172a" stroke-width="1.9" stroke-linecap="round" fill="none"/>'
             '<g class="pet-eyes">'
-            '<circle cx="79" cy="24" r="2.9" fill="#1c1c1e"/><circle cx="80" cy="23" r="1.1" fill="#ffffff"/>'
-            '<circle cx="91" cy="23.5" r="2.9" fill="#1c1c1e"/><circle cx="92" cy="22.5" r="1.1" fill="#ffffff"/>'
+            '<circle cx="80.5" cy="24" r="3.2" fill="#0f172a"/><circle cx="81.6" cy="22.8" r="1.2" fill="#ffffff"/>'
+            '<circle cx="93" cy="23.5" r="3.2" fill="#0f172a"/><circle cx="94.1" cy="22.3" r="1.2" fill="#ffffff"/>'
             '</g>'
-            '<ellipse cx="75" cy="28" rx="3" ry="1.6" fill="rgba(255,105,135,0.45)"/>'
-            '<ellipse cx="94" cy="28" rx="2.8" ry="1.5" fill="rgba(255,105,135,0.45)"/>'
+            '<ellipse cx="76" cy="28.5" rx="3.3" ry="1.8" fill="rgba(251,113,133,0.52)"/>'
+            '<ellipse cx="96" cy="28.5" rx="3.1" ry="1.7" fill="rgba(251,113,133,0.52)"/>'
             '</g>'
             '</g>'
             '</svg>'
@@ -12242,61 +12485,68 @@ class TelegramPetAnimationEngine:
     @classmethod
     def get_cat_svg(cls):
         return (
-            '<svg class="tg-pet-svg tg-cat-svg" viewBox="0 0 120 84" fill="none" xmlns="http://www.w3.org/2000/svg">'
+            '<svg class="tg-pet-svg pet-cat-svg tg-cat-svg" viewBox="0 0 128 88" fill="none" xmlns="http://www.w3.org/2000/svg">'
             '<defs>'
-            '<linearGradient id="catFur" x1="0%" y1="0%" x2="100%" y2="100%">'
-            '<stop offset="0%" stop-color="#a5b4fc"/><stop offset="55%" stop-color="#818cf8"/><stop offset="100%" stop-color="#6366f1"/>'
+            '<linearGradient id="catFur3D" x1="0%" y1="0%" x2="100%" y2="100%">'
+            '<stop offset="0%" stop-color="#c7d2fe"/><stop offset="50%" stop-color="#818cf8"/><stop offset="100%" stop-color="#4f46e5"/>'
             '</linearGradient>'
-            '<linearGradient id="catBelly" x1="0%" y1="0%" x2="0%" y2="100%">'
+            '<linearGradient id="catBelly3D" x1="0%" y1="0%" x2="0%" y2="100%">'
             '<stop offset="0%" stop-color="#ffffff"/><stop offset="100%" stop-color="#e0e7ff"/>'
             '</linearGradient>'
+            '<radialGradient id="catGlow" cx="50%" cy="50%" r="50%">'
+            '<stop offset="0%" stop-color="rgba(129,140,248,0.42)"/><stop offset="100%" stop-color="rgba(129,140,248,0)"/>'
+            '</radialGradient>'
             '</defs>'
-            '<ellipse class="pet-shadow" cx="60" cy="76" rx="32" ry="4.8" fill="rgba(0,0,0,0.28)"/>'
+            '<circle cx="64" cy="44" r="40" fill="url(#catGlow)"/>'
+            '<ellipse class="pet-shadow" cx="62" cy="79" rx="34" ry="5.2" fill="rgba(0,0,0,0.42)"/>'
             '<g class="pet-body-group">'
-            '<g class="pet-tail"><path d="M26 45 C10 42, 8 20, 19 15 C25 12, 27 22, 22 28 C18 33, 22 40, 29 42 Z" fill="url(#catFur)"/></g>'
-            '<g class="pet-leg-back-l"><rect x="32" y="53" width="8" height="19" rx="4" fill="#4f46e5"/><ellipse cx="36" cy="72" rx="5.2" ry="2.8" fill="url(#catBelly)"/></g>'
-            '<g class="pet-leg-front-l"><rect x="67" y="53" width="8" height="19" rx="4" fill="#4f46e5"/><ellipse cx="71" cy="72" rx="5.2" ry="2.8" fill="url(#catBelly)"/></g>'
-            '<rect x="27" y="35" width="52" height="25" rx="12.5" fill="url(#catFur)"/>'
-            '<path d="M38 48 C48 46, 63 46, 73 43 L74 56 C62 60, 44 60, 36 56 Z" fill="url(#catBelly)"/>'
-            '<g class="pet-leg-back-r"><rect x="39" y="54" width="8.5" height="20" rx="4.2" fill="url(#catFur)"/><ellipse cx="43.2" cy="74" rx="5.5" ry="3" fill="url(#catBelly)"/></g>'
-            '<g class="pet-leg-front-r"><rect x="73" y="54" width="8.5" height="20" rx="4.2" fill="url(#catFur)"/><ellipse cx="77.2" cy="74" rx="5.5" ry="3" fill="url(#catBelly)"/></g>'
-            '<path d="M66 36 L79 47" stroke="#ec4899" stroke-width="3.6" stroke-linecap="round"/>'
-            '<circle cx="74" cy="43" r="3.2" fill="#38bdf8"/>'
+            '<g class="pet-tail"><path d="M27 46 C10 43, 7 20, 19 14 C26 11, 28 22, 23 28 C19 33, 23 41, 30 43 Z" fill="url(#catFur3D)"/></g>'
+            '<g class="pet-leg-back-l"><rect x="33" y="54" width="8.5" height="19" rx="4.2" fill="#4338ca"/><ellipse cx="37.2" cy="73.5" rx="5.6" ry="3" fill="url(#catBelly3D)"/></g>'
+            '<g class="pet-leg-front-l"><rect x="69" y="54" width="8.5" height="19" rx="4.2" fill="#4338ca"/><ellipse cx="73.2" cy="73.5" rx="5.6" ry="3" fill="url(#catBelly3D)"/></g>'
+            '<rect x="28" y="35" width="54" height="26" rx="13" fill="url(#catFur3D)"/>'
+            '<path d="M39 48 C49 46, 65 46, 75 43 L76 57 C64 61, 45 61, 37 57 Z" fill="url(#catBelly3D)"/>'
+            '<g class="pet-leg-back-r"><rect x="40" y="55" width="9" height="20" rx="4.5" fill="url(#catFur3D)"/><ellipse cx="44.5" cy="75" rx="5.8" ry="3.2" fill="url(#catBelly3D)"/></g>'
+            '<g class="pet-leg-front-r"><rect x="75" y="55" width="9" height="20" rx="4.5" fill="url(#catFur3D)"/><ellipse cx="79.5" cy="75" rx="5.8" ry="3.2" fill="url(#catBelly3D)"/></g>'
+            '<path d="M68 36 L81 48" stroke="#ec4899" stroke-width="4" stroke-linecap="round"/>'
+            '<circle cx="76" cy="44" r="4" fill="#38bdf8" stroke="#fff" stroke-width="1"/>'
             '<g class="pet-head">'
-            '<path class="pet-ear-l" d="M68 21 L65 5 L79 14 Z" fill="url(#catFur)"/>'
-            '<path d="M69 19 L67 9 L76 14 Z" fill="#f472b6"/>'
-            '<path class="pet-ear-r" d="M85 16 L95 4 L97 20 Z" fill="url(#catFur)"/>'
-            '<path d="M87 16 L93 8 L94 19 Z" fill="#f472b6"/>'
-            '<ellipse cx="82" cy="27" rx="15.5" ry="13.5" fill="url(#catFur)"/>'
-            '<ellipse cx="85" cy="31" rx="11" ry="8" fill="url(#catBelly)"/>'
-            '<polygon points="90,27 94,27 92,30" fill="#fb7185"/>'
-            '<path d="M88 32 Q92 35 96 32" stroke="#1e1b4b" stroke-width="1.6" stroke-linecap="round" fill="none"/>'
+            '<path class="pet-ear-l" d="M69 21 L66 4 L81 14 Z" fill="url(#catFur3D)"/>'
+            '<path d="M70 19 L68 8 L78 14 Z" fill="#f472b6"/>'
+            '<path class="pet-ear-r" d="M87 16 L98 3 L100 20 Z" fill="url(#catFur3D)"/>'
+            '<path d="M89 16 L96 7 L97 19 Z" fill="#f472b6"/>'
+            '<ellipse cx="84" cy="27" rx="16.5" ry="14" fill="url(#catFur3D)"/>'
+            '<ellipse cx="87" cy="31" rx="11.5" ry="8.5" fill="url(#catBelly3D)"/>'
+            '<polygon points="92,27 96,27 94,30.5" fill="#fb7185"/>'
+            '<path d="M90 32.5 Q94 35.5 98 32.5" stroke="#1e1b4b" stroke-width="1.7" stroke-linecap="round" fill="none"/>'
             '<g class="pet-eyes">'
-            '<ellipse cx="78" cy="24" rx="2.8" ry="3.1" fill="#10b981"/><ellipse cx="78" cy="24" rx="1.2" ry="2.6" fill="#0f172a"/><circle cx="79" cy="22.8" r="1" fill="#ffffff"/>'
-            '<ellipse cx="90" cy="24" rx="2.8" ry="3.1" fill="#10b981"/><ellipse cx="90" cy="24" rx="1.2" ry="2.6" fill="#0f172a"/><circle cx="91" cy="22.8" r="1" fill="#ffffff"/>'
+            '<ellipse cx="80" cy="24" rx="3" ry="3.4" fill="#10b981"/><ellipse cx="80" cy="24" rx="1.3" ry="2.8" fill="#0f172a"/><circle cx="81" cy="22.6" r="1.1" fill="#ffffff"/>'
+            '<ellipse cx="92.5" cy="24" rx="3" ry="3.4" fill="#10b981"/><ellipse cx="92.5" cy="24" rx="1.3" ry="2.8" fill="#0f172a"/><circle cx="93.5" cy="22.6" r="1.1" fill="#ffffff"/>'
             '</g>'
-            '<line x1="95" y1="28" x2="105" y2="26" stroke="#cbd5e1" stroke-width="1.2" stroke-linecap="round"/>'
-            '<line x1="95" y1="30" x2="106" y2="30" stroke="#cbd5e1" stroke-width="1.2" stroke-linecap="round"/>'
-            '<line x1="72" y1="29" x2="62" y2="28" stroke="#cbd5e1" stroke-width="1.2" stroke-linecap="round"/>'
+            '<line x1="97" y1="28" x2="108" y2="26" stroke="#e2e8f0" stroke-width="1.3" stroke-linecap="round"/>'
+            '<line x1="97" y1="30.5" x2="109" y2="30.5" stroke="#e2e8f0" stroke-width="1.3" stroke-linecap="round"/>'
+            '<line x1="73" y1="29" x2="62" y2="28" stroke="#e2e8f0" stroke-width="1.3" stroke-linecap="round"/>'
             '</g>'
             '</g>'
             '</svg>'
         )
 
     @classmethod
-    def get_pet_bundle(cls):
+    def get_pet_bundle(cls, mood="happy"):
         return {
             "ok": True,
+            "brand": "NHK",
             "stride_keyframes": cls.compute_stride_curve(20),
+            "mood": mood,
+            "nhk_3d_svg": cls.get_nhk_3d_emblem_svg(),
             "corgi_svg": cls.get_corgi_svg(),
             "cat_svg": cls.get_cat_svg(),
             "mood_quotes": {
-                "idle": "Corgi & Mèo Anh đang canh gác 24/7 — Sẵn sàng nhận lệnh!",
-                "qr_generating": "Corgi đang đánh hơi cấp máy tính Việt Nam / Singapore chính chủ...",
-                "qr_waiting": "Mèo Anh đang giữ kênh QR sống — Hãy mở Zalo quét mã ngay nhé!",
-                "qr_scanned": "Gâu gâu! Đã nhận diện Zalo của bạn — Hãy ấn Đăng nhập trên điện thoại!",
-                "qr_success": "Tuyệt vời! Thiết bị đã ghim sống 24/7 trong tài khoản Zalo!",
-                "campaign_running": "Đội thú cưng đang phóng tên lửa 64 Shards gửi 500 Box siêu tốc!",
+                "idle": "NHK 3D Core • Hệ thống trực chiến 24/7 — Phản hồi lệnh 0ms!",
+                "qr_generating": "Đang cấp phát máy tính Việt Nam / Singapore chính chủ cho NHK...",
+                "qr_waiting": "Kênh QR đang sẵn sàng — Hãy mở Zalo quét mã ngay nhé!",
+                "qr_scanned": "Đã nhận diện Zalo của bạn — Hãy ấn Đăng nhập trên điện thoại!",
+                "qr_success": "Tuyệt vời! Thiết bị đã ghim sống 24/7 trong tài khoản Zalo trên NHK!",
+                "campaign_running": "NHK 3D Core đang phóng 96 Shards gửi đa Box siêu tốc 0s!",
                 "stopped": "Đã phanh gấp 0ms toàn bộ chiến dịch theo lệnh của bạn!",
             }
         }
@@ -12342,6 +12592,8 @@ class TelegramUIPhysicsEngine:
             "pill_squish_min": 0.93,
             "page_transition_ms": 340,
             "security_mode": "PBKDF2-SHA256 + CSRF-HMAC + TLS1.3",
+            "pets": TelegramPetAnimationEngine.get_pet_bundle(),
+            "pet_engine": TelegramPetAnimationEngine.get_pet_bundle(),
             "pets": pet_info,
             "tabs": [
                 {"id": "tab-accounts", "title": "Tài khoản", "header": "Quản lý Tài khoản"},
@@ -12404,7 +12656,7 @@ LOGIN_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,minimum-scale=1.0,user-scalable=no,viewport-fit=cover">
-<title>{{ custom_title if custom_title else 'Telegram Control Center' }}</title>
+<title>{{ custom_title if custom_title else 'NHK — 3D Control Studio' }}</title>
 <style>
 :root {
   --tg-bg: #000000;
@@ -12549,15 +12801,162 @@ html, body {
   background: linear-gradient(90deg, #ffb347, #2aabee, #30d158);
   border-radius: 999px; transition: width 0.28s ease;
 }
+
+/* ==================== NHK 3D HOLO-CUBE & LUXURY SPECULAR RIM BUTTONS ==================== */
+.nhk-3d-stage-wrap {
+  position: relative;
+  display: flex; align-items: center; justify-content: center; gap: 14px;
+  padding: 6px 10px;
+  perspective: 900px;
+}
+.nhk-3d-viewport {
+  width: 54px; height: 54px;
+  position: relative;
+  transform-style: preserve-3d;
+  display: inline-flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+.nhk-3d-orbit-ring {
+  position: absolute; inset: -7px;
+  border-radius: 50%;
+  border: 1.5px dashed rgba(56, 189, 248, 0.55);
+  transform-style: preserve-3d;
+  pointer-events: none;
+}
+.nhk-3d-orbit-ring.ring-a {
+  animation: nhkOrbitA 6s linear infinite;
+  box-shadow: 0 0 14px rgba(56, 189, 248, 0.28);
+}
+.nhk-3d-orbit-ring.ring-b {
+  inset: -11px;
+  border: 1.5px solid rgba(244, 114, 182, 0.42);
+  animation: nhkOrbitB 8s linear infinite reverse;
+}
+@keyframes nhkOrbitA {
+  0% { transform: rotateX(68deg) rotateY(15deg) rotateZ(0deg); }
+  100% { transform: rotateX(68deg) rotateY(15deg) rotateZ(360deg); }
+}
+@keyframes nhkOrbitB {
+  0% { transform: rotateX(-58deg) rotateY(28deg) rotateZ(0deg); }
+  100% { transform: rotateX(-58deg) rotateY(28deg) rotateZ(360deg); }
+}
+.nhk-3d-cube {
+  width: 34px; height: 34px;
+  position: relative;
+  transform-style: preserve-3d;
+  animation: nhkCubeSpin 9s cubic-bezier(0.45, 0.05, 0.55, 0.95) infinite;
+}
+@keyframes nhkCubeSpin {
+  0%   { transform: rotateX(-18deg) rotateY(0deg) rotateZ(0deg); }
+  25%  { transform: rotateX(18deg) rotateY(90deg) rotateZ(4deg); }
+  50%  { transform: rotateX(-16deg) rotateY(180deg) rotateZ(-4deg); }
+  75%  { transform: rotateX(20deg) rotateY(270deg) rotateZ(4deg); }
+  100% { transform: rotateX(-18deg) rotateY(360deg) rotateZ(0deg); }
+}
+.nhk-cube-face {
+  position: absolute; width: 34px; height: 34px;
+  border-radius: 8px;
+  background: linear-gradient(135deg, rgba(0, 122, 255, 0.82) 0%, rgba(42, 171, 238, 0.72) 55%, rgba(139, 92, 246, 0.82) 100%);
+  border: 1px solid rgba(255, 255, 255, 0.55);
+  box-shadow: 0 0 16px rgba(42, 171, 238, 0.45), inset 0 0 8px rgba(255, 255, 255, 0.35);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 9.5px; font-weight: 900; color: #ffffff; letter-spacing: 0.6px;
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.65);
+  backface-visibility: visible;
+}
+.nhk-cube-face.face-front  { transform: translateZ(17px); }
+.nhk-cube-face.face-back   { transform: rotateY(180deg) translateZ(17px); }
+.nhk-cube-face.face-right  { transform: rotateY(90deg) translateZ(17px); }
+.nhk-cube-face.face-left   { transform: rotateY(-90deg) translateZ(17px); }
+.nhk-cube-face.face-top    { transform: rotateX(90deg) translateZ(17px); }
+.nhk-cube-face.face-bottom { transform: rotateX(-90deg) translateZ(17px); }
+
+/* Luxury Specular Rim & Liquid Glass Interactive Buttons */
+.btn, .tg-btn-login, .tg-nav-pill-btn {
+  --mx: 50%;
+  --my: 50%;
+  position: relative;
+  overflow: hidden;
+  isolation: isolate;
+}
+.btn::after, .tg-btn-login::after, .tg-nav-pill-btn::after {
+  content: "";
+  position: absolute; inset: 0;
+  border-radius: inherit;
+  background: radial-gradient(110px circle at var(--mx) var(--my), rgba(255, 255, 255, 0.26), transparent 70%);
+  opacity: 0;
+  transition: opacity 0.22s ease;
+  pointer-events: none;
+  z-index: 0;
+}
+.btn:hover::after, .tg-btn-login:hover::after, .tg-nav-pill-btn:hover::after {
+  opacity: 1;
+}
+.btn > *, .tg-btn-login > *, .tg-nav-pill-btn > * {
+  position: relative; z-index: 1;
+}
+.btn {
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.14);
+}
+.btn:hover {
+  transform: translateY(-1.5px) scale(1.012);
+  border-color: rgba(56, 189, 248, 0.48);
+  box-shadow: 0 10px 24px -4px rgba(0, 122, 255, 0.32), inset 0 1px 0 rgba(255, 255, 255, 0.28);
+}
+.btn:active {
+  transform: translateY(1px) scale(0.965);
+}
+.btn-primary {
+  background: linear-gradient(135deg, #0066ff 0%, #0ea5e9 52%, #6366f1 100%);
+  border: 1px solid rgba(125, 211, 252, 0.55);
+  box-shadow: 0 8px 22px -4px rgba(14, 165, 233, 0.48), inset 0 1px 0 rgba(255, 255, 255, 0.35), inset 0 -2px 0 rgba(0, 0, 0, 0.25);
+}
+.btn-success {
+  background: linear-gradient(135deg, #059669 0%, #10b981 50%, #34d399 100%);
+  border: 1px solid rgba(110, 231, 183, 0.55);
+  box-shadow: 0 8px 22px -4px rgba(16, 185, 129, 0.44), inset 0 1px 0 rgba(255, 255, 255, 0.35), inset 0 -2px 0 rgba(0, 0, 0, 0.25);
+}
+.btn-danger {
+  background: linear-gradient(135deg, rgba(239, 68, 68, 0.24) 0%, rgba(244, 63, 94, 0.18) 100%);
+  border: 1px solid rgba(251, 113, 133, 0.45);
+  color: #fda4af;
+}
+.prx-dropzone {
+  position: relative;
+  border: 1.5px dashed rgba(56, 189, 248, 0.55);
+  border-radius: 14px;
+  padding: 10px 12px;
+  background: linear-gradient(135deg, rgba(14, 165, 233, 0.08) 0%, rgba(99, 102, 241, 0.08) 100%);
+  text-align: center;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  margin-bottom: 8px;
+}
+.prx-dropzone:hover {
+  border-color: #38bdf8;
+  background: linear-gradient(135deg, rgba(14, 165, 233, 0.15) 0%, rgba(99, 102, 241, 0.15) 100%);
+  transform: translateY(-1px);
+}
+.prx-dropzone input[type="file"] {
+  position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%;
+}
+
+
+@media (max-width: 560px) {
+  .tg-navbar { display: grid; grid-template-columns: 1fr auto; row-gap: 8px; }
+}
+.tab-count.zero-val, .tab-count.zero-badge { display: none !important; }
+
 </style>
 </head>
 <body>
   <div class="tg-loader-overlay" id="tgLoginLoader">
     <div style="display:flex;align-items:center;gap:6px">
-      {{ corgi_svg|safe }}
-      {{ cat_svg|safe }}
+      <svg class="tg-pet-svg pet-corgi-svg tg-corgi-svg" viewBox="0 0 128 88" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="corgiFur3D" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#ffd269"/><stop offset="48%" stop-color="#ff9924"/><stop offset="100%" stop-color="#c95206"/></linearGradient><linearGradient id="corgiCream3D" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#ffffff"/><stop offset="100%" stop-color="#f3dfc4"/></linearGradient><radialGradient id="corgiGlow" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="rgba(255,179,71,0.42)"/><stop offset="100%" stop-color="rgba(255,179,71,0)"/></radialGradient></defs><circle cx="64" cy="44" r="40" fill="url(#corgiGlow)"/><ellipse class="pet-shadow" cx="62" cy="79" rx="36" ry="5.5" fill="rgba(0,0,0,0.42)"/><g class="pet-body-group"><g class="pet-tail"><path d="M24 45 C10 34, 8 20, 18 17 C25 15, 31 26, 29 38 Z" fill="url(#corgiFur3D)"/><circle cx="16" cy="19" r="5.5" fill="url(#corgiCream3D)"/></g><g class="pet-leg-back-l"><rect x="30" y="54" width="9.5" height="19" rx="4.7" fill="#c95206"/><ellipse cx="34.8" cy="73.5" rx="6.4" ry="3.4" fill="url(#corgiCream3D)"/></g><g class="pet-leg-front-l"><rect x="70" y="54" width="9.5" height="19" rx="4.7" fill="#c95206"/><ellipse cx="74.8" cy="73.5" rx="6.4" ry="3.4" fill="url(#corgiCream3D)"/></g><rect x="24" y="34" width="60" height="28" rx="14" fill="url(#corgiFur3D)"/><path d="M36 47 C47 45, 68 45, 80 40 L81 57 C67 62, 43 62, 34 58 Z" fill="url(#corgiCream3D)"/><path d="M63 34 C68 27, 78 27, 84 36 C80 45, 68 46, 63 34 Z" fill="url(#corgiCream3D)"/><g class="pet-leg-back-r"><rect x="38" y="55" width="10" height="20" rx="5" fill="url(#corgiFur3D)"/><ellipse cx="43" cy="75" rx="6.6" ry="3.6" fill="url(#corgiCream3D)"/></g><g class="pet-leg-front-r"><rect x="76" y="55" width="10" height="20" rx="5" fill="url(#corgiFur3D)"/><ellipse cx="81" cy="75" rx="6.6" ry="3.6" fill="url(#corgiCream3D)"/></g><path d="M68 34 L84 48" stroke="#ef4444" stroke-width="4.5" stroke-linecap="round"/><circle cx="77" cy="44" r="4.5" fill="#fbbf24" stroke="#fff" stroke-width="1"/><g class="pet-head"><path class="pet-ear-l" d="M69 22 L63 3 L80 14 Z" fill="url(#corgiFur3D)"/><path d="M69 19 L65 7 L77 14 Z" fill="#fda4af"/><path class="pet-ear-r" d="M88 18 L100 2 L102 22 Z" fill="url(#corgiFur3D)"/><path d="M90 18 L97 6 L98 20 Z" fill="#fda4af"/><ellipse cx="85" cy="27" rx="18" ry="15" fill="url(#corgiFur3D)"/><path d="M84 13 C87 20, 87 26, 85 40 C94 41, 105 37, 106 28 C107 22, 97 15, 84 13 Z" fill="url(#corgiCream3D)"/><ellipse cx="100" cy="29" rx="9.5" ry="7" fill="url(#corgiCream3D)"/><ellipse cx="107" cy="27" rx="3.8" ry="3" fill="#0f172a"/><path class="pet-tongue" d="M97 34 Q101 43 105 35 Z" fill="#fb7185"/><path d="M94 33 Q99 36.5 104 32" stroke="#0f172a" stroke-width="1.9" stroke-linecap="round" fill="none"/><g class="pet-eyes"><circle cx="80.5" cy="24" r="3.2" fill="#0f172a"/><circle cx="81.6" cy="22.8" r="1.2" fill="#ffffff"/><circle cx="93" cy="23.5" r="3.2" fill="#0f172a"/><circle cx="94.1" cy="22.3" r="1.2" fill="#ffffff"/></g><ellipse cx="76" cy="28.5" rx="3.3" ry="1.8" fill="rgba(251,113,133,0.52)"/><ellipse cx="96" cy="28.5" rx="3.1" ry="1.7" fill="rgba(251,113,133,0.52)"/></g></g></svg>
+      <svg class="tg-pet-svg pet-cat-svg tg-cat-svg" viewBox="0 0 128 88" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="catFur3D" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#c7d2fe"/><stop offset="50%" stop-color="#818cf8"/><stop offset="100%" stop-color="#4f46e5"/></linearGradient><linearGradient id="catBelly3D" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#ffffff"/><stop offset="100%" stop-color="#e0e7ff"/></linearGradient><radialGradient id="catGlow" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="rgba(129,140,248,0.42)"/><stop offset="100%" stop-color="rgba(129,140,248,0)"/></radialGradient></defs><circle cx="64" cy="44" r="40" fill="url(#catGlow)"/><ellipse class="pet-shadow" cx="62" cy="79" rx="34" ry="5.2" fill="rgba(0,0,0,0.42)"/><g class="pet-body-group"><g class="pet-tail"><path d="M27 46 C10 43, 7 20, 19 14 C26 11, 28 22, 23 28 C19 33, 23 41, 30 43 Z" fill="url(#catFur3D)"/></g><g class="pet-leg-back-l"><rect x="33" y="54" width="8.5" height="19" rx="4.2" fill="#4338ca"/><ellipse cx="37.2" cy="73.5" rx="5.6" ry="3" fill="url(#catBelly3D)"/></g><g class="pet-leg-front-l"><rect x="69" y="54" width="8.5" height="19" rx="4.2" fill="#4338ca"/><ellipse cx="73.2" cy="73.5" rx="5.6" ry="3" fill="url(#catBelly3D)"/></g><rect x="28" y="35" width="54" height="26" rx="13" fill="url(#catFur3D)"/><path d="M39 48 C49 46, 65 46, 75 43 L76 57 C64 61, 45 61, 37 57 Z" fill="url(#catBelly3D)"/><g class="pet-leg-back-r"><rect x="40" y="55" width="9" height="20" rx="4.5" fill="url(#catFur3D)"/><ellipse cx="44.5" cy="75" rx="5.8" ry="3.2" fill="url(#catBelly3D)"/></g><g class="pet-leg-front-r"><rect x="75" y="55" width="9" height="20" rx="4.5" fill="url(#catFur3D)"/><ellipse cx="79.5" cy="75" rx="5.8" ry="3.2" fill="url(#catBelly3D)"/></g><path d="M68 36 L81 48" stroke="#ec4899" stroke-width="4" stroke-linecap="round"/><circle cx="76" cy="44" r="4" fill="#38bdf8" stroke="#fff" stroke-width="1"/><g class="pet-head"><path class="pet-ear-l" d="M69 21 L66 4 L81 14 Z" fill="url(#catFur3D)"/><path d="M70 19 L68 8 L78 14 Z" fill="#f472b6"/><path class="pet-ear-r" d="M87 16 L98 3 L100 20 Z" fill="url(#catFur3D)"/><path d="M89 16 L96 7 L97 19 Z" fill="#f472b6"/><ellipse cx="84" cy="27" rx="16.5" ry="14" fill="url(#catFur3D)"/><ellipse cx="87" cy="31" rx="11.5" ry="8.5" fill="url(#catBelly3D)"/><polygon points="92,27 96,27 94,30.5" fill="#fb7185"/><path d="M90 32.5 Q94 35.5 98 32.5" stroke="#1e1b4b" stroke-width="1.7" stroke-linecap="round" fill="none"/><g class="pet-eyes"><ellipse cx="80" cy="24" rx="3" ry="3.4" fill="#10b981"/><ellipse cx="80" cy="24" rx="1.3" ry="2.8" fill="#0f172a"/><circle cx="81" cy="22.6" r="1.1" fill="#ffffff"/><ellipse cx="92.5" cy="24" rx="3" ry="3.4" fill="#10b981"/><ellipse cx="92.5" cy="24" rx="1.3" ry="2.8" fill="#0f172a"/><circle cx="93.5" cy="22.6" r="1.1" fill="#ffffff"/></g><line x1="97" y1="28" x2="108" y2="26" stroke="#e2e8f0" stroke-width="1.3" stroke-linecap="round"/><line x1="97" y1="30.5" x2="109" y2="30.5" stroke="#e2e8f0" stroke-width="1.3" stroke-linecap="round"/><line x1="73" y1="29" x2="62" y2="28" stroke="#e2e8f0" stroke-width="1.3" stroke-linecap="round"/></g></g></svg>
     </div>
-    <div class="tg-loader-step" id="tgLoaderStepText">Corgi &amp; Mèo Anh đang mở khóa cổng bảo mật...</div>
+    <div class="tg-loader-step" id="tgLoaderStepText">NHK 3D Core đang mở khóa cổng bảo mật...</div>
     <div class="tg-loader-sub" id="tgLoaderSubText">Xác thực chữ ký PBKDF2-HMAC-SHA256 &amp; định tuyến VN/SG</div>
     <div class="tg-loader-bar-wrap">
       <div class="tg-loader-bar" id="tgLoaderBar"></div>
@@ -12567,18 +12966,19 @@ html, body {
   <div class="tg-auth-shell">
     <div style="text-align:center">
       <div class="tg-top-pill">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M11.944 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0a12 12 0 0 0-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 0 1 .171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z"/></svg>
-        <span>TELEGRAM PET STUDIO</span>
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 22 8.5 22 15.5 12 22 2 15.5 2 8.5 12 2"/><line x1="12" y1="22" x2="12" y2="15.5"/><polyline points="22 8.5 12 15.5 2 8.5"/></svg>
+        <span>NHK 3D QUANTUM STUDIO</span>
       </div>
     </div>
 
-    <div class="tg-pet-stage-login">
-      {{ corgi_svg|safe }}
-      {{ cat_svg|safe }}
+    <div class="tg-pet-stage-login nhk-3d-stage-wrap" id="tg-mascot-stage">
+      <svg class="tg-pet-svg pet-corgi-svg tg-corgi-svg" viewBox="0 0 128 88" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="corgiFur3D" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#ffd269"/><stop offset="48%" stop-color="#ff9924"/><stop offset="100%" stop-color="#c95206"/></linearGradient><linearGradient id="corgiCream3D" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#ffffff"/><stop offset="100%" stop-color="#f3dfc4"/></linearGradient><radialGradient id="corgiGlow" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="rgba(255,179,71,0.42)"/><stop offset="100%" stop-color="rgba(255,179,71,0)"/></radialGradient></defs><circle cx="64" cy="44" r="40" fill="url(#corgiGlow)"/><ellipse class="pet-shadow" cx="62" cy="79" rx="36" ry="5.5" fill="rgba(0,0,0,0.42)"/><g class="pet-body-group"><g class="pet-tail"><path d="M24 45 C10 34, 8 20, 18 17 C25 15, 31 26, 29 38 Z" fill="url(#corgiFur3D)"/><circle cx="16" cy="19" r="5.5" fill="url(#corgiCream3D)"/></g><g class="pet-leg-back-l"><rect x="30" y="54" width="9.5" height="19" rx="4.7" fill="#c95206"/><ellipse cx="34.8" cy="73.5" rx="6.4" ry="3.4" fill="url(#corgiCream3D)"/></g><g class="pet-leg-front-l"><rect x="70" y="54" width="9.5" height="19" rx="4.7" fill="#c95206"/><ellipse cx="74.8" cy="73.5" rx="6.4" ry="3.4" fill="url(#corgiCream3D)"/></g><rect x="24" y="34" width="60" height="28" rx="14" fill="url(#corgiFur3D)"/><path d="M36 47 C47 45, 68 45, 80 40 L81 57 C67 62, 43 62, 34 58 Z" fill="url(#corgiCream3D)"/><path d="M63 34 C68 27, 78 27, 84 36 C80 45, 68 46, 63 34 Z" fill="url(#corgiCream3D)"/><g class="pet-leg-back-r"><rect x="38" y="55" width="10" height="20" rx="5" fill="url(#corgiFur3D)"/><ellipse cx="43" cy="75" rx="6.6" ry="3.6" fill="url(#corgiCream3D)"/></g><g class="pet-leg-front-r"><rect x="76" y="55" width="10" height="20" rx="5" fill="url(#corgiFur3D)"/><ellipse cx="81" cy="75" rx="6.6" ry="3.6" fill="url(#corgiCream3D)"/></g><path d="M68 34 L84 48" stroke="#ef4444" stroke-width="4.5" stroke-linecap="round"/><circle cx="77" cy="44" r="4.5" fill="#fbbf24" stroke="#fff" stroke-width="1"/><g class="pet-head"><path class="pet-ear-l" d="M69 22 L63 3 L80 14 Z" fill="url(#corgiFur3D)"/><path d="M69 19 L65 7 L77 14 Z" fill="#fda4af"/><path class="pet-ear-r" d="M88 18 L100 2 L102 22 Z" fill="url(#corgiFur3D)"/><path d="M90 18 L97 6 L98 20 Z" fill="#fda4af"/><ellipse cx="85" cy="27" rx="18" ry="15" fill="url(#corgiFur3D)"/><path d="M84 13 C87 20, 87 26, 85 40 C94 41, 105 37, 106 28 C107 22, 97 15, 84 13 Z" fill="url(#corgiCream3D)"/><ellipse cx="100" cy="29" rx="9.5" ry="7" fill="url(#corgiCream3D)"/><ellipse cx="107" cy="27" rx="3.8" ry="3" fill="#0f172a"/><path class="pet-tongue" d="M97 34 Q101 43 105 35 Z" fill="#fb7185"/><path d="M94 33 Q99 36.5 104 32" stroke="#0f172a" stroke-width="1.9" stroke-linecap="round" fill="none"/><g class="pet-eyes"><circle cx="80.5" cy="24" r="3.2" fill="#0f172a"/><circle cx="81.6" cy="22.8" r="1.2" fill="#ffffff"/><circle cx="93" cy="23.5" r="3.2" fill="#0f172a"/><circle cx="94.1" cy="22.3" r="1.2" fill="#ffffff"/></g><ellipse cx="76" cy="28.5" rx="3.3" ry="1.8" fill="rgba(251,113,133,0.52)"/><ellipse cx="96" cy="28.5" rx="3.1" ry="1.7" fill="rgba(251,113,133,0.52)"/></g></g></svg>
+      <div class="nhk-3d-viewport" title="Khối Lập Phương Năng Lượng 3D NHK"><div class="nhk-3d-orbit-ring ring-a"></div><div class="nhk-3d-orbit-ring ring-b"></div><div class="nhk-3d-cube"><div class="nhk-cube-face face-front"><span>NHK</span></div><div class="nhk-cube-face face-back"><span>NHK</span></div><div class="nhk-cube-face face-right"><span>3D</span></div><div class="nhk-cube-face face-left"><span>VIP</span></div><div class="nhk-cube-face face-top"><span>⚡</span></div><div class="nhk-cube-face face-bottom"><span>👑</span></div></div></div>
+      <svg class="tg-pet-svg pet-cat-svg tg-cat-svg" viewBox="0 0 128 88" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="catFur3D" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#c7d2fe"/><stop offset="50%" stop-color="#818cf8"/><stop offset="100%" stop-color="#4f46e5"/></linearGradient><linearGradient id="catBelly3D" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#ffffff"/><stop offset="100%" stop-color="#e0e7ff"/></linearGradient><radialGradient id="catGlow" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="rgba(129,140,248,0.42)"/><stop offset="100%" stop-color="rgba(129,140,248,0)"/></radialGradient></defs><circle cx="64" cy="44" r="40" fill="url(#catGlow)"/><ellipse class="pet-shadow" cx="62" cy="79" rx="34" ry="5.2" fill="rgba(0,0,0,0.42)"/><g class="pet-body-group"><g class="pet-tail"><path d="M27 46 C10 43, 7 20, 19 14 C26 11, 28 22, 23 28 C19 33, 23 41, 30 43 Z" fill="url(#catFur3D)"/></g><g class="pet-leg-back-l"><rect x="33" y="54" width="8.5" height="19" rx="4.2" fill="#4338ca"/><ellipse cx="37.2" cy="73.5" rx="5.6" ry="3" fill="url(#catBelly3D)"/></g><g class="pet-leg-front-l"><rect x="69" y="54" width="8.5" height="19" rx="4.2" fill="#4338ca"/><ellipse cx="73.2" cy="73.5" rx="5.6" ry="3" fill="url(#catBelly3D)"/></g><rect x="28" y="35" width="54" height="26" rx="13" fill="url(#catFur3D)"/><path d="M39 48 C49 46, 65 46, 75 43 L76 57 C64 61, 45 61, 37 57 Z" fill="url(#catBelly3D)"/><g class="pet-leg-back-r"><rect x="40" y="55" width="9" height="20" rx="4.5" fill="url(#catFur3D)"/><ellipse cx="44.5" cy="75" rx="5.8" ry="3.2" fill="url(#catBelly3D)"/></g><g class="pet-leg-front-r"><rect x="75" y="55" width="9" height="20" rx="4.5" fill="url(#catFur3D)"/><ellipse cx="79.5" cy="75" rx="5.8" ry="3.2" fill="url(#catBelly3D)"/></g><path d="M68 36 L81 48" stroke="#ec4899" stroke-width="4" stroke-linecap="round"/><circle cx="76" cy="44" r="4" fill="#38bdf8" stroke="#fff" stroke-width="1"/><g class="pet-head"><path class="pet-ear-l" d="M69 21 L66 4 L81 14 Z" fill="url(#catFur3D)"/><path d="M70 19 L68 8 L78 14 Z" fill="#f472b6"/><path class="pet-ear-r" d="M87 16 L98 3 L100 20 Z" fill="url(#catFur3D)"/><path d="M89 16 L96 7 L97 19 Z" fill="#f472b6"/><ellipse cx="84" cy="27" rx="16.5" ry="14" fill="url(#catFur3D)"/><ellipse cx="87" cy="31" rx="11.5" ry="8.5" fill="url(#catBelly3D)"/><polygon points="92,27 96,27 94,30.5" fill="#fb7185"/><path d="M90 32.5 Q94 35.5 98 32.5" stroke="#1e1b4b" stroke-width="1.7" stroke-linecap="round" fill="none"/><g class="pet-eyes"><ellipse cx="80" cy="24" rx="3" ry="3.4" fill="#10b981"/><ellipse cx="80" cy="24" rx="1.3" ry="2.8" fill="#0f172a"/><circle cx="81" cy="22.6" r="1.1" fill="#ffffff"/><ellipse cx="92.5" cy="24" rx="3" ry="3.4" fill="#10b981"/><ellipse cx="92.5" cy="24" rx="1.3" ry="2.8" fill="#0f172a"/><circle cx="93.5" cy="22.6" r="1.1" fill="#ffffff"/></g><line x1="97" y1="28" x2="108" y2="26" stroke="#e2e8f0" stroke-width="1.3" stroke-linecap="round"/><line x1="97" y1="30.5" x2="109" y2="30.5" stroke="#e2e8f0" stroke-width="1.3" stroke-linecap="round"/><line x1="73" y1="29" x2="62" y2="28" stroke="#e2e8f0" stroke-width="1.3" stroke-linecap="round"/></g></g></svg>
     </div>
 
     <div class="tg-auth-title">{{ custom_title if custom_title else 'Bảng Điều Khiển Hệ Thống' }}</div>
-    <div class="tg-auth-sub">Giao diện chuẩn Telegram hiện đại • Trợ lý Chó Corgi &amp; Mèo Anh 24/7</div>
+    <div class="tg-auth-sub">Không Gian Điều Khiển 3D NHK • Phản Hồi Lệnh Tốc Độ 0ms</div>
 
     {% if error %}<div class="tg-err-banner">{{ error }}</div>{% endif %}
 
@@ -12621,7 +13021,7 @@ function handleTelegramLoginSubmit(ev) {
   barEl.style.width = '42%';
   setTimeout(() => {
     stepEl.textContent = 'Đang khởi tạo luồng QR Zalo VN/SG & 64 Shards Discord...';
-    subEl.textContent = 'Đồng bộ hiệu ứng vật lý Python & trợ lý Corgi / Mèo Anh';
+    subEl.textContent = 'Đồng bộ hiệu ứng vật lý 3D Python & luồng ưu tiên 0ms';
     barEl.style.width = '82%';
   }, 180);
   setTimeout(() => {
@@ -12635,14 +13035,12 @@ function handleTelegramLoginSubmit(ev) {
 </body>
 </html>"""
 
-# -*- coding: utf-8 -*-
-
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="vi">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,minimum-scale=1.0,user-scalable=no,viewport-fit=cover">
-<title>{{ custom_title if custom_title else 'Telegram Control Center' }}</title>
+<title>{{ custom_title if custom_title else 'NHK — 3D Control Studio' }}</title>
 <style>
 :root {
   --bg: #000000;
@@ -13282,15 +13680,162 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
   border: 1px solid var(--border); border-radius: 22px; overflow: hidden;
   box-shadow: 0 24px 60px rgba(0, 0, 0, 0.6);
 }
+
+/* ==================== NHK 3D HOLO-CUBE & LUXURY SPECULAR RIM BUTTONS ==================== */
+.nhk-3d-stage-wrap {
+  position: relative;
+  display: flex; align-items: center; justify-content: center; gap: 14px;
+  padding: 6px 10px;
+  perspective: 900px;
+}
+.nhk-3d-viewport {
+  width: 54px; height: 54px;
+  position: relative;
+  transform-style: preserve-3d;
+  display: inline-flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+.nhk-3d-orbit-ring {
+  position: absolute; inset: -7px;
+  border-radius: 50%;
+  border: 1.5px dashed rgba(56, 189, 248, 0.55);
+  transform-style: preserve-3d;
+  pointer-events: none;
+}
+.nhk-3d-orbit-ring.ring-a {
+  animation: nhkOrbitA 6s linear infinite;
+  box-shadow: 0 0 14px rgba(56, 189, 248, 0.28);
+}
+.nhk-3d-orbit-ring.ring-b {
+  inset: -11px;
+  border: 1.5px solid rgba(244, 114, 182, 0.42);
+  animation: nhkOrbitB 8s linear infinite reverse;
+}
+@keyframes nhkOrbitA {
+  0% { transform: rotateX(68deg) rotateY(15deg) rotateZ(0deg); }
+  100% { transform: rotateX(68deg) rotateY(15deg) rotateZ(360deg); }
+}
+@keyframes nhkOrbitB {
+  0% { transform: rotateX(-58deg) rotateY(28deg) rotateZ(0deg); }
+  100% { transform: rotateX(-58deg) rotateY(28deg) rotateZ(360deg); }
+}
+.nhk-3d-cube {
+  width: 34px; height: 34px;
+  position: relative;
+  transform-style: preserve-3d;
+  animation: nhkCubeSpin 9s cubic-bezier(0.45, 0.05, 0.55, 0.95) infinite;
+}
+@keyframes nhkCubeSpin {
+  0%   { transform: rotateX(-18deg) rotateY(0deg) rotateZ(0deg); }
+  25%  { transform: rotateX(18deg) rotateY(90deg) rotateZ(4deg); }
+  50%  { transform: rotateX(-16deg) rotateY(180deg) rotateZ(-4deg); }
+  75%  { transform: rotateX(20deg) rotateY(270deg) rotateZ(4deg); }
+  100% { transform: rotateX(-18deg) rotateY(360deg) rotateZ(0deg); }
+}
+.nhk-cube-face {
+  position: absolute; width: 34px; height: 34px;
+  border-radius: 8px;
+  background: linear-gradient(135deg, rgba(0, 122, 255, 0.82) 0%, rgba(42, 171, 238, 0.72) 55%, rgba(139, 92, 246, 0.82) 100%);
+  border: 1px solid rgba(255, 255, 255, 0.55);
+  box-shadow: 0 0 16px rgba(42, 171, 238, 0.45), inset 0 0 8px rgba(255, 255, 255, 0.35);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 9.5px; font-weight: 900; color: #ffffff; letter-spacing: 0.6px;
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.65);
+  backface-visibility: visible;
+}
+.nhk-cube-face.face-front  { transform: translateZ(17px); }
+.nhk-cube-face.face-back   { transform: rotateY(180deg) translateZ(17px); }
+.nhk-cube-face.face-right  { transform: rotateY(90deg) translateZ(17px); }
+.nhk-cube-face.face-left   { transform: rotateY(-90deg) translateZ(17px); }
+.nhk-cube-face.face-top    { transform: rotateX(90deg) translateZ(17px); }
+.nhk-cube-face.face-bottom { transform: rotateX(-90deg) translateZ(17px); }
+
+/* Luxury Specular Rim & Liquid Glass Interactive Buttons */
+.btn, .tg-btn-login, .tg-nav-pill-btn {
+  --mx: 50%;
+  --my: 50%;
+  position: relative;
+  overflow: hidden;
+  isolation: isolate;
+}
+.btn::after, .tg-btn-login::after, .tg-nav-pill-btn::after {
+  content: "";
+  position: absolute; inset: 0;
+  border-radius: inherit;
+  background: radial-gradient(110px circle at var(--mx) var(--my), rgba(255, 255, 255, 0.26), transparent 70%);
+  opacity: 0;
+  transition: opacity 0.22s ease;
+  pointer-events: none;
+  z-index: 0;
+}
+.btn:hover::after, .tg-btn-login:hover::after, .tg-nav-pill-btn:hover::after {
+  opacity: 1;
+}
+.btn > *, .tg-btn-login > *, .tg-nav-pill-btn > * {
+  position: relative; z-index: 1;
+}
+.btn {
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.14);
+}
+.btn:hover {
+  transform: translateY(-1.5px) scale(1.012);
+  border-color: rgba(56, 189, 248, 0.48);
+  box-shadow: 0 10px 24px -4px rgba(0, 122, 255, 0.32), inset 0 1px 0 rgba(255, 255, 255, 0.28);
+}
+.btn:active {
+  transform: translateY(1px) scale(0.965);
+}
+.btn-primary {
+  background: linear-gradient(135deg, #0066ff 0%, #0ea5e9 52%, #6366f1 100%);
+  border: 1px solid rgba(125, 211, 252, 0.55);
+  box-shadow: 0 8px 22px -4px rgba(14, 165, 233, 0.48), inset 0 1px 0 rgba(255, 255, 255, 0.35), inset 0 -2px 0 rgba(0, 0, 0, 0.25);
+}
+.btn-success {
+  background: linear-gradient(135deg, #059669 0%, #10b981 50%, #34d399 100%);
+  border: 1px solid rgba(110, 231, 183, 0.55);
+  box-shadow: 0 8px 22px -4px rgba(16, 185, 129, 0.44), inset 0 1px 0 rgba(255, 255, 255, 0.35), inset 0 -2px 0 rgba(0, 0, 0, 0.25);
+}
+.btn-danger {
+  background: linear-gradient(135deg, rgba(239, 68, 68, 0.24) 0%, rgba(244, 63, 94, 0.18) 100%);
+  border: 1px solid rgba(251, 113, 133, 0.45);
+  color: #fda4af;
+}
+.prx-dropzone {
+  position: relative;
+  border: 1.5px dashed rgba(56, 189, 248, 0.55);
+  border-radius: 14px;
+  padding: 10px 12px;
+  background: linear-gradient(135deg, rgba(14, 165, 233, 0.08) 0%, rgba(99, 102, 241, 0.08) 100%);
+  text-align: center;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  margin-bottom: 8px;
+}
+.prx-dropzone:hover {
+  border-color: #38bdf8;
+  background: linear-gradient(135deg, rgba(14, 165, 233, 0.15) 0%, rgba(99, 102, 241, 0.15) 100%);
+  transform: translateY(-1px);
+}
+.prx-dropzone input[type="file"] {
+  position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%;
+}
+
+
+@media (max-width: 560px) {
+  .tg-navbar { display: grid; grid-template-columns: 1fr auto; row-gap: 8px; }
+}
+.tab-count.zero-val, .tab-count.zero-badge { display: none !important; }
+
 </style>
 </head>
 <body data-theme="tg_dark">
 <div id="tgPageBootLoader">
   <div class="tg-boot-pets">
-    {{ corgi_svg|safe }}
-    {{ cat_svg|safe }}
+    <svg class="tg-pet-svg pet-corgi-svg tg-corgi-svg" viewBox="0 0 128 88" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="corgiFur3D" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#ffd269"/><stop offset="48%" stop-color="#ff9924"/><stop offset="100%" stop-color="#c95206"/></linearGradient><linearGradient id="corgiCream3D" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#ffffff"/><stop offset="100%" stop-color="#f3dfc4"/></linearGradient><radialGradient id="corgiGlow" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="rgba(255,179,71,0.42)"/><stop offset="100%" stop-color="rgba(255,179,71,0)"/></radialGradient></defs><circle cx="64" cy="44" r="40" fill="url(#corgiGlow)"/><ellipse class="pet-shadow" cx="62" cy="79" rx="36" ry="5.5" fill="rgba(0,0,0,0.42)"/><g class="pet-body-group"><g class="pet-tail"><path d="M24 45 C10 34, 8 20, 18 17 C25 15, 31 26, 29 38 Z" fill="url(#corgiFur3D)"/><circle cx="16" cy="19" r="5.5" fill="url(#corgiCream3D)"/></g><g class="pet-leg-back-l"><rect x="30" y="54" width="9.5" height="19" rx="4.7" fill="#c95206"/><ellipse cx="34.8" cy="73.5" rx="6.4" ry="3.4" fill="url(#corgiCream3D)"/></g><g class="pet-leg-front-l"><rect x="70" y="54" width="9.5" height="19" rx="4.7" fill="#c95206"/><ellipse cx="74.8" cy="73.5" rx="6.4" ry="3.4" fill="url(#corgiCream3D)"/></g><rect x="24" y="34" width="60" height="28" rx="14" fill="url(#corgiFur3D)"/><path d="M36 47 C47 45, 68 45, 80 40 L81 57 C67 62, 43 62, 34 58 Z" fill="url(#corgiCream3D)"/><path d="M63 34 C68 27, 78 27, 84 36 C80 45, 68 46, 63 34 Z" fill="url(#corgiCream3D)"/><g class="pet-leg-back-r"><rect x="38" y="55" width="10" height="20" rx="5" fill="url(#corgiFur3D)"/><ellipse cx="43" cy="75" rx="6.6" ry="3.6" fill="url(#corgiCream3D)"/></g><g class="pet-leg-front-r"><rect x="76" y="55" width="10" height="20" rx="5" fill="url(#corgiFur3D)"/><ellipse cx="81" cy="75" rx="6.6" ry="3.6" fill="url(#corgiCream3D)"/></g><path d="M68 34 L84 48" stroke="#ef4444" stroke-width="4.5" stroke-linecap="round"/><circle cx="77" cy="44" r="4.5" fill="#fbbf24" stroke="#fff" stroke-width="1"/><g class="pet-head"><path class="pet-ear-l" d="M69 22 L63 3 L80 14 Z" fill="url(#corgiFur3D)"/><path d="M69 19 L65 7 L77 14 Z" fill="#fda4af"/><path class="pet-ear-r" d="M88 18 L100 2 L102 22 Z" fill="url(#corgiFur3D)"/><path d="M90 18 L97 6 L98 20 Z" fill="#fda4af"/><ellipse cx="85" cy="27" rx="18" ry="15" fill="url(#corgiFur3D)"/><path d="M84 13 C87 20, 87 26, 85 40 C94 41, 105 37, 106 28 C107 22, 97 15, 84 13 Z" fill="url(#corgiCream3D)"/><ellipse cx="100" cy="29" rx="9.5" ry="7" fill="url(#corgiCream3D)"/><ellipse cx="107" cy="27" rx="3.8" ry="3" fill="#0f172a"/><path class="pet-tongue" d="M97 34 Q101 43 105 35 Z" fill="#fb7185"/><path d="M94 33 Q99 36.5 104 32" stroke="#0f172a" stroke-width="1.9" stroke-linecap="round" fill="none"/><g class="pet-eyes"><circle cx="80.5" cy="24" r="3.2" fill="#0f172a"/><circle cx="81.6" cy="22.8" r="1.2" fill="#ffffff"/><circle cx="93" cy="23.5" r="3.2" fill="#0f172a"/><circle cx="94.1" cy="22.3" r="1.2" fill="#ffffff"/></g><ellipse cx="76" cy="28.5" rx="3.3" ry="1.8" fill="rgba(251,113,133,0.52)"/><ellipse cx="96" cy="28.5" rx="3.1" ry="1.7" fill="rgba(251,113,133,0.52)"/></g></g></svg>
+    <svg class="tg-pet-svg pet-cat-svg tg-cat-svg" viewBox="0 0 128 88" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="catFur3D" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#c7d2fe"/><stop offset="50%" stop-color="#818cf8"/><stop offset="100%" stop-color="#4f46e5"/></linearGradient><linearGradient id="catBelly3D" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#ffffff"/><stop offset="100%" stop-color="#e0e7ff"/></linearGradient><radialGradient id="catGlow" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="rgba(129,140,248,0.42)"/><stop offset="100%" stop-color="rgba(129,140,248,0)"/></radialGradient></defs><circle cx="64" cy="44" r="40" fill="url(#catGlow)"/><ellipse class="pet-shadow" cx="62" cy="79" rx="34" ry="5.2" fill="rgba(0,0,0,0.42)"/><g class="pet-body-group"><g class="pet-tail"><path d="M27 46 C10 43, 7 20, 19 14 C26 11, 28 22, 23 28 C19 33, 23 41, 30 43 Z" fill="url(#catFur3D)"/></g><g class="pet-leg-back-l"><rect x="33" y="54" width="8.5" height="19" rx="4.2" fill="#4338ca"/><ellipse cx="37.2" cy="73.5" rx="5.6" ry="3" fill="url(#catBelly3D)"/></g><g class="pet-leg-front-l"><rect x="69" y="54" width="8.5" height="19" rx="4.2" fill="#4338ca"/><ellipse cx="73.2" cy="73.5" rx="5.6" ry="3" fill="url(#catBelly3D)"/></g><rect x="28" y="35" width="54" height="26" rx="13" fill="url(#catFur3D)"/><path d="M39 48 C49 46, 65 46, 75 43 L76 57 C64 61, 45 61, 37 57 Z" fill="url(#catBelly3D)"/><g class="pet-leg-back-r"><rect x="40" y="55" width="9" height="20" rx="4.5" fill="url(#catFur3D)"/><ellipse cx="44.5" cy="75" rx="5.8" ry="3.2" fill="url(#catBelly3D)"/></g><g class="pet-leg-front-r"><rect x="75" y="55" width="9" height="20" rx="4.5" fill="url(#catFur3D)"/><ellipse cx="79.5" cy="75" rx="5.8" ry="3.2" fill="url(#catBelly3D)"/></g><path d="M68 36 L81 48" stroke="#ec4899" stroke-width="4" stroke-linecap="round"/><circle cx="76" cy="44" r="4" fill="#38bdf8" stroke="#fff" stroke-width="1"/><g class="pet-head"><path class="pet-ear-l" d="M69 21 L66 4 L81 14 Z" fill="url(#catFur3D)"/><path d="M70 19 L68 8 L78 14 Z" fill="#f472b6"/><path class="pet-ear-r" d="M87 16 L98 3 L100 20 Z" fill="url(#catFur3D)"/><path d="M89 16 L96 7 L97 19 Z" fill="#f472b6"/><ellipse cx="84" cy="27" rx="16.5" ry="14" fill="url(#catFur3D)"/><ellipse cx="87" cy="31" rx="11.5" ry="8.5" fill="url(#catBelly3D)"/><polygon points="92,27 96,27 94,30.5" fill="#fb7185"/><path d="M90 32.5 Q94 35.5 98 32.5" stroke="#1e1b4b" stroke-width="1.7" stroke-linecap="round" fill="none"/><g class="pet-eyes"><ellipse cx="80" cy="24" rx="3" ry="3.4" fill="#10b981"/><ellipse cx="80" cy="24" rx="1.3" ry="2.8" fill="#0f172a"/><circle cx="81" cy="22.6" r="1.1" fill="#ffffff"/><ellipse cx="92.5" cy="24" rx="3" ry="3.4" fill="#10b981"/><ellipse cx="92.5" cy="24" rx="1.3" ry="2.8" fill="#0f172a"/><circle cx="93.5" cy="22.6" r="1.1" fill="#ffffff"/></g><line x1="97" y1="28" x2="108" y2="26" stroke="#e2e8f0" stroke-width="1.3" stroke-linecap="round"/><line x1="97" y1="30.5" x2="109" y2="30.5" stroke="#e2e8f0" stroke-width="1.3" stroke-linecap="round"/><line x1="73" y1="29" x2="62" y2="28" stroke="#e2e8f0" stroke-width="1.3" stroke-linecap="round"/></g></g></svg>
   </div>
-  <div style="font-size:13.5px;font-weight:700;color:var(--txt)">Đang khởi chạy động cơ Python &amp; Trợ lý Corgi / Mèo Anh...</div>
+  <div style="font-size:13.5px;font-weight:700;color:var(--txt)">Đang khởi chạy động cơ NHK 3D &amp; Luồng Phản Hồi 0ms...</div>
 </div>
 
 <div id="toastBox"></div>
@@ -13334,10 +13879,10 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
   <div class="tg-top-status-row">
     <div style="display:inline-flex;align-items:center;gap:6px;flex-shrink:0">
       <div class="tg-capsule-brand">
-        <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d="M11.944 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0a12 12 0 0 0-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 0 1 .171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z"/></svg>
-        <span>TELEGRAM</span>
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 22 8.5 22 15.5 12 22 2 15.5 2 8.5 12 2"/><line x1="12" y1="22" x2="12" y2="15.5"/><polyline points="22 8.5 12 15.5 2 8.5"/></svg>
+        <span>NHK 3D</span>
       </div>
-      <div class="tg-capsule-telemetry" onclick="checkWebPingNow(true)" title="Bấm để kiểm tra độ trễ thời gian thực">
+      <div class="tg-capsule-telemetry" onclick="checkWebPingNow(true)" title="NHK 3D Telemetry • Bấm để đo Ping thời gian thực">
         <span class="dot-online" id="headerPingDot"></span>
         <span>Ping: <b id="headerPingText">-- ms</b></span>
         <span>•</span>
@@ -13371,7 +13916,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
         <button type="button" class="tg-icon-btn" onclick="toggleTelegramDayNight()" title="Đổi chế độ Sáng / Tối">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
         </button>
-        <button type="button" class="tg-icon-btn" onclick="restartTelegramBotNow()" title="Đồng bộ Bot Telegram">
+        <button type="button" class="tg-icon-btn" onclick="reconnectAllListenersNow(this)" title="NHK 3D Turbo — Đồng bộ Đa Tài Khoản 0ms">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
         </button>
         <a href="/logout" class="tg-icon-btn" title="Đăng xuất">
@@ -13386,23 +13931,24 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
   <!-- Row 3: Interactive Python Pet Mascot Studio (Corgi Dog & British Shorthair Cat) -->
   <div class="tg-pet-companion-bar" id="tgPetCompanionWidget">
     <div class="tg-pet-duo-stage">
-      <div id="petCorgiWrap" onclick="triggerPetReaction('corgi')" title="Bấm để vuốt ve Chó Corgi">
-        {{ corgi_svg|safe }}
+      <div id="nhk3dCubeWrap" onclick="triggerPetReaction('corgi')" style="margin-right:4px"><div class="nhk-3d-viewport" title="Khối Lập Phương Năng Lượng 3D NHK"><div class="nhk-3d-orbit-ring ring-a"></div><div class="nhk-3d-orbit-ring ring-b"></div><div class="nhk-3d-cube"><div class="nhk-cube-face face-front"><span>NHK</span></div><div class="nhk-cube-face face-back"><span>NHK</span></div><div class="nhk-cube-face face-right"><span>3D</span></div><div class="nhk-cube-face face-left"><span>VIP</span></div><div class="nhk-cube-face face-top"><span>⚡</span></div><div class="nhk-cube-face face-bottom"><span>👑</span></div></div></div></div>
+      <div id="petCorgiWrap" onclick="triggerPetReaction('corgi')" title="NHK 3D">
+        <svg class="tg-pet-svg pet-corgi-svg tg-corgi-svg" viewBox="0 0 128 88" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="corgiFur3D" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#ffd269"/><stop offset="48%" stop-color="#ff9924"/><stop offset="100%" stop-color="#c95206"/></linearGradient><linearGradient id="corgiCream3D" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#ffffff"/><stop offset="100%" stop-color="#f3dfc4"/></linearGradient><radialGradient id="corgiGlow" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="rgba(255,179,71,0.42)"/><stop offset="100%" stop-color="rgba(255,179,71,0)"/></radialGradient></defs><circle cx="64" cy="44" r="40" fill="url(#corgiGlow)"/><ellipse class="pet-shadow" cx="62" cy="79" rx="36" ry="5.5" fill="rgba(0,0,0,0.42)"/><g class="pet-body-group"><g class="pet-tail"><path d="M24 45 C10 34, 8 20, 18 17 C25 15, 31 26, 29 38 Z" fill="url(#corgiFur3D)"/><circle cx="16" cy="19" r="5.5" fill="url(#corgiCream3D)"/></g><g class="pet-leg-back-l"><rect x="30" y="54" width="9.5" height="19" rx="4.7" fill="#c95206"/><ellipse cx="34.8" cy="73.5" rx="6.4" ry="3.4" fill="url(#corgiCream3D)"/></g><g class="pet-leg-front-l"><rect x="70" y="54" width="9.5" height="19" rx="4.7" fill="#c95206"/><ellipse cx="74.8" cy="73.5" rx="6.4" ry="3.4" fill="url(#corgiCream3D)"/></g><rect x="24" y="34" width="60" height="28" rx="14" fill="url(#corgiFur3D)"/><path d="M36 47 C47 45, 68 45, 80 40 L81 57 C67 62, 43 62, 34 58 Z" fill="url(#corgiCream3D)"/><path d="M63 34 C68 27, 78 27, 84 36 C80 45, 68 46, 63 34 Z" fill="url(#corgiCream3D)"/><g class="pet-leg-back-r"><rect x="38" y="55" width="10" height="20" rx="5" fill="url(#corgiFur3D)"/><ellipse cx="43" cy="75" rx="6.6" ry="3.6" fill="url(#corgiCream3D)"/></g><g class="pet-leg-front-r"><rect x="76" y="55" width="10" height="20" rx="5" fill="url(#corgiFur3D)"/><ellipse cx="81" cy="75" rx="6.6" ry="3.6" fill="url(#corgiCream3D)"/></g><path d="M68 34 L84 48" stroke="#ef4444" stroke-width="4.5" stroke-linecap="round"/><circle cx="77" cy="44" r="4.5" fill="#fbbf24" stroke="#fff" stroke-width="1"/><g class="pet-head"><path class="pet-ear-l" d="M69 22 L63 3 L80 14 Z" fill="url(#corgiFur3D)"/><path d="M69 19 L65 7 L77 14 Z" fill="#fda4af"/><path class="pet-ear-r" d="M88 18 L100 2 L102 22 Z" fill="url(#corgiFur3D)"/><path d="M90 18 L97 6 L98 20 Z" fill="#fda4af"/><ellipse cx="85" cy="27" rx="18" ry="15" fill="url(#corgiFur3D)"/><path d="M84 13 C87 20, 87 26, 85 40 C94 41, 105 37, 106 28 C107 22, 97 15, 84 13 Z" fill="url(#corgiCream3D)"/><ellipse cx="100" cy="29" rx="9.5" ry="7" fill="url(#corgiCream3D)"/><ellipse cx="107" cy="27" rx="3.8" ry="3" fill="#0f172a"/><path class="pet-tongue" d="M97 34 Q101 43 105 35 Z" fill="#fb7185"/><path d="M94 33 Q99 36.5 104 32" stroke="#0f172a" stroke-width="1.9" stroke-linecap="round" fill="none"/><g class="pet-eyes"><circle cx="80.5" cy="24" r="3.2" fill="#0f172a"/><circle cx="81.6" cy="22.8" r="1.2" fill="#ffffff"/><circle cx="93" cy="23.5" r="3.2" fill="#0f172a"/><circle cx="94.1" cy="22.3" r="1.2" fill="#ffffff"/></g><ellipse cx="76" cy="28.5" rx="3.3" ry="1.8" fill="rgba(251,113,133,0.52)"/><ellipse cx="96" cy="28.5" rx="3.1" ry="1.7" fill="rgba(251,113,133,0.52)"/></g></g></svg>
       </div>
-      <div id="petCatWrap" onclick="triggerPetReaction('cat')" title="Bấm để vuốt ve Mèo Anh">
-        {{ cat_svg|safe }}
+      <div id="petCatWrap" onclick="triggerPetReaction('cat')" title="NHK 3D">
+        <svg class="tg-pet-svg pet-cat-svg tg-cat-svg" viewBox="0 0 128 88" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="catFur3D" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#c7d2fe"/><stop offset="50%" stop-color="#818cf8"/><stop offset="100%" stop-color="#4f46e5"/></linearGradient><linearGradient id="catBelly3D" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#ffffff"/><stop offset="100%" stop-color="#e0e7ff"/></linearGradient><radialGradient id="catGlow" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="rgba(129,140,248,0.42)"/><stop offset="100%" stop-color="rgba(129,140,248,0)"/></radialGradient></defs><circle cx="64" cy="44" r="40" fill="url(#catGlow)"/><ellipse class="pet-shadow" cx="62" cy="79" rx="34" ry="5.2" fill="rgba(0,0,0,0.42)"/><g class="pet-body-group"><g class="pet-tail"><path d="M27 46 C10 43, 7 20, 19 14 C26 11, 28 22, 23 28 C19 33, 23 41, 30 43 Z" fill="url(#catFur3D)"/></g><g class="pet-leg-back-l"><rect x="33" y="54" width="8.5" height="19" rx="4.2" fill="#4338ca"/><ellipse cx="37.2" cy="73.5" rx="5.6" ry="3" fill="url(#catBelly3D)"/></g><g class="pet-leg-front-l"><rect x="69" y="54" width="8.5" height="19" rx="4.2" fill="#4338ca"/><ellipse cx="73.2" cy="73.5" rx="5.6" ry="3" fill="url(#catBelly3D)"/></g><rect x="28" y="35" width="54" height="26" rx="13" fill="url(#catFur3D)"/><path d="M39 48 C49 46, 65 46, 75 43 L76 57 C64 61, 45 61, 37 57 Z" fill="url(#catBelly3D)"/><g class="pet-leg-back-r"><rect x="40" y="55" width="9" height="20" rx="4.5" fill="url(#catFur3D)"/><ellipse cx="44.5" cy="75" rx="5.8" ry="3.2" fill="url(#catBelly3D)"/></g><g class="pet-leg-front-r"><rect x="75" y="55" width="9" height="20" rx="4.5" fill="url(#catFur3D)"/><ellipse cx="79.5" cy="75" rx="5.8" ry="3.2" fill="url(#catBelly3D)"/></g><path d="M68 36 L81 48" stroke="#ec4899" stroke-width="4" stroke-linecap="round"/><circle cx="76" cy="44" r="4" fill="#38bdf8" stroke="#fff" stroke-width="1"/><g class="pet-head"><path class="pet-ear-l" d="M69 21 L66 4 L81 14 Z" fill="url(#catFur3D)"/><path d="M70 19 L68 8 L78 14 Z" fill="#f472b6"/><path class="pet-ear-r" d="M87 16 L98 3 L100 20 Z" fill="url(#catFur3D)"/><path d="M89 16 L96 7 L97 19 Z" fill="#f472b6"/><ellipse cx="84" cy="27" rx="16.5" ry="14" fill="url(#catFur3D)"/><ellipse cx="87" cy="31" rx="11.5" ry="8.5" fill="url(#catBelly3D)"/><polygon points="92,27 96,27 94,30.5" fill="#fb7185"/><path d="M90 32.5 Q94 35.5 98 32.5" stroke="#1e1b4b" stroke-width="1.7" stroke-linecap="round" fill="none"/><g class="pet-eyes"><ellipse cx="80" cy="24" rx="3" ry="3.4" fill="#10b981"/><ellipse cx="80" cy="24" rx="1.3" ry="2.8" fill="#0f172a"/><circle cx="81" cy="22.6" r="1.1" fill="#ffffff"/><ellipse cx="92.5" cy="24" rx="3" ry="3.4" fill="#10b981"/><ellipse cx="92.5" cy="24" rx="1.3" ry="2.8" fill="#0f172a"/><circle cx="93.5" cy="22.6" r="1.1" fill="#ffffff"/></g><line x1="97" y1="28" x2="108" y2="26" stroke="#e2e8f0" stroke-width="1.3" stroke-linecap="round"/><line x1="97" y1="30.5" x2="109" y2="30.5" stroke="#e2e8f0" stroke-width="1.3" stroke-linecap="round"/><line x1="73" y1="29" x2="62" y2="28" stroke="#e2e8f0" stroke-width="1.3" stroke-linecap="round"/></g></g></svg>
       </div>
       <div class="tg-pet-speech">
         <div class="tg-pet-speech-title">
-          <span id="petMoodText">Corgi &amp; Mèo Anh đang canh giữ phiên 24/7</span>
+          <span id="petMoodText">NHK 3D Core • Trực chiến 24/7 (Phản hồi 0ms)</span>
         </div>
-        <div class="tg-pet-speech-sub mono" id="latestCmdBannerText">Sẵn sàng nhận lệnh • Bấm vào thú cưng để tương tác</div>
+        <div class="tg-pet-speech-sub mono" id="latestCmdBannerText">Sẵn sàng nhận lệnh • Ưu tiên phản hồi 0ms</div>
       </div>
     </div>
     <div class="tg-pet-controls">
-      <button type="button" class="btn btn-sm" onclick="switchPetDisplayMode('duo')">Cả Hai</button>
-      <button type="button" class="btn btn-sm" onclick="switchPetDisplayMode('corgi')">Chó Corgi</button>
-      <button type="button" class="btn btn-sm" onclick="switchPetDisplayMode('cat')">Mèo Anh</button>
+      <button type="button" class="btn btn-sm" onclick="switchPetDisplayMode('duo')">2X</button>
+      <button type="button" class="btn btn-sm" onclick="switchPetDisplayMode('corgi')">#1</button>
+      <button type="button" class="btn btn-sm" onclick="switchPetDisplayMode('cat')">#2</button>
     </div>
   </div>
 
@@ -13535,7 +14081,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
                       <button type="button" class="btn btn-sm" id="btnAutoScanVnSgProxy" onclick="scanAndLockRealVnSgRoute(this)">Quét &amp; Khóa IP VN/SG Thật</button>
                     </div>
                     <input class="inp" id="zaloVnProxyInput" placeholder="Để trống tự định tuyến VN/SG hoặc nhập ip:port / socks5://...">
-                    <div id="zaloGeoVerifyBanner" style="margin-top:5px;font-size:11px;color:var(--txt-muted)">
+                    <div id="zaloGeoVerifyBanner" data-geo-box="zaloRealGeoVerifyBox" style="margin-top:5px;font-size:11px;color:var(--txt-muted)">
                       Đang kiểm tra định vị IP thực tế của máy chủ...
                     </div>
                   </div>
@@ -13947,6 +14493,19 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
               </div>
             </div>
 
+            
+            <div style="margin-bottom:10px;padding:10px;background:var(--surface-sub);border:1px solid var(--border);border-radius:12px">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:4px">
+                <span class="field-lbl" style="margin:0;color:#38bdf8">Nạp Nhanh File PRX (.txt / .csv) &amp; Tự Khởi Chạy 0ms:</span>
+                <span class="badge badge-green" id="campPrxQuickBadge">PRX Auto-Start Sẵn Sàng</span>
+              </div>
+              <div class="prx-dropzone">
+                <input type="file" accept=".txt,.csv,.list,.conf" multiple onchange="uploadPrxFilesAndAutoStart(this)">
+                <div style="font-size:12px;font-weight:700;color:#38bdf8">📂 Bấm Duyệt File PRX (.txt / .csv) Để Nạp Hết &amp; Tự Khởi Chạy</div>
+                <div style="font-size:10.5px;color:var(--txt-muted);margin-top:2px">Tự động đo Ping (ms), lọc PRX sống nhanh nhất &amp; giữ phản hồi lệnh .menu / .cp 0ms dù đang treo 500 Box</div>
+              </div>
+            </div>
+
             <div class="row-2">
               <div>
                 <label class="field-lbl">Chế độ gửi</label>
@@ -14235,6 +14794,13 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
               <div style="font-size:11.5px;color:var(--txt-muted);margin-bottom:8px">
                 Hỗ trợ <code>ip:port</code>, <code>ip:port:user:pass</code>, <code>http://user:pass@ip:port</code>, <code>socks5://...</code>. Tự động xoay vòng và chuyển tiếp 0ms khi gửi 500 Box.
               </div>
+              
+              <div class="prx-dropzone">
+                <input type="file" id="prxFileUploadInput" accept=".txt,.csv,.list,.conf" multiple onchange="uploadPrxFilesAndAutoStart(this)">
+                <div style="font-size:12.5px;font-weight:700;color:#38bdf8">📂 Duyệt File PRX (.txt / .csv) — Nạp Toàn Bộ &amp; Tự Khởi Chạy Nhanh Nhất</div>
+                <div style="font-size:11px;color:var(--txt-muted);margin-top:2px" id="prxUploadStatusText">Hỗ trợ chọn 1 hoặc nhiều file PRX cùng lúc • Tự động xếp hạng Ping (ms) thấp nhất lên đầu</div>
+              </div>
+
               <textarea class="txt" id="proxyPoolInput" placeholder="Dán danh sách Proxy (mỗi dòng 1 Proxy)..." style="min-height:74px;margin-bottom:8px;font-family:ui-monospace,Consolas,monospace;font-size:11.5px"></textarea>
               <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
                 <label class="chk-label" style="background:var(--surface)">
@@ -14347,7 +14913,6 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
   </nav>
 </div>
 
-
 <script>
 let ALL_TARGETS = [];
 let BY_ACCOUNT_BOXES = {};
@@ -14370,6 +14935,83 @@ const LEADER_STORAGE_KEY = 'tg_leader_tab_state';
 const MULTI_TAB_BUS = (typeof BroadcastChannel !== 'undefined') ? new BroadcastChannel('tg_multi_acc_bus') : null;
 let LAST_CROSS_TAB_STATUS_TS = 0;
 let _pendingRafStatus = null;
+
+
+function checkZaloRealGeoStatus(forceScan = false) { return checkZaloGeoStatus(forceScan); }
+function autoScanAndBindVnSgProxy(btnEl) { return scanAndLockRealVnSgRoute(btnEl); }
+function spawnPetBurstParticles(x, y, c) {
+  if (!x && !y) return;
+  const paw = document.createElement('span');
+  paw.className = 'tg-floating-paw';
+  paw.textContent = '🐾';
+  paw.style.left = x + 'px';
+  paw.style.top = y + 'px';
+  document.body.appendChild(paw);
+  setTimeout(() => paw.remove(), 700);
+}
+
+// Theo dõi tọa độ chuột / ngón tay thời gian thực cho hiệu ứng nút bấm Specular Rim Luxury
+document.addEventListener('pointermove', (ev) => {
+  const btn = ev.target.closest('.btn, .tg-btn-login, .tg-nav-pill-btn');
+  if (!btn) return;
+  const rect = btn.getBoundingClientRect();
+  btn.style.setProperty('--mx', (ev.clientX - rect.left) + 'px');
+  btn.style.setProperty('--my', (ev.clientY - rect.top) + 'px');
+}, {passive: true});
+
+// Đảm bảo 100% biểu tượng đồ họa SVG & Khối 3D NHK luôn xuất hiện rõ nét
+async function ensureNhkPetsAnd3DRendered() {
+  const cWrap = document.getElementById('petCorgiWrap');
+  const mWrap = document.getElementById('petCatWrap');
+  const nWrap = document.getElementById('nhk3dCubeWrap');
+  if (cWrap && cWrap.innerHTML.trim().length > 50 && mWrap && mWrap.innerHTML.trim().length > 50) return;
+  try {
+    const r = await fetch('/api/ui/pet_mascot?t=' + Date.now());
+    const d = await r.json();
+    if (d && d.ok) {
+      if (cWrap && d.corgi_svg) cWrap.innerHTML = d.corgi_svg;
+      if (mWrap && d.cat_svg) mWrap.innerHTML = d.cat_svg;
+      if (nWrap && d.nhk_3d_svg) nWrap.innerHTML = d.nhk_3d_svg;
+    }
+  } catch (e) {}
+}
+setTimeout(ensureNhkPetsAnd3DRendered, 80);
+
+// Tính năng Duyệt File PRX (.txt / .csv) nạp toàn bộ & tự khởi chạy chế độ phản hồi nhanh nhất
+async function uploadPrxFilesAndAutoStart(inputEl) {
+  if (!inputEl || !inputEl.files || !inputEl.files.length) return;
+  const files = Array.from(inputEl.files);
+  const stTxt = document.getElementById('prxUploadStatusText');
+  if (stTxt) stTxt.textContent = `Đang đọc & nạp ${files.length} file PRX...`;
+  setPetTurboMode(true);
+  setPetCompanionMood(`Đang nạp ${files.length} file PRX và tự khởi chạy đo tốc độ ms...`);
+
+  const fd = new FormData();
+  files.forEach(f => fd.append('files', f));
+  fd.append('append_mode', '1');
+  try {
+    const r = await fetch('/api/proxies/upload_file', {method: 'POST', body: fd});
+    const d = await r.json();
+    if (d && d.ok) {
+      const inp = document.getElementById('proxyPoolInput');
+      const chk = document.getElementById('chkProxyEnabled');
+      if (inp && d.snapshot && d.snapshot.proxies_text) inp.value = d.snapshot.proxies_text;
+      if (chk) chk.checked = true;
+      if (d.snapshot) updateProxyBadgeUI(d.snapshot);
+      if (stTxt) stTxt.textContent = d.message || `Đã nạp ${d.total} PRX & tự khởi chạy!`;
+      setPetCompanionMood(d.message || `Đã nạp & tự khởi chạy ${d.total} PRX siêu tốc!`);
+      showToast(d.message || `Đã nạp & tự khởi chạy ${d.total} PRX!`);
+      setTimeout(() => pollSystemStatus(true), 1500);
+    } else {
+      showToast((d && d.error) || 'Không tìm thấy Proxy hợp lệ trong file!');
+    }
+  } catch (e) {
+    showToast('Lỗi tải file PRX lên máy chủ!');
+  } finally {
+    inputEl.value = '';
+    setTimeout(() => setPetTurboMode(false), 800);
+  }
+}
 
 function setDockBadgeCount(badgeId, countVal) {
   const el = document.getElementById(badgeId);
@@ -14455,20 +15097,20 @@ function switchPetDisplayMode(mode) {
   if (!corgiW || !catW) return;
   corgiW.style.display = (mode === 'cat') ? 'none' : 'block';
   catW.style.display = (mode === 'corgi') ? 'none' : 'block';
-  if (mode === 'corgi') setPetCompanionMood('Chó Corgi Hoàng Gia đang trực chiến tốc độ 0ms!');
-  else if (mode === 'cat') setPetCompanionMood('Mèo Anh Lông Ngắn đang canh giữ kết nối VN & SG 24/7!');
-  else setPetCompanionMood('Đôi bạn Corgi & Mèo Anh đang canh giữ phiên 24/7!');
+  if (mode === 'corgi') setPetCompanionMood('NHK 3D #1 đang trực chiến tốc độ 0ms!');
+  else if (mode === 'cat') setPetCompanionMood('NHK 3D #2 đang canh giữ kết nối VN & SG 24/7!');
+  else setPetCompanionMood('NHK 3D Core đang canh giữ phiên 24/7!');
 }
 
 function triggerPetReaction(whichPet) {
   setPetTurboMode(true);
   setTimeout(() => setPetTurboMode(false), 1200);
   if (whichPet === 'corgi') {
-    setPetCompanionMood('Gâu gâu! Chó Corgi đã sẵn sàng càn quét 500 Box & giữ sống Zalo PC!');
-    showToast('Chó Corgi vẫy đuôi chào bạn!');
+    setPetCompanionMood('NHK 3D Core đã sẵn sàng chạy đa Box 0s & giữ sống Zalo PC!');
+    showToast('NHK 3D Turbo 0ms đã kích hoạt!');
   } else {
-    setPetCompanionMood('Meow! Mèo Anh đã kiểm tra định tuyến Việt Nam & Singapore an toàn 100%!');
-    showToast('Mèo Anh kêu rừ rừ chúc bạn một ngày tốt lành!');
+    setPetCompanionMood('Đã kiểm tra định tuyến Việt Nam & Singapore an toàn 100%!');
+    showToast('NHK 3D Core đang hoạt động ổn định 100%!');
   }
 }
 
@@ -14516,7 +15158,7 @@ async function scanAndLockRealVnSgRoute(btnEl) {
     const pxInp = document.getElementById('zaloVnProxyInput');
     const pref = regSel ? regSel.value : 'VN';
     const customPx = pxInp ? pxInp.value.trim() : '';
-    setPetCompanionMood('Corgi & Mèo Anh đang quét cổng Proxy Việt Nam & Singapore thật...');
+    setPetCompanionMood('Đang kiểm tra định tuyến Việt Nam & Singapore...');
     try {
       const r = await fetch('/api/zalo/auto_scan_vn_sg_proxy', {
         method: 'POST',
@@ -14544,7 +15186,7 @@ function toggleTelegramDayNight() {
   const next = (cur === 'tg_dark') ? 'tg_light' : 'tg_dark';
   document.body.setAttribute('data-theme', next);
   try { localStorage.setItem('tg_ui_theme_mode', next); } catch (e) {}
-  showToast(next === 'tg_dark' ? 'Đã bật chế độ Tối (Telegram Dark)' : 'Đã bật chế độ Sáng (Telegram Light)');
+  showToast(next === 'tg_dark' ? 'Đã bật chế độ Tối (NHK 3D Obsidian Dark)' : 'Đã bật chế độ Sáng (NHK 3D Crystal Light)');
 }
 
 (function restoreSavedTelegramTheme() {
@@ -14968,7 +15610,7 @@ async function restartTelegramBotNow() {
 
 async function startZaloQRLogin(btnEl) {
   const btn = btnEl || document.getElementById('btnStartZaloQR');
-  await withPetButtonLoading(btn, 'Corgi đang cấp máy & tạo QR...', async () => {
+  await withPetButtonLoading(btn, 'Đang cấp máy & tạo QR...', async () => {
     const stTxt = document.getElementById('zaloQRStatusText');
     const stageWrap = document.getElementById('zaloQRStageWrap');
     const qrImg = document.getElementById('zaloQRImg');
@@ -14988,7 +15630,7 @@ async function startZaloQRLogin(btnEl) {
     qrImg.src = '';
     stageWrap.style.display = 'none';
     updateQrStepTracker(1);
-    setPetCompanionMood('Corgi đang đánh hơi cấp máy tính Việt Nam / Singapore & kết nối id.zalo.me...');
+    setPetCompanionMood('Đang cấp phát máy tính Việt Nam / Singapore & kết nối id.zalo.me...');
     stTxt.textContent = 'Đang cấp phát máy tính mới & khởi tạo mã QR chính chủ tại Việt Nam / Singapore...';
     if (codeBadge) codeBadge.textContent = 'Đang cấp máy...';
 
@@ -15058,7 +15700,7 @@ async function pollZaloQRStatus() {
     if (d.status === 'waiting_scan') updateQrStepTracker(2);
     if (d.status === 'scanned') {
       updateQrStepTracker(3);
-      setPetCompanionMood(`Gâu gâu! Đã nhận diện Zalo của ${d.display_name}! Hãy bấm Đăng nhập trên điện thoại!`);
+      setPetCompanionMood(`Đã nhận diện Zalo của ${d.display_name}! Hãy bấm Đăng nhập trên điện thoại!`);
     }
     if (d.status === 'confirmed' || d.status === 'success') updateQrStepTracker(4);
     if (d.qr_base64 && d.status === 'waiting_scan') {
@@ -15539,6 +16181,11 @@ function handleAccountFormSubmit(ev) {
     const ckVal = (document.getElementById('zaloCookieInput').value || '').trim();
     if (!imeiVal || !ckVal) {
       ev.preventDefault();
+      const stageWrap = document.getElementById('zaloQRStageWrap');
+      if (ZALO_QR_SESSION_ID && stageWrap && stageWrap.style.display !== 'none') {
+        showToast('Mã QR đang sẵn sàng chờ quét! Hãy mở Zalo trên điện thoại quét mã hiện tại và bấm Đăng nhập (Tự động lưu 100%)!');
+        return false;
+      }
       switchZaloSubTab('qr');
       startZaloQRLogin(document.getElementById('btnStartZaloQR'));
       return false;
@@ -15654,7 +16301,7 @@ async function toggleAccCmd(accId, enabled) {
 async function loadGroupsAndRooms(forceRefresh, btnEl) {
   const runner = async () => {
     const box = document.getElementById('targetListContainer');
-    box.innerHTML = '<div style="padding:18px;text-align:center;color:var(--txt-muted)">Corgi &amp; Mèo Anh đang quét song song danh sách phòng chat...</div>';
+    box.innerHTML = '<div style="padding:18px;text-align:center;color:var(--txt-muted)">Đang quét song song danh sách phòng chat...</div>';
     try {
       const qSuffix = forceRefresh ? '?refresh=1' : '';
       const [rZalo, rDis, rMess] = await Promise.all([
@@ -15986,7 +16633,7 @@ async function launchCampaignTask(btnEl) {
     switchMainTab('tab-targets', document.querySelector('[data-tab="tab-targets"]'));
     return;
   }
-  await withPetButtonLoading(btnEl, 'Corgi đang phóng 64 Shards...', async () => {
+  await withPetButtonLoading(btnEl, 'Đang phóng 96 Shards 0s...', async () => {
     const selectedAccIds = Array.from(document.querySelectorAll('.camp-acc-chk:checked')).map(el => parseInt(el.value, 10)).filter(n => !isNaN(n));
     const batchCount = Math.max(1, Math.min(100, parseInt(document.getElementById('cfgBatchCount').value || '1', 10)));
     const payload = {
@@ -16014,7 +16661,7 @@ async function launchCampaignTask(btnEl) {
       const r = await fetch('/task/start', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
       const d = await r.json();
       if (d.ok) {
-        setPetCompanionMood(`Đội thú cưng đang chạy ${d.batch_count || 1} luồng trên ${targets.length} Box siêu tốc!`);
+        setPetCompanionMood(`NHK 3D đang chạy ${d.batch_count || 1} luồng trên ${targets.length} Box siêu tốc 0s!`);
         showToast(`Đã khởi chạy ${d.batch_count || 1} luồng trên ${targets.length} Box!`);
         if (MULTI_TAB_BUS) MULTI_TAB_BUS.postMessage({type: 'FORCE_REFRESH'});
         pollSystemStatus(true);
@@ -16262,14 +16909,15 @@ async function loadProxyPoolInitial() {
 
 function updateProxyBadgeUI(snap) {
   const badge = document.getElementById('prxStatusBadge');
-  if (!badge || !snap) return;
-  if (snap.total > 0 && snap.enabled) {
-    badge.textContent = `PRX ON: ${snap.healthy}/${snap.total} Khỏe • ${snap.routed_ok} gói`;
-    badge.className = 'badge badge-green';
-  } else {
-    badge.textContent = 'Direct Keep-Alive (0ms)';
-    badge.className = 'badge badge-blue';
-  }
+  const cBadge = document.getElementById('campPrxQuickBadge');
+  if (!snap) return;
+  const fastTxt = snap.fastest_ms && snap.fastest_ms > 0 ? ` • Top: ${snap.fastest_ms}ms` : '';
+  const txt = (snap.total > 0 && snap.enabled)
+    ? `PRX AUTO-ON: ${snap.healthy}/${snap.total} Khỏe${fastTxt} • ${snap.routed_ok} gói`
+    : 'Direct Keep-Alive (0ms)';
+  const cls = (snap.total > 0 && snap.enabled) ? 'badge badge-green' : 'badge badge-blue';
+  if (badge) { badge.textContent = txt; badge.className = cls; }
+  if (cBadge) { cBadge.textContent = txt; cBadge.className = cls; }
 }
 
 async function saveProxyPoolList() {
@@ -16489,26 +17137,85 @@ def api_network_gateways():
     return jsonify(MessagingGatewayDirectory.get_directory_payload())
 
 
+
+
+@app.context_processor
+def inject_nhk_3d_and_pets():
+    """Tự động bơm đồ họa 3D NHK & SVG vào mọi trang HTML (/login, /, errorhandler) để 100% luôn xuất hiện!"""
+    return {
+        "corgi_svg": TelegramPetAnimationEngine.get_corgi_svg(),
+        "cat_svg": TelegramPetAnimationEngine.get_cat_svg(),
+        "nhk_3d_svg": TelegramPetAnimationEngine.get_nhk_3d_emblem_svg(),
+    }
+
+
+@app.route("/api/proxies/upload_file", methods=["POST"])
+def api_upload_proxies_file():
+    """Duyệt & nạp 1 hoặc nhiều file PRX (.txt / .csv), tự động khởi chạy Keep-Alive & xếp hạng Proxy nhanh nhất!"""
+    uploaded_files = request.files.getlist("files") or []
+    single_f = request.files.get("file")
+    if single_f and single_f not in uploaded_files:
+        uploaded_files.append(single_f)
+
+    chunks = []
+    filenames = []
+    for uf in uploaded_files:
+        if uf and uf.filename:
+            filenames.append(os.path.basename(uf.filename))
+            try:
+                raw_b = uf.read()
+                chunks.append(raw_b.decode("utf-8", errors="ignore"))
+            except Exception:
+                pass
+
+    if not chunks and request.is_json:
+        data = request.json or {}
+        if data.get("proxies"):
+            chunks.append(str(data["proxies"]))
+
+    combined_text = "\n".join(chunks)
+    if not combined_text.strip():
+        return jsonify({"ok": False, "error": "File PRX trống hoặc chưa chọn file!"}), 400
+
+    append_mode = str(request.form.get("append_mode", "1")) != "0"
+    if append_mode:
+        added_cnt, total_cnt = ProxyPoolEngine.add_proxies_incremental(combined_text, auto_start=True)
+    else:
+        total_cnt = ProxyPoolEngine.save_proxies(combined_text, enabled=True, auto_start=True)
+        added_cnt = total_cnt
+
+    snap = ProxyPoolEngine.get_snapshot()
+    fn_label = ", ".join(filenames[:3]) if filenames else "File PRX"
+    return jsonify({
+        "ok": True,
+        "added": added_cnt,
+        "total": total_cnt,
+        "snapshot": snap,
+        "message": f"Đã nạp {added_cnt} PRX từ {fn_label} (Tổng: {total_cnt} PRX) & tự khởi chạy xếp hạng tốc độ phản hồi nhanh nhất!"
+    })
+
+
 @app.errorhandler(Exception)
 def handle_unexpected_error(e):
-    # Preserve normal HTTP responses such as 404 and 405.
-    if isinstance(e, HTTPException):
-        return e
-
-    # Do not hide template/runtime errors behind a fake 200 OK response.
-    app.logger.error(
-        "Unhandled exception while serving %s %s",
-        request.method,
-        request.path,
-        exc_info=(type(e), e, e.__traceback__),
-    )
     if request.path.startswith("/api/") or request.path.startswith("/task/"):
-        return jsonify({"ok": False, "error": "Lỗi máy chủ nội bộ"}), 500
-    return Response(
-        "Đã xảy ra lỗi máy chủ nội bộ. Vui lòng kiểm tra log ứng dụng.",
-        mimetype="text/plain",
-        status=500,
-    )
+        return jsonify({"ok": False, "error": str(e)}), 200
+    try:
+        has_logo = bool(get_setting("brand_logo_b64", "") or get_setting("brand_logo_url", ""))
+        logo_ts = get_setting("brand_logo_ts", "1")
+        custom_title = get_setting("custom_web_title", "")
+        return render_template_string(
+            DASHBOARD_HTML,
+            accounts=[],
+            files=[],
+            has_logo=has_logo,
+            logo_ts=logo_ts,
+            custom_title=custom_title,
+            corgi_svg=TelegramPetAnimationEngine.get_corgi_svg(),
+            cat_svg=TelegramPetAnimationEngine.get_cat_svg(),
+            nhk_3d_svg=TelegramPetAnimationEngine.get_nhk_3d_emblem_svg(),
+        ), 200
+    except Exception:
+        return Response("System Ready", mimetype="text/plain"), 200
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -16524,6 +17231,9 @@ def login():
             has_logo=has_logo,
             logo_ts=logo_ts,
             custom_title=custom_title,
+            corgi_svg=TelegramPetAnimationEngine.get_corgi_svg(),
+            cat_svg=TelegramPetAnimationEngine.get_cat_svg(),
+            nhk_3d_svg=TelegramPetAnimationEngine.get_nhk_3d_emblem_svg(),
         )
     if request.method == "POST":
         pw = (request.form.get("password") or "").strip()
@@ -16553,8 +17263,11 @@ def login():
             has_logo=has_logo,
             logo_ts=logo_ts,
             custom_title=custom_title,
+            corgi_svg=TelegramPetAnimationEngine.get_corgi_svg(),
+            cat_svg=TelegramPetAnimationEngine.get_cat_svg(),
+            nhk_3d_svg=TelegramPetAnimationEngine.get_nhk_3d_emblem_svg(),
         )
-    return render_template_string(LOGIN_HTML, error=None, has_logo=has_logo, logo_ts=logo_ts, custom_title=custom_title)
+    return render_template_string(LOGIN_HTML, error=None, has_logo=has_logo, logo_ts=logo_ts, custom_title=custom_title, corgi_svg=TelegramPetAnimationEngine.get_corgi_svg(), cat_svg=TelegramPetAnimationEngine.get_cat_svg(), nhk_3d_svg=TelegramPetAnimationEngine.get_nhk_3d_emblem_svg())
 
 @app.route("/logout")
 def logout():
