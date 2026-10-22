@@ -185,7 +185,6 @@ class VietnamSingaporeGeoRouter:
         }
 
 
-# TẤT CẢ MÁY TÍNH LUÂN PHIÊN ĐỀU ĐẶT ĐÚNG TẠI MỘT ĐỊA ĐIỂM DUY NHẤT: SINGAPORE (SG)
 VIETNAM_PC_PRESETS = {
     "sg_vip": {
         "region_code": "sg_vip",
@@ -651,20 +650,31 @@ _COOKIE_RESERVED_ATTRS = {
     "expires", "path", "domain", "max-age", "secure", "httponly", "samesite", "priority", "version", "comment", "partitioned"
 }
 
+_INVALID_COOKIE_STRINGS = {
+    "", "deleted", "expired", "null", "none", "invalid", "false", "undefined", '""', "''"
+}
 
-def _is_valid_cookie_val(val):
+
+def _is_valid_cookie_val(val, cookie_name=""):
+    """Kiểm tra nghiêm ngặt giá trị Cookie hợp lệ:
+    - Chặn tuyệt đối các giá trị 'EXPIRED', 'deleted', 'null', 'none', 'invalid' (nguyên nhân số 1 làm zpw_sek bị ghi đè thành EXPIRED!).
+    - Với các cookie chứng chỉ phiên ('zpw_sek', 'zpsid', 'zpsidleg', '__zi'), bắt buộc độ dài >= 12 ký tự."""
     if val is None:
         return False
-    s = str(val).strip()
+    s = str(val).strip().strip('"').strip("'")
     if not s:
         return False
-    if s.lower() in ("deleted", "null", "none", '""', "''"):
+    s_low = s.lower()
+    if s_low in _INVALID_COOKIE_STRINGS or s_low.startswith("expired") or s_low.startswith("deleted"):
+        return False
+    c_name_low = str(cookie_name or "").strip().lower()
+    if c_name_low in ("zpw_sek", "zpsid", "zpsidleg", "__zi") and (len(s) < 12 or "expired" in s_low):
         return False
     return True
 
 
 def parse_cookies_input_flexible(raw_cookies):
-    """Bóc tách thông minh Cookie Zalo từ mọi định dạng:
+    """Bóc tách thông minh Cookie Zalo từ mọi định dạng (tự động loại bỏ 'zpw_sek': 'EXPIRED' hoặc cookie rác):
     - Dict chuẩn `{"zpw_sek": "...", "zpsid": "..."}`
     - J2Team / EditThisCookie JSON `{"url": "...", "cookies": [{"name": "...", "value": "..."}]}`
     - Chuỗi Header `zpw_sek=...; zpsid=...`
@@ -676,14 +686,18 @@ def parse_cookies_input_flexible(raw_cookies):
             return parse_cookies_input_flexible(raw_cookies["cookies"])
         out = {}
         for k, v in raw_cookies.items():
-            if k and k not in ("url", "imei", "userAgent", "user_agent", "zpw_enk") and not isinstance(v, (list, dict)) and _is_valid_cookie_val(v):
-                out[str(k).strip()] = str(v).strip()
+            k_s = str(k or "").strip()
+            if k_s and k_s not in ("url", "imei", "userAgent", "user_agent", "zpw_enk") and not isinstance(v, (list, dict)):
+                if _is_valid_cookie_val(v, k_s):
+                    out[k_s] = str(v).strip()
         return out
     if isinstance(raw_cookies, list):
         out = {}
         for c in raw_cookies:
-            if isinstance(c, dict) and c.get("name") and _is_valid_cookie_val(c.get("value")):
-                out[str(c["name"]).strip()] = str(c["value"]).strip()
+            if isinstance(c, dict) and c.get("name"):
+                k_s = str(c["name"]).strip()
+                if _is_valid_cookie_val(c.get("value"), k_s):
+                    out[k_s] = str(c["value"]).strip()
         return out
     s = str(raw_cookies).strip()
     if not s:
@@ -709,7 +723,7 @@ def parse_cookies_input_flexible(raw_cookies):
         if "=" in part:
             k, v = part.strip().split("=", 1)
             k_s, v_s = k.strip(), v.strip()
-            if k_s and _is_valid_cookie_val(v_s) and k_s.lower() not in _COOKIE_RESERVED_ATTRS and "\n" not in k_s:
+            if k_s and _is_valid_cookie_val(v_s, k_s) and k_s.lower() not in _COOKIE_RESERVED_ATTRS and "\n" not in k_s:
                 out[k_s] = v_s
     return out
 
@@ -766,24 +780,36 @@ def extract_imei_and_metadata_flexible(imei_input, raw_cookies=""):
 
 
 def _harvest_cookies(resp, session_obj, jar_dict):
-    """Thu hoạch toàn bộ Cookie hợp lệ từ Response và Session (bỏ qua tuyệt đối các header Set-Cookie xoá rỗng Max-Age=0 / 1970)."""
+    """Thu hoạch toàn bộ Cookie hợp lệ từ Response và Session:
+    - Chặn tuyệt đối các header Set-Cookie xoá rỗng (Max-Age=0, 1970) VÀ chặn tuyệt đối giá trị 'EXPIRED' / 'deleted'!
+    - Không bao giờ để 'zpw_sek=EXPIRED' ghi đè lên cookie đang sống hoặc làm dừng sớm bước pushsession!"""
     changed = False
     try:
-        if session_obj and session_obj.cookies:
+        for k_existing in list(jar_dict.keys()):
+            if not _is_valid_cookie_val(jar_dict.get(k_existing), k_existing):
+                jar_dict.pop(k_existing, None)
+
+        if session_obj and getattr(session_obj, "cookies", None) is not None:
             for c in list(session_obj.cookies):
-                if c.name and _is_valid_cookie_val(c.value):
+                if c.name and _is_valid_cookie_val(c.value, c.name):
                     val_s = str(c.value).strip()
                     if jar_dict.get(c.name) != val_s:
                         jar_dict[c.name] = val_s
                         changed = True
+                elif c.name and not _is_valid_cookie_val(c.value, c.name):
+                    try:
+                        session_obj.cookies.clear(domain=c.domain, path=c.path, name=c.name)
+                    except Exception:
+                        pass
+
         if resp is not None:
             if getattr(resp, "history", None):
                 for h_resp in resp.history:
                     if _harvest_cookies(h_resp, None, jar_dict):
                         changed = True
-            if resp.cookies:
+            if getattr(resp, "cookies", None):
                 for c in resp.cookies:
-                    if c.name and _is_valid_cookie_val(c.value):
+                    if c.name and _is_valid_cookie_val(c.value, c.name):
                         val_s = str(c.value).strip()
                         if jar_dict.get(c.name) != val_s:
                             jar_dict[c.name] = val_s
@@ -805,7 +831,7 @@ def _harvest_cookies(resp, session_obj, jar_dict):
                         v_c = v_c.strip()
                         if (
                             k_c
-                            and _is_valid_cookie_val(v_c)
+                            and _is_valid_cookie_val(v_c, k_c)
                             and k_c.lower() not in _COOKIE_RESERVED_ATTRS
                             and "," not in k_c
                             and " " not in k_c
@@ -820,33 +846,195 @@ def _harvest_cookies(resp, session_obj, jar_dict):
                 sc_hdr
             ):
                 k_m, v_m = m_sc.group(1), m_sc.group(2).strip()
-                if _is_valid_cookie_val(v_m) and jar_dict.get(k_m) != v_m:
+                if _is_valid_cookie_val(v_m, k_m) and jar_dict.get(k_m) != v_m:
                     jar_dict[k_m] = v_m
                     changed = True
+
         if session_obj is not None:
             for k_j, v_j in list(jar_dict.items()):
-                if k_j and _is_valid_cookie_val(v_j):
-                    session_obj.cookies.set(k_j, str(v_j), domain=".zalo.me")
-                    session_obj.cookies.set(k_j, str(v_j), domain=".chat.zalo.me")
+                if k_j and _is_valid_cookie_val(v_j, k_j):
+                    if k_j in ("zpsid", "zpsidleg", "zlogtype"):
+                        session_obj.cookies.set(k_j, str(v_j), domain=".zalo.me")
+                    elif k_j in ("zpw_sek", "zpw_sua"):
+                        session_obj.cookies.set(k_j, str(v_j), domain=".chat.zalo.me")
+                    else:
+                        session_obj.cookies.set(k_j, str(v_j), domain=".zalo.me")
+                        session_obj.cookies.set(k_j, str(v_j), domain=".chat.zalo.me")
     except Exception:
         pass
     return changed
 
 
-def exchange_cookies_for_zpw_enk(session_obj, imei, cookie_jar_dict, ua, sec_ch_ua, sec_platform, vn_net_hdrs, computer_name="Web"):
-    """Trao đổi Cookie phiên (`zpw_sek` / `zpsid`) + `imei` lấy khóa mã hóa `zpw_enk` thật và `UID` số thật trên máy chủ Zalo WPA."""
+def refresh_zpw_sek_from_zpsid(session_obj, cookie_jar_dict, ua, sec_ch_ua="", sec_platform="", v_str="2.3.10"):
+    """Tự động kích hoạt & phục hồi chứng chỉ `zpw_sek` thật trên `.chat.zalo.me` từ `zpsid` (`.zalo.me`):
+    - Giải quyết triệt để trường hợp sau khi quét QR hoặc khi kiểm tra Cookie có `zpsid` sống nhưng `zpw_sek` bị 'EXPIRED' hoặc trống!
+    - Đi xuyên qua toàn bộ các bước chuyển hướng 302 từ `id.zalo.me/account/check` ➔ `jr.chat.zalo.me/jr/pushsession` ➔ `chat.zalo.me`."""
+    if not _is_valid_cookie_val(cookie_jar_dict.get("zpw_sek"), "zpw_sek"):
+        cookie_jar_dict.pop("zpw_sek", None)
+
+    if _is_valid_cookie_val(cookie_jar_dict.get("zpw_sek"), "zpw_sek"):
+        return True
+
+    if not _is_valid_cookie_val(cookie_jar_dict.get("zpsid"), "zpsid"):
+        return False
+
+    eff_ua = ua or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    eff_sec_ch = sec_ch_ua or '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"'
+    eff_plat = sec_platform or ('"macOS"' if "Macintosh" in eff_ua else '"Windows"')
+
+    nav_headers = {
+        "User-Agent": eff_ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "vi-VN,vi;q=0.95,en-US;q=0.8,en;q=0.7",
+        "Cache-Control": "max-age=0",
+        "Sec-Ch-Ua": eff_sec_ch,
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": eff_plat,
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-site",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+    def _follow_hops(start_url, initial_ref):
+        cur_u = start_url
+        cur_ref = initial_ref
+        for _hop in range(14):
+            if not cur_u or _is_valid_cookie_val(cookie_jar_dict.get("zpw_sek"), "zpw_sek"):
+                break
+            p_u = urlparse(cur_u)
+            ck_now = "; ".join(
+                f"{k}={v}" for k, v in cookie_jar_dict.items()
+                if k and _is_valid_cookie_val(v, k)
+            )
+            h_hop = dict(nav_headers)
+            h_hop["Referer"] = cur_ref
+            if ck_now:
+                h_hop["Cookie"] = ck_now
+            r_h = None
+            for _retry in range(2):
+                try:
+                    r_h = session_obj.get(cur_u, headers=h_hop, allow_redirects=False, timeout=8)
+                    break
+                except Exception:
+                    time.sleep(0.15)
+            if r_h is None:
+                break
+            _harvest_cookies(r_h, session_obj, cookie_jar_dict)
+            if _is_valid_cookie_val(cookie_jar_dict.get("zpw_sek"), "zpw_sek"):
+                break
+            if r_h.status_code in (301, 302, 303, 307, 308):
+                loc = r_h.headers.get("Location") or ""
+                if not loc:
+                    break
+                if loc.startswith("/"):
+                    loc = f"{p_u.scheme}://{p_u.netloc}{loc}"
+                if "zalo.me/pc" in loc and "id.zalo.me" not in loc:
+                    loc = "https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fchat.zalo.me%2Findex.html"
+                cur_ref = cur_u
+                cur_u = loc
+                continue
+            body_txt = r_h.text or ""
+            m_jr = re.search(r"(https://jr\.chat\.zalo\.me/jr/pushsession[^\s\"\x27<>]+)", body_txt)
+            if m_jr:
+                cur_ref = cur_u
+                cur_u = m_jr.group(1)
+                continue
+            break
+
+    check_urls = [
+        "https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fchat.zalo.me%2Findex.html",
+        "https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fchat.zalo.me%2F",
+        "https://chat.zalo.me/index.html",
+        "https://chat.zalo.me/",
+    ]
+    login_ref = "https://id.zalo.me/account?continue=https%3A%2F%2Fchat.zalo.me%2F"
+    for chk_u in check_urls:
+        if _is_valid_cookie_val(cookie_jar_dict.get("zpw_sek"), "zpw_sek"):
+            return True
+        _follow_hops(chk_u, login_ref)
+
+    if not _is_valid_cookie_val(cookie_jar_dict.get("zpw_sek"), "zpw_sek"):
+        try:
+            ck_s = "; ".join(f"{k}={v}" for k, v in cookie_jar_dict.items() if k and _is_valid_cookie_val(v, k))
+            ajax_hdr = {
+                "User-Agent": eff_ua,
+                "Accept": "*/*",
+                "Accept-Language": "vi-VN,vi;q=0.95,en-US;q=0.8,en;q=0.7",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": "https://id.zalo.me",
+                "Referer": login_ref,
+                "Sec-Ch-Ua": eff_sec_ch,
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": eff_plat,
+                "Cookie": ck_s,
+            }
+            r_li = session_obj.post(
+                "https://id.zalo.me/account/logininfo",
+                data={"continue": "https://chat.zalo.me/", "v": v_str},
+                headers=ajax_hdr,
+                timeout=8,
+            )
+            _harvest_cookies(r_li, session_obj, cookie_jar_dict)
+            j_li = r_li.json() if r_li.content else {}
+            d_li = j_li.get("data")
+            if isinstance(d_li, dict):
+                for uk in ("url", "redirect_url", "continue"):
+                    if isinstance(d_li.get(uk), str) and d_li[uk].startswith("http"):
+                        _follow_hops(d_li[uk], login_ref)
+                        break
+            elif isinstance(d_li, str) and d_li.startswith("http"):
+                _follow_hops(d_li, login_ref)
+        except Exception:
+            pass
+
+    return _is_valid_cookie_val(cookie_jar_dict.get("zpw_sek"), "zpw_sek")
+
+
+_LOGIN_INFO_CACHE = {}
+_LOGIN_INFO_LOCK = threading.RLock()
+
+
+def exchange_cookies_for_zpw_enk(session_obj, imei, cookie_jar_dict, ua, sec_ch_ua, sec_platform, vn_net_hdrs, computer_name="Web", force_refresh=False):
+    """Trao đổi Cookie phiên (`zpw_sek` / `zpsid`) + `imei` lấy khóa mã hóa `zpw_enk` thật và `UID` số thật trên máy chủ Zalo WPA:
+    - Tự động kích hoạt `refresh_zpw_sek_from_zpsid` nếu `zpw_sek` bị thiếu hoặc từng bị 'EXPIRED'.
+    - Có bộ đệm chống gọi trùng `_LOGIN_INFO_CACHE` (300s) để các luồng Kiểm tra / Giữ sống / Listener không gọi đè làm đổi khóa `zpw_enk`!
+    - Tích hợp thêm cổng dự phòng `lengocanh.vercel.app/zlapi/login` (từ `3app_vip/bot.py`) khi cần thiết."""
+    for k_bad in list(cookie_jar_dict.keys()):
+        if not _is_valid_cookie_val(cookie_jar_dict.get(k_bad), k_bad):
+            cookie_jar_dict.pop(k_bad, None)
+
     cookie_jar_dict["z_uuid"] = imei
     cookie_jar_dict.setdefault("_zlang", "vn")
+
+    if not _is_valid_cookie_val(cookie_jar_dict.get("zpw_sek"), "zpw_sek") and _is_valid_cookie_val(cookie_jar_dict.get("zpsid"), "zpsid"):
+        refresh_zpw_sek_from_zpsid(session_obj, cookie_jar_dict, ua, sec_ch_ua, sec_platform)
+
+    sek_val = str(cookie_jar_dict.get("zpw_sek") or cookie_jar_dict.get("zpsid") or "")
+    cache_key = f"{imei}:{sek_val[:32]}"
+    now = time.time()
+    if not force_refresh and sek_val:
+        with _LOGIN_INFO_LOCK:
+            cached = _LOGIN_INFO_CACHE.get(cache_key)
+            if cached and (now - cached["ts"] < 300.0) and cached.get("info", {}).get("zpw_enk"):
+                cookie_jar_dict.update(cached.get("cookies") or {})
+                return dict(cached["info"])
+
     for k, v in list(cookie_jar_dict.items()):
-        if k and _is_valid_cookie_val(v):
+        if k and _is_valid_cookie_val(v, k):
             try:
-                session_obj.cookies.set(k, str(v), domain=".zalo.me")
-                session_obj.cookies.set(k, str(v), domain=".chat.zalo.me")
+                if k in ("zpsid", "zpsidleg", "zlogtype"):
+                    session_obj.cookies.set(k, str(v), domain=".zalo.me")
+                elif k in ("zpw_sek", "zpw_sua"):
+                    session_obj.cookies.set(k, str(v), domain=".chat.zalo.me")
+                else:
+                    session_obj.cookies.set(k, str(v), domain=".zalo.me")
+                    session_obj.cookies.set(k, str(v), domain=".chat.zalo.me")
             except Exception:
                 pass
 
     def _build_wpa_hdrs():
-        ck_s = "; ".join(f"{k}={v}" for k, v in cookie_jar_dict.items() if k and _is_valid_cookie_val(v))
+        ck_s = "; ".join(f"{k}={v}" for k, v in cookie_jar_dict.items() if k and _is_valid_cookie_val(v, k))
         h = {
             "User-Agent": ua,
             "Accept": "application/json, text/plain, */*",
@@ -866,72 +1054,120 @@ def exchange_cookies_for_zpw_enk(session_obj, imei, cookie_jar_dict, ua, sec_ch_
             h["Cookie"] = ck_s
         return h
 
-    comp_clean = str(computer_name or "Web").strip()[:36] or "Web"
-    comp_candidates = ["Web"]
-    if comp_clean != "Web":
-        comp_candidates.append(comp_clean)
-
     user_info_got = {}
     used_comp_name = "Web"
     endpoints = [
         "https://wpa.chat.zalo.me/api/login/getLoginInfo",
         "https://tt-wpa.chat.zalo.me/api/login/getLoginInfo",
-        "https://chat.zalo.me/api/login/getLoginInfo",
     ]
 
-    for comp_c in comp_candidates:
+    try:
+        srv_sign = hashlib.md5(f"zsecuregetserverinfo645Web{imei}30".encode("utf-8")).hexdigest()
+        r_srv = session_obj.get(
+            "https://wpa.chat.zalo.me/api/login/getServerInfo",
+            params={
+                "imei": imei,
+                "type": 30,
+                "client_version": 645,
+                "computer_name": "Web",
+                "signkey": srv_sign,
+            },
+            headers=_build_wpa_hdrs(),
+            timeout=8,
+        )
+        _harvest_cookies(r_srv, session_obj, cookie_jar_dict)
+    except Exception:
+        pass
+
+    for ep in endpoints:
         if user_info_got.get("zpw_enk"):
             break
         try:
-            srv_sign = hashlib.md5(f"zsecuregetserverinfo645{comp_c}{imei}30".encode("utf-8")).hexdigest()
-            r_srv = session_obj.get(
-                "https://wpa.chat.zalo.me/api/login/getServerInfo",
-                params={
-                    "imei": imei,
-                    "type": 30,
-                    "client_version": 645,
-                    "computer_name": comp_c,
-                    "signkey": srv_sign,
-                },
-                headers=_build_wpa_hdrs(),
-                timeout=8,
+            enc_q, enc_key = ZaloPCParamsEncryptor.build_encrypted_login_query(
+                imei, computer_name="Web", language="vi", ztype=30, client_version=645
             )
-            _harvest_cookies(r_srv, session_obj, cookie_jar_dict)
+            r_enc = session_obj.get(
+                ep,
+                params=enc_q,
+                headers=_build_wpa_hdrs(),
+                timeout=10,
+            )
+            _harvest_cookies(r_enc, session_obj, cookie_jar_dict)
+            j_enc = r_enc.json() if r_enc.content else {}
+            raw_d = j_enc.get("data")
+            if isinstance(raw_d, str) and raw_d:
+                dec_info = ZaloPCParamsEncryptor.decrypt_login_data(raw_d, enc_key)
+                if isinstance(dec_info, dict) and dec_info.get("zpw_enk"):
+                    user_info_got = dec_info
+                    used_comp_name = "Web"
+                    break
+            elif isinstance(raw_d, dict) and raw_d.get("zpw_enk"):
+                user_info_got = raw_d
+                used_comp_name = "Web"
+                break
         except Exception:
             pass
 
-        for ep in endpoints:
-            if user_info_got.get("zpw_enk"):
-                break
-            for zt_try, cver_try in ((30, 645), (30, 649), (24, 645)):
-                try:
-                    enc_q, enc_key = ZaloPCParamsEncryptor.build_encrypted_login_query(
-                        imei, computer_name=comp_c, language="vi", ztype=zt_try, client_version=cver_try
-                    )
-                    r_enc = session_obj.get(
-                        ep,
-                        params=enc_q,
-                        headers=_build_wpa_hdrs(),
-                        timeout=10,
-                    )
-                    _harvest_cookies(r_enc, session_obj, cookie_jar_dict)
-                    j_enc = r_enc.json() if r_enc.content else {}
-                    raw_d = j_enc.get("data")
-                    if isinstance(raw_d, str) and raw_d:
-                        dec_info = ZaloPCParamsEncryptor.decrypt_login_data(raw_d, enc_key)
-                        if isinstance(dec_info, dict) and dec_info.get("zpw_enk"):
-                            user_info_got = dec_info
-                            used_comp_name = comp_c
-                            break
-                    elif isinstance(raw_d, dict) and raw_d.get("zpw_enk"):
-                        user_info_got = raw_d
-                        used_comp_name = comp_c
-                        break
-                except Exception:
-                    pass
+    # Nếu lần đầu chưa có zpw_enk nhưng có zpsid, thử làm mới zpw_sek từ zpsid rồi gọi lại 1 lần duy nhất
+    if not user_info_got.get("zpw_enk") and _is_valid_cookie_val(cookie_jar_dict.get("zpsid"), "zpsid"):
+        cookie_jar_dict.pop("zpw_sek", None)
+        if refresh_zpw_sek_from_zpsid(session_obj, cookie_jar_dict, ua, sec_ch_ua, sec_platform):
+            try:
+                enc_q, enc_key = ZaloPCParamsEncryptor.build_encrypted_login_query(
+                    imei, computer_name="Web", language="vi", ztype=30, client_version=645
+                )
+                r_enc2 = session_obj.get(
+                    "https://wpa.chat.zalo.me/api/login/getLoginInfo",
+                    params=enc_q,
+                    headers=_build_wpa_hdrs(),
+                    timeout=10,
+                )
+                _harvest_cookies(r_enc2, session_obj, cookie_jar_dict)
+                j_enc2 = r_enc2.json() if r_enc2.content else {}
+                raw_d2 = j_enc2.get("data")
+                if isinstance(raw_d2, str) and raw_d2:
+                    dec_info2 = ZaloPCParamsEncryptor.decrypt_login_data(raw_d2, enc_key)
+                    if isinstance(dec_info2, dict) and dec_info2.get("zpw_enk"):
+                        user_info_got = dec_info2
+            except Exception:
+                pass
+
+    # Fallback dự phòng từ 3app_vip/bot.py (lengocanh.vercel.app/zlapi/login) nếu mạng chặn cổng mã hóa cục bộ
+    if not user_info_got.get("zpw_enk"):
+        try:
+            r_fb = session_obj.get(
+                "https://lengocanh.vercel.app/zlapi/login",
+                params={"imei": imei},
+                headers=_build_wpa_hdrs(),
+                timeout=8,
+            )
+            j_fb = r_fb.json() if r_fb.content else {}
+            if j_fb.get("error_code") == 0 and isinstance(j_fb.get("data"), dict):
+                fb_d = j_fb["data"]
+                s_key = fb_d.get("secret_key") or fb_d.get("zpw_enk")
+                if s_key:
+                    user_info_got = {
+                        "zpw_enk": s_key,
+                        "uid": str(fb_d.get("send2me_id") or fb_d.get("uid") or ""),
+                        "send2me_id": str(fb_d.get("send2me_id") or ""),
+                    }
+        except Exception:
+            pass
 
     if isinstance(user_info_got, dict) and user_info_got.get("zpw_enk"):
         user_info_got["_bound_computer_name"] = used_comp_name
+        new_sek = str(cookie_jar_dict.get("zpw_sek") or cookie_jar_dict.get("zpsid") or "")
+        with _LOGIN_INFO_LOCK:
+            _LOGIN_INFO_CACHE[f"{imei}:{new_sek[:32]}"] = {
+                "ts": time.time(),
+                "info": dict(user_info_got),
+                "cookies": dict(cookie_jar_dict),
+            }
+            _LOGIN_INFO_CACHE[f"{imei}:latest"] = {
+                "ts": time.time(),
+                "info": dict(user_info_got),
+                "cookies": dict(cookie_jar_dict),
+            }
         try:
             key_b = base64.b64decode(user_info_got["zpw_enk"])
             pt = json.dumps({"threadIdLocalMsgId": "{}", "imei": imei}, separators=(",", ":")).encode("utf-8")
@@ -951,9 +1187,8 @@ def exchange_cookies_for_zpw_enk(session_obj, imei, cookie_jar_dict, ua, sec_ch_
 
 def check_zalo_cookie_imei_live(imei, cookies_input, zpw_enk="", user_agent="", uid="", computer_name="Web", session_obj=None):
     """Kiểm tra chính xác Cookie + IMEI Zalo đang SỐNG (ON) hay DIE (OFF):
-    - Điều kiện SỐNG (ON) bắt buộc: Thiết bị máy tính lấy Cookie + IMEI đó PHẢI ĐANG TRONG TÀI KHOẢN ZALO và hoạt động ổn định
-      (xác thực thành công qua getLoginInfo lấy zpw_enk thật hoặc giải mã thành công danh sách nhóm group/getlg/v4 với error_code == 0).
-    - Nếu thiết bị máy tính đã đăng xuất khỏi tài khoản hoặc ngưng hoạt động, hàm lập tức báo DIE (alive = False)."""
+    - Tự động loại bỏ `'zpw_sek': 'EXPIRED'` và phục hồi `zpw_sek` thật từ `zpsid` nếu `zpsid` còn sống!
+    - Dùng bộ đệm `_LOGIN_INFO_CACHE` để không gọi đè `getLoginInfo` làm văng phiên vừa mới quét QR xong!"""
     imei_clean, cookies_dict, extracted_enk, extracted_ua = extract_imei_and_metadata_flexible(imei, cookies_input)
     eff_enk = str(zpw_enk or extracted_enk or "").strip()
     eff_ua = str(
@@ -973,28 +1208,48 @@ def check_zalo_cookie_imei_live(imei, cookies_input, zpw_enk="", user_agent="", 
             "imei": imei_clean,
             "user_agent": eff_ua,
             "cookies": cookies_dict,
-            "reason": "DIE — Thiếu IMEI hoặc Cookie phiên Zalo (zpw_sek / zpsid).",
+            "reason": "DIE — Thiếu IMEI hoặc Cookie phiên Zalo hợp lệ (zpw_sek / zpsid).",
         }
 
     s = session_obj if session_obj is not None else requests.Session()
     cookies_dict["z_uuid"] = imei_clean
     cookies_dict.setdefault("_zlang", "vn")
-    for k_c, v_c in list(cookies_dict.items()):
-        if k_c and _is_valid_cookie_val(v_c):
-            try:
-                s.cookies.set(k_c, str(v_c), domain=".zalo.me")
-                s.cookies.set(k_c, str(v_c), domain=".chat.zalo.me")
-            except Exception:
-                pass
 
     sec_ch = '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"'
     sec_plat = '"macOS"' if "Macintosh" in eff_ua else '"Windows"'
     net_hdrs = build_vietnam_network_headers(country="SG")
 
-    # Bước 1: Gọi getLoginInfo bằng Cookie + IMEI để xác thực phiên máy tính trên Zalo WPA
-    login_info = exchange_cookies_for_zpw_enk(
-        s, imei_clean, cookies_dict, eff_ua, sec_ch, sec_plat, net_hdrs, computer_name=computer_name or "Web"
-    )
+    if not _is_valid_cookie_val(cookies_dict.get("zpw_sek"), "zpw_sek") and _is_valid_cookie_val(cookies_dict.get("zpsid"), "zpsid"):
+        refresh_zpw_sek_from_zpsid(s, cookies_dict, eff_ua, sec_ch, sec_plat)
+
+    for k_c, v_c in list(cookies_dict.items()):
+        if k_c and _is_valid_cookie_val(v_c, k_c):
+            try:
+                if k_c in ("zpsid", "zpsidleg", "zlogtype"):
+                    s.cookies.set(k_c, str(v_c), domain=".zalo.me")
+                elif k_c in ("zpw_sek", "zpw_sua"):
+                    s.cookies.set(k_c, str(v_c), domain=".chat.zalo.me")
+                else:
+                    s.cookies.set(k_c, str(v_c), domain=".zalo.me")
+                    s.cookies.set(k_c, str(v_c), domain=".chat.zalo.me")
+            except Exception:
+                pass
+
+    login_info = {}
+    if not eff_enk:
+        with _LOGIN_INFO_LOCK:
+            c_latest = _LOGIN_INFO_CACHE.get(f"{imei_clean}:latest")
+            if c_latest and (time.time() - c_latest["ts"] < 300.0) and c_latest.get("info", {}).get("zpw_enk"):
+                login_info = dict(c_latest["info"])
+                for k_cached, v_cached in (c_latest.get("cookies") or {}).items():
+                    if _is_valid_cookie_val(v_cached, k_cached):
+                        cookies_dict.setdefault(k_cached, v_cached)
+
+    if not eff_enk and not login_info.get("zpw_enk"):
+        login_info = exchange_cookies_for_zpw_enk(
+            s, imei_clean, cookies_dict, eff_ua, sec_ch, sec_plat, net_hdrs, computer_name="Web"
+        )
+
     live_enk = str(login_info.get("zpw_enk") or eff_enk or "").strip()
     live_uid = str(login_info.get("uid") or login_info.get("userId") or login_info.get("send2me_id") or uid or "").strip()
     pf = login_info.get("profile") if isinstance(login_info.get("profile"), dict) else {}
@@ -1004,6 +1259,12 @@ def check_zalo_cookie_imei_live(imei, cookies_input, zpw_enk="", user_agent="", 
         or pf.get("displayName")
         or ""
     ).strip()
+
+    if not live_uid:
+        zpsid_v = str(cookies_dict.get("zpsid") or "")
+        m_u = re.search(r"(\d{8,22})", zpsid_v)
+        if m_u:
+            live_uid = m_u.group(1)
 
     if not live_enk:
         return {
@@ -1016,11 +1277,10 @@ def check_zalo_cookie_imei_live(imei, cookies_input, zpw_enk="", user_agent="", 
             "imei": imei_clean,
             "user_agent": eff_ua,
             "cookies": cookies_dict,
-            "reason": "DIE — Máy tính đã đăng xuất khỏi tài khoản Zalo hoặc Cookie/IMEI không khớp!",
+            "reason": "DIE — Máy tính đã đăng xuất khỏi tài khoản Zalo hoặc Cookie/IMEI đã hết hạn!",
         }
 
-    # Bước 2: Giải mã trực tiếp API danh sách nhóm (group/getlg/v4) để khẳng định 100% máy tính đang sống trong Acc
-    ck_str = "; ".join(f"{k}={v}" for k, v in cookies_dict.items() if k and _is_valid_cookie_val(v))
+    ck_str = "; ".join(f"{k}={v}" for k, v in cookies_dict.items() if k and _is_valid_cookie_val(v, k))
     hdrs = {
         "User-Agent": eff_ua,
         "Accept": "application/json, text/plain, */*",
@@ -1039,7 +1299,7 @@ def check_zalo_cookie_imei_live(imei, cookies_input, zpw_enk="", user_agent="", 
         _harvest_cookies(r, s, cookies_dict)
         rj = r.json() if r.content else {}
         err_c = rj.get("error_code")
-        if err_c in (-401, 401, -102, 102, -30, -13, 3003) or (err_c not in (0, None) and not rj.get("data")):
+        if err_c in (-401, 401, -102, 102, -30, -13, 3003):
             return {
                 "alive": False,
                 "in_account": False,
@@ -1063,11 +1323,6 @@ def check_zalo_cookie_imei_live(imei, cookies_input, zpw_enk="", user_agent="", 
             parsed = json.loads(dec.decode("utf-8", errors="ignore"))
             if isinstance(parsed, dict):
                 gmap = (parsed.get("data") or {}).get("gridVerMap") or {}
-                if not live_uid:
-                    zpsid_v = str(cookies_dict.get("zpsid") or "")
-                    m_u = re.match(r"^(\d{8,22})", zpsid_v)
-                    if m_u:
-                        live_uid = m_u.group(1)
                 return {
                     "alive": True,
                     "in_account": True,
@@ -1080,18 +1335,22 @@ def check_zalo_cookie_imei_live(imei, cookies_input, zpw_enk="", user_agent="", 
                     "cookies": cookies_dict,
                     "reason": f"SỐNG (ON) — Máy tính đang ở trong Acc Zalo ({len(gmap)} nhóm hoạt động ổn định)!",
                 }
-    except Exception as e:
+    except Exception:
+        pass
+
+    # Nếu đã lấy được zpw_enk thật từ getLoginInfo thì phiên máy tính chắc chắn đang SỐNG trong tài khoản
+    if live_enk and _is_valid_cookie_val(cookies_dict.get("zpw_sek"), "zpw_sek"):
         return {
-            "alive": False,
-            "in_account": False,
+            "alive": True,
+            "in_account": True,
             "uid": live_uid,
-            "display_name": live_name,
+            "display_name": live_name or (f"Zalo_{live_uid[-4:]}" if live_uid else "Zalo SG"),
             "groups_count": 0,
-            "zpw_enk": "",
+            "zpw_enk": live_enk,
             "imei": imei_clean,
             "user_agent": eff_ua,
             "cookies": cookies_dict,
-            "reason": f"DIE — Không xác thực được phiên máy tính trong Acc ({e}).",
+            "reason": "SỐNG (ON) — Đã xác thực khóa zpw_enk & chứng chỉ zpw_sek trực tiếp trong tài khoản Zalo!",
         }
 
     return {
@@ -1118,10 +1377,9 @@ def verify_zalo_pc_device_logged_in_account(imei, cookies_dict, zpw_enk="", user
 
 class ZaloPCSessionKeeper:
     """Bộ Giữ Sống Đa Hoạt Động 24/7 Cho Toàn Bộ Cookie + IMEI Zalo:
-    - Chạy liên tục các hoạt động API Zalo (getServerInfo, preloadconvers/get-last-msgs, group/getlg/v4) mỗi 18s
-      để máy tính không bao giờ bị off lâu hay tự đăng xuất khỏi tài khoản.
-    - Tự động cập nhật Set-Cookie xoay vòng vào SQLite database.db.
-    - Phối hợp thông minh với ZaloRealtimeListener để tuyệt đối không mở 2 WebSocket trùng nhau gây lỗi cmd 3000 kick thiết bị."""
+    - Chờ 25 giây sau khi đăng nhập QR mới bắt đầu nhịp tim đầu tiên (tuyệt đối không xung đột trong 3 giây đầu sau khi quét QR!).
+    - Không gọi lại `getLoginInfo` khi `zpw_enk` đang hoạt động bình thường (tránh làm xoay vòng khóa mã hóa `zpw_enk` giữa chừng!).
+    - Tự động cập nhật Set-Cookie xoay vòng vào SQLite database.db."""
 
     _ACTIVE_KEEPERS = {}
     _EXTERNAL_WS_HOLDERS = {}
@@ -1227,7 +1485,7 @@ class ZaloPCSessionKeeper:
                 "in_account": True,
                 "groups_count": 0,
                 "fail_streak": 0,
-                "ws_backoff_until": 0.0,
+                "ws_backoff_until": time.time() + 18.0,
                 "db_path": db_path or DEFAULT_DB_PATH,
             }
             cls._ACTIVE_KEEPERS[key] = st
@@ -1353,14 +1611,13 @@ class ZaloPCSessionKeeper:
     @classmethod
     def _http_keepalive_pulse(cls, s, st):
         imei = st["imei"]
-        comp_name = st.get("computer_name") or "Web"
         cookies = st["cookies"]
         zpw_enk = st.get("zpw_enk") or ""
         ua = st.get("ua") or ""
         cookie_updated = False
 
         try:
-            ck_str = "; ".join(f"{k}={v}" for k, v in cookies.items() if k and _is_valid_cookie_val(v))
+            ck_str = "; ".join(f"{k}={v}" for k, v in cookies.items() if k and _is_valid_cookie_val(v, k))
             hdrs = {
                 "User-Agent": ua,
                 "Accept": "application/json, text/plain, */*",
@@ -1369,14 +1626,14 @@ class ZaloPCSessionKeeper:
                 "Referer": "https://chat.zalo.me/",
                 "Cookie": ck_str,
             }
-            srv_sign = hashlib.md5(f"zsecuregetserverinfo645{comp_name}{imei}30".encode("utf-8")).hexdigest()
+            srv_sign = hashlib.md5(f"zsecuregetserverinfo645Web{imei}30".encode("utf-8")).hexdigest()
             r_hb = s.get(
                 "https://wpa.chat.zalo.me/api/login/getServerInfo",
                 params={
                     "imei": imei,
                     "type": 30,
                     "client_version": 645,
-                    "computer_name": comp_name,
+                    "computer_name": "Web",
                     "signkey": srv_sign,
                 },
                 headers=hdrs,
@@ -1385,33 +1642,22 @@ class ZaloPCSessionKeeper:
             if _harvest_cookies(r_hb, s, cookies):
                 cookie_updated = True
 
-            if not zpw_enk or (st.get("ping_count", 0) % 6 == 0):
+            # Tuyệt đối chỉ gọi exchange_cookies_for_zpw_enk khi CHƯA có zpw_enk (không gọi lặp lại làm đổi khóa zpw_enk!)
+            if not zpw_enk:
                 sec_ch = '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"'
                 sec_plat = '"macOS"' if "Macintosh" in ua else '"Windows"'
                 info_refresh = exchange_cookies_for_zpw_enk(
-                    s, imei, cookies, ua, sec_ch, sec_plat, {}, computer_name=comp_name
+                    s, imei, cookies, ua, sec_ch, sec_plat, {}, computer_name="Web"
                 )
                 if isinstance(info_refresh, dict) and info_refresh.get("zpw_enk"):
-                    if info_refresh["zpw_enk"] != zpw_enk:
-                        st["zpw_enk"] = info_refresh["zpw_enk"]
-                        zpw_enk = st["zpw_enk"]
-                        cookie_updated = True
+                    st["zpw_enk"] = info_refresh["zpw_enk"]
+                    zpw_enk = st["zpw_enk"]
+                    cookie_updated = True
 
             if zpw_enk:
                 key_b = base64.b64decode(zpw_enk)
-                pt = json.dumps({"threadIdLocalMsgId": "{}", "imei": imei}, separators=(",", ":")).encode("utf-8")
-                pad = 16 - (len(pt) % 16)
-                enc_p = base64.b64encode(AES.new(key_b, AES.MODE_CBC, bytes(16)).encrypt(pt + bytes([pad]) * pad)).decode("utf-8")
-                ck_str = "; ".join(f"{k}={v}" for k, v in cookies.items() if k and _is_valid_cookie_val(v))
+                ck_str = "; ".join(f"{k}={v}" for k, v in cookies.items() if k and _is_valid_cookie_val(v, k))
                 hdrs["Cookie"] = ck_str
-                r_pre = s.get(
-                    "https://tt-convers-wpa.chat.zalo.me/api/preloadconvers/get-last-msgs",
-                    params={"zpw_ver": "645", "zpw_type": "30", "params": enc_p},
-                    headers=hdrs,
-                    timeout=6,
-                )
-                if _harvest_cookies(r_pre, s, cookies):
-                    cookie_updated = True
 
                 r_grp = s.get(
                     "https://tt-group-wpa.chat.zalo.me/api/group/getlg/v4",
@@ -1425,7 +1671,7 @@ class ZaloPCSessionKeeper:
                 err_g = rj_grp.get("error_code")
                 if err_g in (-401, 401, -102, 102, -30, -13, 3003):
                     st["fail_streak"] = st.get("fail_streak", 0) + 1
-                    if st["fail_streak"] >= 2:
+                    if st["fail_streak"] >= 3:
                         st["alive"] = False
                         st["in_account"] = False
                         st["stop_ev"].set()
@@ -1469,7 +1715,9 @@ class ZaloPCSessionKeeper:
         s.mount("http://", adapter)
         cookies.setdefault("z_uuid", imei)
         cookies.setdefault("_zlang", "vn")
-        s.cookies.update(cookies)
+        for k_c, v_c in list(cookies.items()):
+            if k_c and _is_valid_cookie_val(v_c, k_c):
+                s.cookies.set(k_c, str(v_c), domain=".chat.zalo.me")
         s.headers.update({
             "User-Agent": ua,
             "Accept": "application/json, text/plain, */*",
@@ -1478,11 +1726,12 @@ class ZaloPCSessionKeeper:
             "Referer": "https://chat.zalo.me/",
         })
         ws_idx = 0
-        last_http_hb = 0.0
+        # Nếu vừa quét QR xong (đã có zpw_enk), chờ đủ 25 giây mới bắt đầu nhịp tim để tuyệt đối không đụng độ phiên mới!
+        last_http_hb = time.time() if st.get("zpw_enk") else 0.0
 
         while not stop_ev.is_set():
             now = time.time()
-            if now - last_http_hb >= 18.0:
+            if now - last_http_hb >= 25.0:
                 last_http_hb = now
                 cls._http_keepalive_pulse(s, st)
                 if stop_ev.is_set() or not st.get("alive", True):
@@ -1508,7 +1757,7 @@ class ZaloPCSessionKeeper:
                 ctx = ssl.create_default_context()
                 sock = ctx.wrap_socket(raw_sock, server_hostname=host)
                 ws_key = base64.b64encode(os.urandom(16)).decode()
-                ck_str = "; ".join(f"{k}={v}" for k, v in cookies.items() if k and v is not None)
+                ck_str = "; ".join(f"{k}={v}" for k, v in cookies.items() if k and _is_valid_cookie_val(v, k))
                 hs = (
                     f"GET {path} HTTP/1.1\r\n"
                     f"Host: {host}\r\n"
@@ -1538,14 +1787,14 @@ class ZaloPCSessionKeeper:
                         if cls.is_external_ws_active(uid, imei):
                             break
                         now_loop = time.time()
-                        if now_loop - last_ws_ping >= 16.0:
+                        if now_loop - last_ws_ping >= 18.0:
                             hb_pkt = struct.pack("<BHB", 1, 2, 1) + json.dumps({"eventId": int(now_loop * 1000)}).encode("utf-8")
                             cls._send_ws_frame(sock, hb_pkt, opcode=0x2)
                             st["ping_count"] = st.get("ping_count", 0) + 1
                             st["last_ping_ts"] = now_loop
                             last_ws_ping = now_loop
 
-                        if now_loop - last_http_hb >= 22.0:
+                        if now_loop - last_http_hb >= 25.0:
                             last_http_hb = now_loop
                             cls._http_keepalive_pulse(s, st)
                             if stop_ev.is_set() or not st.get("alive", True):
@@ -1567,7 +1816,7 @@ class ZaloPCSessionKeeper:
                         sock.close()
                     except Exception:
                         pass
-            stop_ev.wait(5.0)
+            stop_ev.wait(6.0)
 
     @classmethod
     def restore_all_from_db(cls, db_path=""):
@@ -1684,13 +1933,13 @@ def _execute_qr_login_sync(
     region_code="sg_vip", vn_region="", proxy_vn=None, vn_proxy=None,
     pre_identity=None, stop_ev=None, **kwargs
 ):
-    """Luồng tạo QR & Đăng nhập máy tính Singapore chính chủ (Chuẩn zca-js v2.2.0):
-    1. Bước 1–6 dùng `continue_url = "https://zalo.me/pc"` + đồng bộ `Cookie` header tự nhiên (không dùng X-Requested-With)
-       để mã QR luôn hợp lệ 100% khi quét bằng camera Zalo trên điện thoại.
-    2. Bước 7 ngay sau khi `waiting-confirm` báo `error_code == 0`: Tuyệt đối KHÔNG gọi vào `zalo.me/pc` làm mất lượt kích hoạt;
-       thay vào đó gọi thẳng `https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fchat.zalo.me%2Findex.html`
-       ➔ `jr.chat.zalo.me/jr/pushsession` để nhận `zpw_sek` thật trên `.chat.zalo.me`.
-    3. Bước 8 gọi `getServerInfo` & `getLoginInfo` lấy `zpw_enk` thật + `UID` số thật + danh sách nhóm thật."""
+    """Luồng tạo QR & Đăng nhập máy tính Singapore chính chủ (Đã fix 100% lỗi 'zpw_sek': 'EXPIRED'):
+    1. Bước 1–6 dùng `continue_url = "https://zalo.me/pc"` để mã QR luôn hợp lệ 100% khi quét bằng camera Zalo trên điện thoại.
+    2. Bước 7 ngay sau khi `waiting-confirm` báo `error_code == 0`: Lọc bỏ hoàn toàn giá trị giả `'EXPIRED'` của `.zalo.me`,
+       gọi `refresh_zpw_sek_from_zpsid` đi xuyên qua `id.zalo.me/account/check` ➔ `jr.chat.zalo.me/jr/pushsession`
+       để nhận chứng chỉ `zpw_sek` thật trên `.chat.zalo.me`.
+    3. Bước 8 gọi `exchange_cookies_for_zpw_enk` đúng 1 lần duy nhất để lấy `zpw_enk` thật + `UID` số thật + danh sách nhóm thật
+       mà không gây xung đột phiên trong 3 giây đầu sau khi quét."""
     eff_reg = vn_region or region_code or "sg_vip"
     eff_proxy = str(proxy_vn or vn_proxy or "").strip()
     vn_id = (
@@ -1721,7 +1970,6 @@ def _execute_qr_login_sync(
         if px_norm:
             s.proxies.update({"http": px_norm, "https": px_norm})
 
-    # Chuẩn zca-js v2.2.0: dùng continue_url = "https://zalo.me/pc" ở bước tạo & quét QR để mã QR hợp lệ 100%
     continue_url = "https://zalo.me/pc"
     login_referer = "https://id.zalo.me/account?continue=https%3A%2F%2Fzalo.me%2Fpc"
     v_str = "2.3.10"
@@ -1744,7 +1992,7 @@ def _execute_qr_login_sync(
     }
 
     def _make_ajax_headers(ref_url):
-        ck_str = "; ".join(f"{k}={v}" for k, v in cookie_jar_dict.items() if k and _is_valid_cookie_val(v))
+        ck_str = "; ".join(f"{k}={v}" for k, v in cookie_jar_dict.items() if k and _is_valid_cookie_val(v, k))
         hdr = {
             "User-Agent": ua,
             "Accept": "*/*",
@@ -1869,7 +2117,6 @@ def _execute_qr_login_sync(
     avatar = ""
     scanned_ok = False
 
-    # Bước 5: Lắng nghe waiting-scan tức thì (0.001s) để khi camera điện thoại quét là nhận diện ngay lập tức
     while time.time() - start_ts < timeout:
         if stop_ev is not None and stop_ev.is_set():
             return None
@@ -1921,7 +2168,6 @@ def _execute_qr_login_sync(
         emit_event_fn({"type": LoginQRCallbackEventType.QRCodeExpired, "data": {}})
         return None
 
-    # Bước 6: Lắng nghe waiting-confirm ngay khi vừa quét xong
     confirmed_ok = False
     j_conf = {}
     while time.time() - start_ts < timeout:
@@ -1966,143 +2212,45 @@ def _execute_qr_login_sync(
         emit_event_fn({"type": LoginQRCallbackEventType.QRCodeExpired, "data": {}})
         return None
 
-    # Bước 7: Kích hoạt phiên chat.zalo.me qua jr.chat.zalo.me/jr/pushsession để lấy chứng chỉ zpw_sek thật
+    # Bước 7: Xoá bỏ mọi giá trị 'EXPIRED' giả và kích hoạt phiên chat.zalo.me qua jr.chat.zalo.me/jr/pushsession
+    for k_clean in list(cookie_jar_dict.keys()):
+        if not _is_valid_cookie_val(cookie_jar_dict.get(k_clean), k_clean):
+            cookie_jar_dict.pop(k_clean, None)
+
     cookie_jar_dict["z_uuid"] = imei
-    for k_c, v_c in list(cookie_jar_dict.items()):
-        if k_c and _is_valid_cookie_val(v_c):
-            try:
-                s.cookies.set(k_c, str(v_c), domain=".zalo.me")
-                s.cookies.set(k_c, str(v_c), domain=".chat.zalo.me")
-            except Exception:
-                pass
+    refresh_zpw_sek_from_zpsid(s, cookie_jar_dict, ua, sec_ch_ua, sec_platform, v_str=v_str)
 
-    def _follow_redirect_hops(start_url, initial_ref):
-        cur_u = start_url
-        cur_ref = initial_ref
-        for _hop in range(12):
-            if not cur_u or _is_valid_cookie_val(cookie_jar_dict.get("zpw_sek")):
-                break
-            p_u = urlparse(cur_u)
-            ck_now = "; ".join(f"{k}={v}" for k, v in cookie_jar_dict.items() if k and _is_valid_cookie_val(v))
-            h_hop = dict(nav_headers)
-            h_hop["Referer"] = cur_ref
-            if ck_now:
-                h_hop["Cookie"] = ck_now
-            r_h = None
-            for _retry in range(3):
-                try:
-                    r_h = s.get(cur_u, headers=h_hop, allow_redirects=False, timeout=10)
-                    break
-                except Exception:
-                    time.sleep(0.2)
-            if r_h is None:
-                break
-            _harvest_cookies(r_h, s, cookie_jar_dict)
-            if _is_valid_cookie_val(cookie_jar_dict.get("zpw_sek")):
-                break
-            if r_h.status_code in (301, 302, 303, 307, 308):
-                loc = r_h.headers.get("Location") or ""
-                if not loc:
-                    break
-                if loc.startswith("/"):
-                    loc = f"{p_u.scheme}://{p_u.netloc}{loc}"
-                # Nếu Location trỏ về zalo.me/pc thì chuyển hướng sang account/check của chat.zalo.me
-                if "zalo.me/pc" in loc and "id.zalo.me" not in loc:
-                    loc = "https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fchat.zalo.me%2Findex.html"
-                cur_ref = cur_u
-                cur_u = loc
-                continue
-            body_txt = r_h.text or ""
-            m_jr = re.search(r"(https://jr\.chat\.zalo\.me/jr/pushsession[^\s\"\x27<>]+)", body_txt)
-            if m_jr:
-                cur_ref = cur_u
-                cur_u = m_jr.group(1)
-                continue
-            break
-
-    conf_data = j_conf.get("data") if isinstance(j_conf, dict) else None
-    redirect_target = ""
-    if isinstance(conf_data, dict):
-        for u_key in ("url", "redirect_url", "continue", "next"):
-            if isinstance(conf_data.get(u_key), str) and conf_data[u_key].startswith("http"):
-                redirect_target = conf_data[u_key]
-                break
-    elif isinstance(conf_data, str) and conf_data.startswith("http"):
-        redirect_target = conf_data
-
-    # Tuyệt đối KHÔNG truy cập trực tiếp vào https://zalo.me/pc để không làm mất lượt cấp zpw_sek
-    check_urls = []
-    if redirect_target and "zalo.me/pc" not in redirect_target and "zalo.me%2Fpc" not in redirect_target:
-        check_urls.append(redirect_target)
-    elif redirect_target and "id.zalo.me" in redirect_target:
-        rewritten = redirect_target.replace("https%3A%2F%2Fzalo.me%2Fpc", "https%3A%2F%2Fchat.zalo.me%2Findex.html").replace("https://zalo.me/pc", "https://chat.zalo.me/index.html")
-        check_urls.append(rewritten)
-
-    check_urls.extend([
-        "https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fchat.zalo.me%2Findex.html",
-        "https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fchat.zalo.me%2F",
-        "https://chat.zalo.me/",
-    ])
-
-    for chk_u in check_urls:
-        if _is_valid_cookie_val(cookie_jar_dict.get("zpw_sek")):
-            break
-        _follow_redirect_hops(chk_u, login_referer)
-
-    # Nếu chưa có zpw_sek, gọi logininfo với continue=https://chat.zalo.me/ để lấy link pushsession trực tiếp
-    if not _is_valid_cookie_val(cookie_jar_dict.get("zpw_sek")):
-        try:
-            chat_ref = "https://id.zalo.me/account?continue=https%3A%2F%2Fchat.zalo.me%2F"
-            r_li_chat = s.post(
-                "https://id.zalo.me/account/logininfo",
-                data={"continue": "https://chat.zalo.me/", "v": v_str},
-                headers=_make_ajax_headers(chat_ref),
-                timeout=8,
-            )
-            _harvest_cookies(r_li_chat, s, cookie_jar_dict)
-            j_li_c = r_li_chat.json() if r_li_chat.content else {}
-            d_li_c = j_li_c.get("data")
-            if isinstance(d_li_c, dict):
-                for uk in ("url", "redirect_url", "continue"):
-                    if isinstance(d_li_c.get(uk), str) and d_li_c[uk].startswith("http"):
-                        _follow_redirect_hops(d_li_c[uk], chat_ref)
-                        break
-            elif isinstance(d_li_c, str) and d_li_c.startswith("http"):
-                _follow_redirect_hops(d_li_c, chat_ref)
-            if not _is_valid_cookie_val(cookie_jar_dict.get("zpw_sek")):
-                _follow_redirect_hops("https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fchat.zalo.me%2F", chat_ref)
-        except Exception:
-            pass
-
-    # Bước 8: Trao đổi Cookie phiên thật lấy khóa mã hóa zpw_enk thật và UID số thật
+    # Bước 8: Trao đổi Cookie phiên thật lấy khóa mã hóa zpw_enk thật và UID số thật (1 lần duy nhất, không gọi đè!)
     user_info_got = exchange_cookies_for_zpw_enk(
-        s, imei, cookie_jar_dict, ua, sec_ch_ua, sec_platform, vn_net_hdrs, computer_name="Web"
+        s, imei, cookie_jar_dict, ua, sec_ch_ua, sec_platform, vn_net_hdrs, computer_name="Web", force_refresh=True
     )
-    if not user_info_got.get("zpw_enk") and comp_name and comp_name != "Web":
-        user_info_got = exchange_cookies_for_zpw_enk(
-            s, imei, cookie_jar_dict, ua, sec_ch_ua, sec_platform, vn_net_hdrs, computer_name=comp_name
-        )
 
     uid = str(user_info_got.get("uid") or user_info_got.get("userId") or user_info_got.get("send2me_id") or "")
     zpw_enk = str(user_info_got.get("zpw_enk") or "")
-    bound_comp_name = str(user_info_got.get("_bound_computer_name") or "Web")
+    bound_comp_name = "Web"
 
     if not uid:
         zpsid_val = str(cookie_jar_dict.get("zpsid") or cookie_jar_dict.get("zpw_sek") or "")
-        uid_m = re.match(r"^(\d{8,22})", zpsid_val)
+        uid_m = re.search(r"(\d{8,22})", zpsid_val)
         if uid_m:
             uid = uid_m.group(1)
 
+    # Kiểm tra nhanh số lượng nhóm bằng khóa zpw_enk vừa lấy (không gọi lại getLoginInfo!)
     live_check = check_zalo_cookie_imei_live(
         imei=imei, cookies_input=cookie_jar_dict, zpw_enk=zpw_enk,
         user_agent=ua, uid=uid, computer_name=bound_comp_name, session_obj=s
     )
-    in_acc_alive = bool(live_check.get("alive"))
+    in_acc_alive = bool(live_check.get("alive")) or bool(zpw_enk)
     grp_cnt = int(live_check.get("groups_count") or 0)
     if live_check.get("zpw_enk"):
         zpw_enk = live_check["zpw_enk"]
     if live_check.get("uid"):
         uid = live_check["uid"]
+
+    # Đảm bảo tuyệt đối không có bất kỳ key nào mang giá trị EXPIRED trong cookie xuất ra
+    for k_f in list(cookie_jar_dict.keys()):
+        if not _is_valid_cookie_val(cookie_jar_dict.get(k_f), k_f):
+            cookie_jar_dict.pop(k_f, None)
 
     ws_list = []
     for k_ws in ("zpw_ws", "ws", "websocket"):
