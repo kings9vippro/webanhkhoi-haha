@@ -301,8 +301,15 @@ def db():
     return pooled
 
 def normalize_zalo_cookies(raw_cookies):
-    """Chuẩn hóa mọi định dạng Cookie Zalo (J2Team JSON, Extension JSON, EditThisCookie Array, Dict, Header String)
-    về Dict phẳng {str(k): str(v)} để không bao giờ gây lỗi TypeError trong requests CookieJar!"""
+    """Chuẩn hóa mọi định dạng Cookie Zalo (J2Team JSON, Extension JSON, EditThisCookie Array, Dict, Header String, File .txt)
+    về Dict phẳng {str(k): str(v)} an toàn tuyệt đối cho cả CookieJar và Header Cookie!"""
+    try:
+        from zalo_login import parse_cookies_input_flexible
+        c_d = parse_cookies_input_flexible(raw_cookies)
+        if c_d:
+            return c_d
+    except Exception:
+        pass
     if not raw_cookies:
         return {}
     if isinstance(raw_cookies, dict):
@@ -310,14 +317,18 @@ def normalize_zalo_cookies(raw_cookies):
             return normalize_zalo_cookies(raw_cookies["cookies"])
         out = {}
         for k, v in raw_cookies.items():
-            if k and k not in ("url", "imei", "userAgent", "user_agent") and not isinstance(v, (list, dict)) and v is not None:
-                out[str(k).strip()] = str(v).strip()
+            if k and k not in ("url", "imei", "userAgent", "user_agent", "zpw_enk") and not isinstance(v, (list, dict)) and v is not None:
+                val_s = str(v).strip()
+                if val_s and val_s.lower() not in ("deleted", "null", "none", '""', "''"):
+                    out[str(k).strip()] = val_s
         return out
     if isinstance(raw_cookies, list):
         out = {}
         for c in raw_cookies:
             if isinstance(c, dict) and c.get("name") and c.get("value") is not None:
-                out[str(c["name"]).strip()] = str(c["value"]).strip()
+                val_s = str(c["value"]).strip()
+                if val_s and val_s.lower() not in ("deleted", "null", "none", '""', "''"):
+                    out[str(c["name"]).strip()] = val_s
         return out
     s = str(raw_cookies).strip()
     if not s:
@@ -329,28 +340,47 @@ def normalize_zalo_cookies(raw_cookies):
     except Exception:
         pass
     out = {}
-    for part in s.split(";"):
-        if "=" in part:
-            k, v = part.strip().split("=", 1)
-            if k.strip():
-                out[k.strip()] = v.strip()
+    for part in s.replace("\r", "\n").split(";"):
+        for line_p in part.split("\n"):
+            if "=" in line_p:
+                k, v = line_p.strip().split("=", 1)
+                k_s, v_s = k.strip(), v.strip().strip(",")
+                if k_s and v_s and " " not in k_s and ":" not in k_s and v_s.lower() not in ("deleted", "null", "none"):
+                    out[k_s] = v_s
     return out
 
 def extract_imei_from_raw_input(imei_str, raw_cookies):
+    """Bóc tách chính xác 100% IMEI (z_uuid) từ ô nhập IMEI, từ trong Cookie (z_uuid), hoặc từ file .txt xuất ra."""
+    try:
+        from zalo_login import extract_imei_and_metadata_flexible
+        im_ext, ck_ext, _, _ = extract_imei_and_metadata_flexible(imei_str, raw_cookies)
+        if im_ext:
+            return im_ext
+        if ck_ext.get("z_uuid"):
+            return str(ck_ext["z_uuid"]).strip()
+    except Exception:
+        pass
     imei_clean = str(imei_str or "").strip()
-    if imei_clean and not imei_clean.startswith("{"):
+    if imei_clean and not imei_clean.startswith("{") and "=" not in imei_clean and "\n" not in imei_clean:
         return imei_clean
     for candidate in (imei_str, raw_cookies):
         if not candidate:
             continue
+        s_cand = str(candidate).strip()
+        m_uuid = re.search(r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(?:-[0-9a-fA-F]{16,64})?)", s_cand)
+        if m_uuid:
+            return m_uuid.group(1).strip()
         try:
-            parsed = json.loads(str(candidate).strip()) if isinstance(candidate, str) else candidate
+            parsed = json.loads(s_cand) if isinstance(candidate, str) else candidate
             if isinstance(parsed, dict):
-                found_imei = parsed.get("imei") or parsed.get("zpw_imei") or parsed.get("deviceId")
+                found_imei = parsed.get("imei") or parsed.get("z_uuid") or parsed.get("zpw_imei") or parsed.get("deviceId")
                 if found_imei:
                     return str(found_imei).strip()
         except Exception:
             pass
+    c_norm = normalize_zalo_cookies(raw_cookies or imei_str)
+    if c_norm.get("z_uuid"):
+        return str(c_norm["z_uuid"]).strip()
     return imei_clean
 
 def normalize_messenger_cookies(raw_cookies):
@@ -3300,12 +3330,10 @@ class Zalo:
         self.user_agent = base_hdrs["User-Agent"]
         self.s.headers.update(base_hdrs)
         self.prio_s.headers.update(base_hdrs)
-        if self.imei and "z_uuid" not in self.cookies_dict:
+        if self.imei:
             self.cookies_dict["z_uuid"] = self.imei
-        if "_zlang" not in self.cookies_dict:
-            self.cookies_dict["_zlang"] = "vn"
-        self.s.cookies.update(self.cookies_dict)
-        self.prio_s.cookies.update(self.cookies_dict)
+        self.cookies_dict.setdefault("_zlang", "vn")
+        self._sync_cookie_headers()
         self.secret_key = (zpw_enk_hint or saved_enk or "").strip() or None
         self.uid = (uid_hint or saved_uid or "").strip() or None
         self.send2me_id = self.uid
@@ -3324,6 +3352,20 @@ class Zalo:
                 self.display_name = f"Zalo_{self.uid[-4:]}"
         else:
             self._login()
+
+    def _sync_cookie_headers(self):
+        try:
+            if self.imei:
+                self.cookies_dict["z_uuid"] = self.imei
+            self.cookies_dict.setdefault("_zlang", "vn")
+            self.s.cookies.update(self.cookies_dict)
+            self.prio_s.cookies.update(self.cookies_dict)
+            ck_str = "; ".join(f"{k}={v}" for k, v in self.cookies_dict.items() if k and v is not None and str(v).strip())
+            if ck_str:
+                self.s.headers["Cookie"] = ck_str
+                self.prio_s.headers["Cookie"] = ck_str
+        except Exception:
+            pass
 
     def _lookup_saved_vault_meta(self):
         ua, enk, uid, dname = "", "", "", ""
@@ -3354,66 +3396,58 @@ class Zalo:
 
     def _login(self):
         """Đăng nhập APIZalo (zca-js / zlapi chuẩn v645) giữ sống Cookie & IMEI cố định 100%:
-        - Sử dụng đúng thứ tự tham số bảng chữ cái cho signkey của getServerInfo (`zsecuregetserverinfo645Web{imei}30`).
-        - Sử dụng ZaloParamsEncryptor (`enc_ver=v2`, `computer_name='Web'`) trên `wpa.chat.zalo.me` để không bao giờ làm hỏng Cookie phiên!"""
+        - Luôn đồng bộ Header Cookie trực tiếp để truyền đầy đủ zpw_sek, zpsid, z_uuid.
+        - Hỗ trợ gọi qua exchange_cookies_for_zpw_enk đa cổng (wpa.chat.zalo.me / tt-wpa.chat.zalo.me / chat.zalo.me)."""
+        self._sync_cookie_headers()
         ud = None
         last_err = ""
+        try:
+            from zalo_login import exchange_cookies_for_zpw_enk
+            sec_ch = '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"'
+            sec_plat = '"macOS"' if "Macintosh" in str(self.user_agent or "") else '"Windows"'
+            ud_ext = exchange_cookies_for_zpw_enk(
+                self.s, self.imei, self.cookies_dict, self.user_agent, sec_ch, sec_plat, {}, computer_name="Web"
+            )
+            if isinstance(ud_ext, dict) and ud_ext.get("zpw_enk"):
+                ud = ud_ext
+                self._sync_cookie_headers()
+        except Exception as e_ex:
+            last_err = str(e_ex)
+
         ts_now = int(time.time() * 1000)
-
-        try:
-            # Bước 1: Gọi getServerInfo với signkey chuẩn thứ tự bảng chữ cái: client_version(645) + computer_name(Web) + imei + type(30)
-            srv_sign = hashlib.md5(f"zsecuregetserverinfo645Web{self.imei}30".encode("utf-8")).hexdigest()
-            self.s.get(
-                "https://wpa.chat.zalo.me/api/login/getServerInfo",
-                params={
-                    "imei": self.imei,
-                    "type": 30,
-                    "client_version": 645,
-                    "computer_name": "Web",
-                    "signkey": srv_sign,
-                },
-                timeout=6,
-            )
-        except Exception:
-            pass
-
-        try:
-            # Bước 2: Gọi getLoginInfo mã hóa AES v2 chuẩn zca-js
-            enc_q, enc_key = ZaloParamsEncryptor.build_encrypted_login_query(
-                self.imei, computer_name="Web", language="vi", ts=ts_now, ztype=30, client_version=645
-            )
-            r_enc = self.s.get("https://wpa.chat.zalo.me/api/login/getLoginInfo", params=enc_q, timeout=10)
-            for c_item in r_enc.cookies:
-                self.cookies_dict[c_item.name] = c_item.value
-            d_enc = r_enc.json() if r_enc.content else {}
-            raw_enc_data = d_enc.get("data")
-            if isinstance(raw_enc_data, str) and raw_enc_data:
-                dec_ud = ZaloParamsEncryptor.decrypt_login_data(raw_enc_data, enc_key)
-                if isinstance(dec_ud, dict) and dec_ud.get("zpw_enk"):
-                    ud = dec_ud
-            elif isinstance(raw_enc_data, dict) and raw_enc_data.get("zpw_enk"):
-                ud = raw_enc_data
-            else:
-                last_err = d_enc.get("error_message") or str(d_enc.get("error_code") or "")
-        except Exception as e_enc:
-            last_err = str(e_enc)
-
         if not isinstance(ud, dict):
-            try:
-                enc_q24, enc_key24 = ZaloParamsEncryptor.build_encrypted_login_query(
-                    self.imei, computer_name="Web", language="vi", ts=ts_now, ztype=24, client_version=645
-                )
-                r_enc24 = self.s.get("https://wpa.chat.zalo.me/api/login/getLoginInfo", params=enc_q24, timeout=10)
-                for c_item in r_enc24.cookies:
-                    self.cookies_dict[c_item.name] = c_item.value
-                d_enc24 = r_enc24.json() if r_enc24.content else {}
-                raw_d24 = d_enc24.get("data")
-                if isinstance(raw_d24, str) and raw_d24:
-                    dec_ud24 = ZaloParamsEncryptor.decrypt_login_data(raw_d24, enc_key24)
-                    if isinstance(dec_ud24, dict) and dec_ud24.get("zpw_enk"):
-                        ud = dec_ud24
-            except Exception:
-                pass
+            for zt_try in (30, 24):
+                for ep_try in (
+                    "https://wpa.chat.zalo.me/api/login/getLoginInfo",
+                    "https://tt-wpa.chat.zalo.me/api/login/getLoginInfo",
+                    "https://chat.zalo.me/api/login/getLoginInfo",
+                ):
+                    try:
+                        self._sync_cookie_headers()
+                        enc_q, enc_key = ZaloParamsEncryptor.build_encrypted_login_query(
+                            self.imei, computer_name="Web", language="vi", ts=ts_now, ztype=zt_try, client_version=645
+                        )
+                        r_enc = self.s.get(ep_try, params=enc_q, timeout=10)
+                        for c_item in r_enc.cookies:
+                            if c_item.name and c_item.value:
+                                self.cookies_dict[c_item.name] = c_item.value
+                        self._sync_cookie_headers()
+                        d_enc = r_enc.json() if r_enc.content else {}
+                        raw_enc_data = d_enc.get("data")
+                        if isinstance(raw_enc_data, str) and raw_enc_data:
+                            dec_ud = ZaloParamsEncryptor.decrypt_login_data(raw_enc_data, enc_key)
+                            if isinstance(dec_ud, dict) and dec_ud.get("zpw_enk"):
+                                ud = dec_ud
+                                break
+                        elif isinstance(raw_enc_data, dict) and raw_enc_data.get("zpw_enk"):
+                            ud = raw_enc_data
+                            break
+                        else:
+                            last_err = d_enc.get("error_message") or str(d_enc.get("error_code") or "")
+                    except Exception as e_enc:
+                        last_err = str(e_enc)
+                if isinstance(ud, dict) and ud.get("zpw_enk"):
+                    break
 
         if isinstance(ud, dict) and ud.get("zpw_enk"):
             self.uid = str(ud.get("uid") or ud.get("userId") or ud.get("send2me_id") or self.uid or "")
@@ -5661,10 +5695,30 @@ class ZaloQRLoginManager:
         except Exception:
             pass
 
-        if not zpw_enk:
-            zpw_enk = base64.b64encode(hashlib.sha256(f"zpw_enk_{imei}_{clean_c.get('zpw_sek', '')}".encode("utf-8")).digest()[:16]).decode("utf-8")
+        if not zpw_enk or not uid or not live_groups_count:
+            try:
+                from zalo_login import check_zalo_cookie_imei_live
+                chk_live = check_zalo_cookie_imei_live(
+                    imei=imei, cookies_input=clean_c, zpw_enk=zpw_enk,
+                    user_agent=ua_bound, uid=uid, computer_name=comp_name
+                )
+                if chk_live.get("zpw_enk"):
+                    zpw_enk = chk_live["zpw_enk"]
+                if chk_live.get("uid"):
+                    uid = chk_live["uid"]
+                if chk_live.get("display_name") and (not d_name or d_name == "Zalo User"):
+                    d_name = chk_live["display_name"]
+                if chk_live.get("groups_count"):
+                    live_groups_count = int(chk_live["groups_count"])
+                if isinstance(chk_live.get("cookies"), dict):
+                    clean_c.update(chk_live["cookies"])
+            except Exception:
+                pass
         if not uid:
-            uid = str(clean_c.get("zpsid") or f"vn_{zlib.crc32(imei.encode('utf-8')) & 0xFFFFFFFF}")[:18]
+            zpsid_v = str(clean_c.get("zpsid") or clean_c.get("zpw_sek") or "")
+            m_u = re.match(r"^(\d{8,22})", zpsid_v)
+            if m_u:
+                uid = m_u.group(1)
 
         try:
             from zalo_login import ZaloPCSessionKeeper
@@ -5913,8 +5967,8 @@ class ZaloQRLoginManager:
         pc_name = st.get("pc_name", "ASUS ROG Zephyrus G16 (Windows 11 Pro VN)")
         comp_name = st.get("computer_name") or "Web"
 
-        continue_url = "https://chat.zalo.me/"
-        login_referer = "https://id.zalo.me/account?continue=https%3A%2F%2Fchat.zalo.me%2F"
+        continue_url = "https://zalo.me/pc"
+        login_referer = "https://id.zalo.me/account?continue=https%3A%2F%2Fzalo.me%2Fpc"
         v_str = "2.3.10"
         qr_b64_raw = ""
         qr_code_id = ""
@@ -6136,12 +6190,17 @@ class ZaloQRLoginManager:
             def _follow_redirect_clean(start_url, initial_ref):
                 cur_u = start_url
                 cur_ref = initial_ref
-                for _hop in range(10):
+                for _hop in range(12):
                     if not cur_u or cls._is_valid_cookie_val(cookie_jar_dict.get("zpw_sek")):
                         break
                     p_u = urlparse(cur_u)
+                    if p_u.netloc in ("zalo.me", "www.zalo.me") and p_u.path.startswith("/pc"):
+                        break
                     h_hop = dict(nav_headers)
                     h_hop["Referer"] = cur_ref
+                    ck_now = "; ".join(f"{k}={v}" for k, v in cookie_jar_dict.items() if k and cls._is_valid_cookie_val(v))
+                    if ck_now:
+                        h_hop["Cookie"] = ck_now
                     r_h = None
                     for _retry in range(3):
                         try:
@@ -6181,11 +6240,14 @@ class ZaloQRLoginManager:
                 redirect_target = conf_data
 
             check_urls = []
-            if redirect_target:
+            if redirect_target and "zalo.me/pc" not in redirect_target:
                 check_urls.append(redirect_target)
+            elif redirect_target and "id.zalo.me/account/check" in redirect_target:
+                check_urls.append(redirect_target.replace("zalo.me%2Fpc", "chat.zalo.me%2Findex.html"))
             check_urls.extend([
-                "https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fchat.zalo.me%2F",
                 "https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fchat.zalo.me%2Findex.html",
+                "https://id.zalo.me/account/check?type=0&continue=https%3A%2F%2Fchat.zalo.me%2F",
+                "https://chat.zalo.me/index.html",
                 "https://chat.zalo.me/",
             ])
 
@@ -17506,36 +17568,48 @@ def api_zalo_vault_list():
 
 @app.route("/api/zalo/verify_cookie_imei", methods=["POST"])
 def api_zalo_verify_cookie_imei():
+    from zalo_login import extract_imei_and_metadata_flexible, check_zalo_cookie_imei_live, ZaloPCSessionKeeper
     data = request.json or {}
     raw_imei = (data.get("imei") or "").strip()
     raw_cookies = (data.get("cookies") or "").strip()
     custom_name = (data.get("name") or "").strip()
     auto_save = bool(data.get("auto_save", True))
 
-    imei = extract_imei_from_raw_input(raw_imei, raw_cookies)
-    if not imei:
-        imei = ZaloWebIDGenerator.generate_unique_imei(salt=raw_cookies[:32])
-    cookies_dict = normalize_zalo_cookies(raw_cookies or raw_imei)
+    imei, cookies_dict, zpw_enk_hint, ua_hint = extract_imei_and_metadata_flexible(raw_imei, raw_cookies)
     if not cookies_dict:
-        return jsonify({"ok": False, "error": "Cookie Zalo không hợp lệ hoặc để trống!"}), 400
+        cookies_dict = normalize_zalo_cookies(raw_cookies or raw_imei)
+    if not imei and cookies_dict.get("z_uuid"):
+        imei = str(cookies_dict["z_uuid"]).strip()
 
-    uid = ""
-    zpw_enk = ""
-    acc_name = custom_name or f"Zalo_{imei[-4:]}"
-    verified_live = False
-    try:
-        z = Zalo.get_pooled_client(imei, cookies_dict, force_new=True)
-        uid = z.uid or ""
-        zpw_enk = z.secret_key or ""
-        if not custom_name and z.display_name:
-            acc_name = z.display_name
-        cookies_dict = z.cookies_dict
-        verified_live = True
-    except Exception:
-        uid = f"zalo_{hashlib.md5(imei.encode('utf-8')).hexdigest()[:8]}"
+    if not cookies_dict:
+        return jsonify({"ok": False, "error": "Cookie Zalo không hợp lệ hoặc đang để trống! Hãy dán Cookie chứa zpw_sek hoặc zpsid."}), 400
+    if not imei:
+        return jsonify({"ok": False, "error": "Thiếu mã IMEI (z_uuid) đi kèm Cookie! Hãy dán đúng IMEI của thiết bị đã lấy Cookie."}), 400
+
+    chk = check_zalo_cookie_imei_live(
+        imei=imei, cookies_input=cookies_dict, zpw_enk=zpw_enk_hint, user_agent=ua_hint
+    )
+    if not chk.get("alive"):
+        return jsonify({
+            "ok": False,
+            "alive": False,
+            "imei": imei,
+            "error": chk.get("reason") or "DIE — Cookie hoặc IMEI Zalo đã hết hạn hoặc thiết bị đã đăng xuất khỏi tài khoản!",
+        }), 400
+
+    uid = str(chk.get("uid") or imei).strip()
+    zpw_enk = str(chk.get("zpw_enk") or zpw_enk_hint or "").strip()
+    cookies_dict = chk.get("cookies") or cookies_dict
+    acc_name = custom_name or chk.get("display_name") or f"Zalo_{uid[-4:]}"
+    groups_count = int(chk.get("groups_count") or 0)
+    eff_ua = ua_hint or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
     ZaloCookieVaultEngine.save_zalo_vault_record(
-        uid=uid, display_name=acc_name, imei=imei, cookies_dict=cookies_dict, zpw_enk=zpw_enk
+        uid=uid, display_name=acc_name, imei=imei, cookies_dict=cookies_dict, zpw_enk=zpw_enk, user_agent=eff_ua
+    )
+    ZaloPCSessionKeeper.register_and_keep_alive(
+        uid=uid, imei=imei, cookies_dict=cookies_dict, zpw_enk=zpw_enk,
+        user_agent=eff_ua, pc_name="Windows 11 Pro (Singapore)", display_name=acc_name, db_path=DB_PATH
     )
 
     if auto_save:
@@ -17543,27 +17617,30 @@ def api_zalo_verify_cookie_imei():
         existing = conn.execute("SELECT id FROM accounts WHERE platform='zalo' AND (uid=? OR imei=?)", (uid, imei)).fetchone()
         if existing:
             conn.execute(
-                "UPDATE accounts SET name=?, imei=?, cookies=?, uid=?, enabled=1 WHERE id=?",
-                (acc_name, imei, json.dumps(cookies_dict, ensure_ascii=False), uid, existing["id"])
+                "UPDATE accounts SET name=?, imei=?, cookies=?, uid=?, zpw_enk=?, user_agent=?, pc_name=?, chat_cmd_enabled=1, allow_all_cmd=1, enabled=1 WHERE id=?",
+                (acc_name, imei, json.dumps(cookies_dict, ensure_ascii=False), uid, zpw_enk, eff_ua, "Windows 11 Pro (Singapore)", existing["id"])
             )
         else:
             conn.execute(
-                """INSERT INTO accounts (name, platform, imei, cookies, token, is_bot, uid, chat_cmd_enabled, cmd_prefix, allow_all_cmd, enabled, created_at)
-                   VALUES (?, 'zalo', ?, ?, '', 0, ?, 1, '.', 1, 1, ?)""",
-                (acc_name, imei, json.dumps(cookies_dict, ensure_ascii=False), uid, time.time())
+                """INSERT INTO accounts (name, platform, imei, cookies, token, is_bot, uid, chat_cmd_enabled, cmd_prefix, allow_all_cmd, enabled, user_agent, zpw_enk, pc_name, created_at)
+                   VALUES (?, 'zalo', ?, ?, '', 0, ?, 1, '.', 1, 1, ?, ?, 'Windows 11 Pro (Singapore)', ?)""",
+                (acc_name, imei, json.dumps(cookies_dict, ensure_ascii=False), uid, eff_ua, zpw_enk, time.time())
             )
         conn.commit()
         conn.close()
+        refresh_accounts_ram_cache()
         sync_all_zalo_listeners()
 
     return jsonify({
         "ok": True,
+        "alive": True,
         "uid": uid,
         "name": acc_name,
         "imei": imei,
-        "verified_live": verified_live,
+        "groups_count": groups_count,
+        "verified_live": True,
         "zpw_enk_ready": bool(zpw_enk),
-        "message": f"Đã lưu Cookie & IMEI của {acc_name} vào Kho lưu trữ và kết nối API Zalo thành công!"
+        "message": f"🟢 SỐNG (ON) — Đã xác thực & giữ sống 24/7 cho {acc_name} (UID: {uid} • {groups_count} nhóm)!"
     })
 
 @app.route("/api/zalo/vault/activate", methods=["POST"])
@@ -17937,31 +18014,52 @@ def account_add():
         sync_all_zalo_listeners()
         return redirect("/")
 
+    from zalo_login import extract_imei_and_metadata_flexible, check_zalo_cookie_imei_live, ZaloPCSessionKeeper
     raw_imei = (request.form.get("imei") or "").strip()
     raw_cookies = (request.form.get("cookies") or "").strip()
-    imei = extract_imei_from_raw_input(raw_imei, raw_cookies)
-    cookies_dict = normalize_zalo_cookies(raw_cookies or raw_imei)
+    imei, cookies_dict, zpw_enk_hint, ua_hint = extract_imei_and_metadata_flexible(raw_imei, raw_cookies)
+    if not cookies_dict:
+        cookies_dict = normalize_zalo_cookies(raw_cookies or raw_imei)
+    if not imei and cookies_dict.get("z_uuid"):
+        imei = str(cookies_dict["z_uuid"]).strip()
     if not imei or not cookies_dict:
         return redirect("/")
 
-    uid = ""
-    acc_name = custom_name or f"Zalo_{imei[-4:]}"
-    try:
-        z = Zalo.get_pooled_client(imei, cookies_dict)
-        uid = z.uid or ""
-        if not custom_name and z.display_name:
-            acc_name = z.display_name
-    except Exception:
-        pass
+    chk = check_zalo_cookie_imei_live(
+        imei=imei, cookies_input=cookies_dict, zpw_enk=zpw_enk_hint, user_agent=ua_hint
+    )
+    uid = str(chk.get("uid") or "").strip()
+    zpw_enk = str(chk.get("zpw_enk") or zpw_enk_hint or "").strip()
+    if chk.get("cookies"):
+        cookies_dict = chk["cookies"]
+    acc_name = custom_name or chk.get("display_name") or (f"Zalo_{uid[-4:]}" if uid else f"Zalo_{imei[-4:]}")
+    eff_ua = ua_hint or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+    if chk.get("alive"):
+        ZaloCookieVaultEngine.save_zalo_vault_record(
+            uid=uid or imei, display_name=acc_name, imei=imei, cookies_dict=cookies_dict, zpw_enk=zpw_enk, user_agent=eff_ua
+        )
+        ZaloPCSessionKeeper.register_and_keep_alive(
+            uid=uid or imei, imei=imei, cookies_dict=cookies_dict, zpw_enk=zpw_enk,
+            user_agent=eff_ua, pc_name="Windows 11 Pro (Singapore)", display_name=acc_name, db_path=DB_PATH
+        )
 
     conn = db()
-    conn.execute(
-        """INSERT INTO accounts (name, platform, imei, cookies, token, is_bot, uid, chat_cmd_enabled, cmd_prefix, allow_all_cmd, enabled, created_at)
-           VALUES (?, 'zalo', ?, ?, '', 0, ?, ?, '.', ?, 1, ?)""",
-        (acc_name, imei, json.dumps(cookies_dict, ensure_ascii=False), uid, chat_cmd, allow_all, time.time()),
-    )
+    existing = conn.execute("SELECT id FROM accounts WHERE platform='zalo' AND (imei=? OR (uid != '' AND uid=?))", (imei, uid)).fetchone()
+    if existing:
+        conn.execute(
+            "UPDATE accounts SET name=?, imei=?, cookies=?, uid=?, user_agent=?, zpw_enk=?, pc_name=?, chat_cmd_enabled=?, allow_all_cmd=?, enabled=1 WHERE id=?",
+            (acc_name, imei, json.dumps(cookies_dict, ensure_ascii=False), uid, eff_ua, zpw_enk, "Windows 11 Pro (Singapore)", chat_cmd, allow_all, existing["id"])
+        )
+    else:
+        conn.execute(
+            """INSERT INTO accounts (name, platform, imei, cookies, token, is_bot, uid, chat_cmd_enabled, cmd_prefix, allow_all_cmd, enabled, user_agent, zpw_enk, pc_name, created_at)
+               VALUES (?, 'zalo', ?, ?, '', 0, ?, ?, '.', ?, 1, ?, ?, 'Windows 11 Pro (Singapore)', ?)""",
+            (acc_name, imei, json.dumps(cookies_dict, ensure_ascii=False), uid, chat_cmd, allow_all, eff_ua, zpw_enk, time.time()),
+        )
     conn.commit()
     conn.close()
+    refresh_accounts_ram_cache()
     sync_all_zalo_listeners()
     return redirect("/")
 
