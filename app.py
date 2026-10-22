@@ -302,7 +302,7 @@ def db():
 
 def normalize_zalo_cookies(raw_cookies):
     """Chuẩn hóa mọi định dạng Cookie Zalo (J2Team JSON, Extension JSON, EditThisCookie Array, Dict, Header String, File .txt)
-    về Dict phẳng {str(k): str(v)} an toàn tuyệt đối cho cả CookieJar và Header Cookie!"""
+    về Dict phẳng {str(k): str(v)} an toàn tuyệt đối cho cả CookieJar và Header Cookie (tự động loại bỏ 'EXPIRED')!"""
     try:
         from zalo_login import parse_cookies_input_flexible
         c_d = parse_cookies_input_flexible(raw_cookies)
@@ -312,6 +312,7 @@ def normalize_zalo_cookies(raw_cookies):
         pass
     if not raw_cookies:
         return {}
+    _bad_vals = ("deleted", "null", "none", "expired", "invalid", "false", "undefined", '""', "''")
     if isinstance(raw_cookies, dict):
         if "cookies" in raw_cookies and isinstance(raw_cookies["cookies"], (list, dict, str)):
             return normalize_zalo_cookies(raw_cookies["cookies"])
@@ -319,7 +320,9 @@ def normalize_zalo_cookies(raw_cookies):
         for k, v in raw_cookies.items():
             if k and k not in ("url", "imei", "userAgent", "user_agent", "zpw_enk") and not isinstance(v, (list, dict)) and v is not None:
                 val_s = str(v).strip()
-                if val_s and val_s.lower() not in ("deleted", "null", "none", '""', "''"):
+                if val_s and val_s.lower() not in _bad_vals:
+                    if str(k).strip().lower() in ("zpw_sek", "zpsid", "zpsidleg", "__zi") and len(val_s) < 12:
+                        continue
                     out[str(k).strip()] = val_s
         return out
     if isinstance(raw_cookies, list):
@@ -462,7 +465,7 @@ def init_db():
         uid TEXT DEFAULT '',
         chat_cmd_enabled INTEGER DEFAULT 1,
         cmd_prefix TEXT DEFAULT '.',
-        allow_all_cmd INTEGER DEFAULT 1,
+        allow_all_cmd INTEGER DEFAULT 0,
         enabled INTEGER DEFAULT 1,
         created_at REAL
     )
@@ -553,7 +556,7 @@ def init_db():
         ("uid", "ALTER TABLE accounts ADD COLUMN uid TEXT DEFAULT ''"),
         ("chat_cmd_enabled", "ALTER TABLE accounts ADD COLUMN chat_cmd_enabled INTEGER DEFAULT 1"),
         ("cmd_prefix", "ALTER TABLE accounts ADD COLUMN cmd_prefix TEXT DEFAULT '.'"),
-        ("allow_all_cmd", "ALTER TABLE accounts ADD COLUMN allow_all_cmd INTEGER DEFAULT 1"),
+        ("allow_all_cmd", "ALTER TABLE accounts ADD COLUMN allow_all_cmd INTEGER DEFAULT 0"),
         ("enabled", "ALTER TABLE accounts ADD COLUMN enabled INTEGER DEFAULT 1"),
         ("user_agent", "ALTER TABLE accounts ADD COLUMN user_agent TEXT DEFAULT ''"),
         ("zpw_enk", "ALTER TABLE accounts ADD COLUMN zpw_enk TEXT DEFAULT ''"),
@@ -625,7 +628,24 @@ def init_db():
 
     try:
         cur.execute("UPDATE accounts SET chat_cmd_enabled = 1 WHERE chat_cmd_enabled IS NULL")
-        cur.execute("UPDATE accounts SET allow_all_cmd = 1 WHERE allow_all_cmd IS NULL")
+        cur.execute("UPDATE accounts SET allow_all_cmd = 0")
+        # Tự động nạp sẵn 8 kho kịch bản VIP từ 3 file zip (nhay.txt, so.txt, chui.txt, codelag.txt, nhayicon.txt, nhaynamebox.txt, ngon.txt, 2c.txt)
+        presets_dir = os.path.join(BASE_DIR, "presets")
+        if os.path.isdir(presets_dir):
+            import shutil
+            existing_fnames = {r["filename"].lower() for r in cur.execute("SELECT filename FROM files").fetchall() if r["filename"]}
+            for pf_name in ("nhay.txt", "so.txt", "chui.txt", "codelag.txt", "nhayicon.txt", "nhaynamebox.txt", "ngon.txt", "2c.txt"):
+                src_pf = os.path.join(presets_dir, pf_name)
+                if os.path.isfile(src_pf) and pf_name.lower() not in existing_fnames:
+                    dst_pf = os.path.join(UPLOAD_DIR, f"preset_{pf_name}")
+                    if not os.path.isfile(dst_pf):
+                        shutil.copyfile(src_pf, dst_pf)
+                    with open(dst_pf, "r", encoding="utf-8", errors="ignore") as rf_p:
+                        l_cnt = sum(1 for ln in rf_p if ln.strip())
+                    cur.execute(
+                        "INSERT INTO files (filename, filepath, lines_count, created_at) VALUES (?, ?, ?, ?)",
+                        (pf_name, dst_pf, max(1, l_cnt), time.time())
+                    )
         z_rows = cur.execute("SELECT id, imei, cookies FROM accounts WHERE platform='zalo'").fetchall()
         for zr in z_rows:
             norm_c = normalize_zalo_cookies(zr["cookies"])
@@ -936,6 +956,11 @@ VALID_SYSTEM_CMD_TOKENS = {
     "vip", "sieuvip", "theme", "setnen", "nen", "poll", "nhaypoll",
     "sharelink", "link", "sharecontact", "contact", "typing", "ty",
     "tenbox", "nhaynamebox", "setname", "bd", "namechange",
+    "treoso", "so", "sotag", "sotagfaketen", "codelag", "lag", "nhay2c", "2c",
+    "ideamess", "chui", "nhayicon", "nhaytagfaketen", "faketen",
+    "nhaytop", "sotop", "treotop", "reostr", "story", "addmem", "raidbox",
+    "block", "unblock", "joinsv", "join", "rename", "doiten", "changeavt", "avt",
+    "ngontele", "nhaytele", "nhaytagtele", "nhayanhtele", "treogmail", "nhaygmail", "meta", "ai",
 }
 
 def normalize_cmd_homoglyphs(s):
@@ -1087,8 +1112,7 @@ def is_user_authorized_for_cmd(sender_uid, client_uid=None, client_send2me_id=No
             if s_name_norm and (info["norm_uid"] == s_name_norm or (info["norm_name"] and info["norm_name"] == s_name_norm)):
                 return True
 
-    if allow_all:
-        return True
+    # TUYỆT ĐỐI KHÔNG CHO PHÉP NGƯỜI LẠ DÙNG LỆNH — CHỈ OWNER HOẶC NGƯỜI ĐƯỢC CẤP QUYỀN (.cp) MỚI ĐƯỢC DÙNG!
     return False
 
 def add_authorized_user(uid, name="", acc_id=0):
@@ -5647,11 +5671,14 @@ class ZaloQRLoginManager:
         clean_c = normalize_zalo_cookies(cookies_dict)
         if session_obj is not None:
             try:
-                for c in session_obj.cookies:
-                    if c.name and c.value is not None:
-                        clean_c[c.name] = c.value
+                for c in list(session_obj.cookies):
+                    if c.name and cls._is_valid_cookie_val(c.value, c.name):
+                        clean_c[c.name] = str(c.value).strip()
             except Exception:
                 pass
+        for k_bad in list(clean_c.keys()):
+            if not cls._is_valid_cookie_val(clean_c.get(k_bad), k_bad):
+                clean_c.pop(k_bad, None)
 
         uid = ""
         zpw_enk = ""
@@ -5779,13 +5806,13 @@ class ZaloQRLoginManager:
                 if existing:
                     saved_acc_id = existing["id"]
                     conn.execute(
-                        "UPDATE accounts SET name=?, imei=?, cookies=?, uid=?, user_agent=?, zpw_enk=?, pc_name=?, chat_cmd_enabled=1, allow_all_cmd=1, enabled=1 WHERE id=?",
+                        "UPDATE accounts SET name=?, imei=?, cookies=?, uid=?, user_agent=?, zpw_enk=?, pc_name=?, chat_cmd_enabled=1, allow_all_cmd=0, enabled=1 WHERE id=?",
                         (d_name, imei, json.dumps(clean_c, ensure_ascii=False), uid, ua_bound, zpw_enk, pc_name, saved_acc_id)
                     )
                 else:
                     cur = conn.execute(
                         """INSERT INTO accounts (name, platform, imei, cookies, token, is_bot, uid, chat_cmd_enabled, cmd_prefix, allow_all_cmd, enabled, user_agent, zpw_enk, pc_name, created_at)
-                           VALUES (?, 'zalo', ?, ?, '', 0, ?, 1, '.', 1, 1, ?, ?, ?, ?)""",
+                           VALUES (?, 'zalo', ?, ?, '', 0, ?, 1, '.', 0, 1, ?, ?, ?, ?)""",
                         (d_name, imei, json.dumps(clean_c, ensure_ascii=False), uid, ua_bound, zpw_enk, pc_name, time.time())
                     )
                     saved_acc_id = cur.lastrowid
@@ -5801,51 +5828,25 @@ class ZaloQRLoginManager:
                 pass
 
     @staticmethod
-    def _is_valid_cookie_val(val):
-        if val is None:
-            return False
-        s = str(val).strip()
-        if not s or s.lower() in ("deleted", "null", "none", '""', "''"):
-            return False
-        return True
+    def _is_valid_cookie_val(val, cookie_name=""):
+        try:
+            from zalo_login import _is_valid_cookie_val as _zl_valid
+            return _zl_valid(val, cookie_name=cookie_name)
+        except Exception:
+            if val is None:
+                return False
+            s = str(val).strip()
+            if not s or s.lower() in ("deleted", "null", "none", "expired", "invalid", "false", "undefined", '""', "''"):
+                return False
+            if str(cookie_name).lower() in ("zpw_sek", "zpsid", "zpsidleg", "__zi") and len(s) < 12:
+                return False
+            return True
 
     @staticmethod
     def _harvest_cookies(resp, session_obj, jar_dict):
         try:
-            if session_obj and session_obj.cookies:
-                for c in session_obj.cookies:
-                    if c.name and ZaloQRLoginManager._is_valid_cookie_val(c.value):
-                        jar_dict[c.name] = str(c.value).strip()
-            if resp is not None:
-                if getattr(resp, "history", None):
-                    for h_resp in resp.history:
-                        ZaloQRLoginManager._harvest_cookies(h_resp, None, jar_dict)
-                if resp.cookies:
-                    for c in resp.cookies:
-                        if c.name and ZaloQRLoginManager._is_valid_cookie_val(c.value):
-                            jar_dict[c.name] = str(c.value).strip()
-                raw_headers = getattr(getattr(resp, "raw", None), "headers", None)
-                sc_list = []
-                if raw_headers is not None and hasattr(raw_headers, "getlist"):
-                    sc_list = raw_headers.getlist("Set-Cookie")
-                elif resp.headers.get("Set-Cookie"):
-                    sc_list = [resp.headers.get("Set-Cookie")]
-                for sc_line in sc_list:
-                    sc_low = str(sc_line or "").lower()
-                    if "max-age=0" in sc_low or "max-age=-" in sc_low or "1970" in sc_low:
-                        continue
-                    for seg in str(sc_line or "").split(";"):
-                        if "=" in seg:
-                            k_c, v_c = seg.strip().split("=", 1)
-                            k_c, v_c = k_c.strip(), v_c.strip()
-                            if k_c and ZaloQRLoginManager._is_valid_cookie_val(v_c) and "," not in k_c and " " not in k_c:
-                                if k_c.lower() not in ("expires", "path", "domain", "max-age", "secure", "httponly", "samesite", "priority", "version"):
-                                    jar_dict[k_c] = v_c
-                            break
-                sc_hdr = resp.headers.get("Set-Cookie") or ""
-                for m_sc in re.finditer(r"(?:^|;\s*|\,\s*)(zpw_sek|zpsid|zpsidleg|zpw_sua|__zi|__zi-legacy|_zlang|app\.event\.zalo\.me|z_uuid|_zsid)=([^;,\s]+)", sc_hdr):
-                    if ZaloQRLoginManager._is_valid_cookie_val(m_sc.group(2)):
-                        jar_dict[m_sc.group(1)] = m_sc.group(2).strip()
+            from zalo_login import _harvest_cookies as _zl_harvest
+            return _zl_harvest(resp, session_obj, jar_dict)
         except Exception:
             pass
 
@@ -6253,8 +6254,14 @@ class ZaloQRLoginManager:
 
             for chk_u in check_urls:
                 _follow_redirect_clean(chk_u, login_referer)
-                if cookie_jar_dict.get("zpw_sek"):
+                if cls._is_valid_cookie_val(cookie_jar_dict.get("zpw_sek"), "zpw_sek"):
                     break
+            if not cls._is_valid_cookie_val(cookie_jar_dict.get("zpw_sek"), "zpw_sek") and cls._is_valid_cookie_val(cookie_jar_dict.get("zpsid"), "zpsid"):
+                try:
+                    from zalo_login import refresh_zpw_sek_from_zpsid
+                    refresh_zpw_sek_from_zpsid(s, cookie_jar_dict, ua, sec_ch_ua, sec_platform, v_str=v_str)
+                except Exception:
+                    pass
 
             user_info_got = {}
             ck_final_str = "; ".join(f"{k}={v}" for k, v in cookie_jar_dict.items() if k and v is not None)
@@ -6920,6 +6927,50 @@ class DiscordClient:
         ep = DiscordStealthAntiBanEngine.pick_stealth_endpoint(self.token, "/hypesquad/online", 0)
         r = self.s.post(ep, json={"house_id": int(house_id or 1)}, timeout=10)
         return r.status_code in (200, 204)
+
+    def join_server(self, invite_code):
+        """Tham gia Server Discord bằng mã mời (Tích hợp từ 3app vip.zip/module/discord.py)."""
+        code = str(invite_code or "").strip().rstrip("/")
+        for pfx in ("https://discord.gg/", "http://discord.gg/", "https://discord.com/invite/", "discord.gg/"):
+            if code.lower().startswith(pfx):
+                code = code[len(pfx):].strip()
+        if not code:
+            return False, "Thiếu mã mời Discord"
+        self._apply_headers()
+        ep = DiscordStealthAntiBanEngine.pick_stealth_endpoint(self.token, f"/invites/{code}", 0)
+        r = self.s.post(ep, json={}, timeout=12)
+        if r.status_code in (200, 201, 204):
+            return True, f"Đã tham gia Server ({code})"
+        return False, f"Mã lỗi HTTP {r.status_code}"
+
+    def change_globalname(self, new_name):
+        """Đổi tên hiển thị (Global Name) cho Token Discord (Tích hợp từ 3app vip.zip/module/discord.py)."""
+        self._apply_headers()
+        ep = DiscordStealthAntiBanEngine.pick_stealth_endpoint(self.token, "/users/@me", 0)
+        r = self.s.patch(ep, json={"global_name": str(new_name or "NHK VIP")[:32]}, timeout=12)
+        return r.status_code == 200
+
+    def change_avatar(self, image_url_or_b64):
+        """Đổi ảnh đại diện (Avatar) cho Token Discord bằng URL hoặc Data URI Base64."""
+        raw_in = str(image_url_or_b64 or "").strip()
+        if not raw_in:
+            return False
+        data_uri = raw_in
+        if raw_in.startswith(("http://", "https://")):
+            try:
+                resp_img = requests.get(raw_in, timeout=10)
+                if resp_img.status_code == 200 and resp_img.content:
+                    mime = resp_img.headers.get("Content-Type") or "image/png"
+                    b64_img = base64.b64encode(resp_img.content).decode("utf-8")
+                    data_uri = f"data:{mime};base64,{b64_img}"
+            except Exception:
+                return False
+        elif not raw_in.startswith("data:image/"):
+            data_uri = f"data:image/png;base64,{raw_in}"
+        self._apply_headers()
+        ep = DiscordStealthAntiBanEngine.pick_stealth_endpoint(self.token, "/users/@me", 0)
+        r = self.s.patch(ep, json={"avatar": data_uri}, timeout=15)
+        return r.status_code == 200
 
     def send_poll_discord(self, channel_id, question_text, options_list=None):
         self._apply_headers(channel_id=channel_id)
@@ -8449,6 +8500,146 @@ class MessengerClient:
         r = self.s.post("https://www.facebook.com/messaging/save_thread_nickname/?source=thread_settings&dpr=1", data=data, headers=hdrs, timeout=10)
         return r.status_code == 200
 
+    def block_user(self, target_uid):
+        """Chặn người dùng Facebook/Messenger qua GraphQL doc_id 6305880099497989 (Tích hợp từ 3app vip.zip/module/block.py)."""
+        t_uid = str(target_uid or "").strip()
+        if not t_uid:
+            return False
+        form = self._form_all(friendly_name="useBlockUserMutation", doc_id="6305880099497989", require_graphql=None)
+        form["variables"] = json.dumps({
+            "input": {
+                "actor_id": str(self.uid),
+                "block_Origin": "MESSENGER_THREAD",
+                "client_mutation_id": str(random.randint(1, 999999)),
+                "target_id": t_uid,
+            }
+        })
+        hdrs = MessengerStealthAntiBanEngine.get_session_headers(self.uid, referer="https://www.facebook.com/")
+        r = self.s.post("https://www.facebook.com/api/graphql/", data=form, headers=hdrs, timeout=10)
+        return r.status_code == 200
+
+    def unblock_user(self, target_uid):
+        """Bỏ chặn người dùng Facebook/Messenger qua GraphQL doc_id 6009824239038988 (Tích hợp từ 3app vip.zip/module/block.py)."""
+        t_uid = str(target_uid or "").strip()
+        if not t_uid:
+            return False
+        form = self._form_all(friendly_name="ProfilePlusFBMessengerUnblockMutation", doc_id="6009824239038988", require_graphql=None)
+        form["variables"] = json.dumps({
+            "input": {
+                "actor_id": str(self.uid),
+                "client_mutation_id": str(random.randint(1, 999999)),
+                "target_id": t_uid,
+            }
+        })
+        hdrs = MessengerStealthAntiBanEngine.get_session_headers(self.uid, referer="https://www.facebook.com/")
+        r = self.s.post("https://www.facebook.com/api/graphql/", data=form, headers=hdrs, timeout=10)
+        return r.status_code == 200
+
+    def add_user_to_group(self, thread_id, user_ids_list):
+        """Thêm thành viên vào Box Nhóm Messenger qua MQTT /ls_req & Mercury (Tích hợp từ 5appbytrantu.zip/module/raid.py)."""
+        tid_s = str(thread_id).strip()
+        uids = [str(u).strip() for u in (user_ids_list if isinstance(user_ids_list, (list, tuple, set)) else [user_ids_list]) if str(u).strip()]
+        if not uids:
+            return False
+        otid = MessengerStealthAntiBanEngine.generate_offline_threading_id()
+        form = self._form_all()
+        form.update({
+            "client": "mercury",
+            "action_type": "ma-type:log-message",
+            "author": f"fbid:{self.uid}",
+            "thread_id": tid_s,
+            "thread_fbid": tid_s,
+            "timestamp": int(time.time() * 1000),
+            "source": "source:chat:web",
+            "log_message_type": "log:subscribe",
+            "offline_threading_id": otid,
+            "message_id": otid,
+        })
+        for idx, u_id in enumerate(uids):
+            form[f"log_message_data[added_participants][{idx}]"] = f"fbid:{u_id}"
+        hdrs = MessengerStealthAntiBanEngine.get_session_headers(self.uid, referer="https://www.facebook.com/")
+        r = self.s.post("https://www.facebook.com/messaging/send/", data=form, headers=hdrs, timeout=12)
+        return r.status_code == 200
+
+    def comment_group_post(self, post_id, comment_text, tag_uid="", tag_name=""):
+        """Bình luận bài viết Group/Top Facebook qua GraphQL doc_id 24323081780615819 (Tích hợp từ 3app vip.zip/module/nhaytop.py)."""
+        pid_s = str(post_id or "").strip()
+        if not pid_s:
+            return False
+        feedback_id = base64.b64encode(f"feedback:{pid_s}".encode("utf-8")).decode("utf-8") if pid_s.isdigit() else pid_s
+        ranges = []
+        final_txt = str(comment_text or "").strip()
+        if tag_uid and str(tag_uid).strip():
+            t_uid = str(tag_uid).strip()
+            t_lbl = str(tag_name or GLOBAL_USER_NAME_CACHE.get(t_uid) or f"User_{t_uid[-4:]}").strip().lstrip("@")
+            idx_t = final_txt.find(t_lbl)
+            if idx_t == -1:
+                sep = " " if final_txt else ""
+                idx_t = len(final_txt + sep)
+                final_txt = f"{final_txt}{sep}{t_lbl}"
+            ranges.append({
+                "entity": {"id": t_uid},
+                "length": len(t_lbl),
+                "offset": idx_t,
+            })
+        form = self._form_all(friendly_name="useCometUFICreateCommentMutation", doc_id="24323081780615819", require_graphql=None)
+        form["variables"] = json.dumps({
+            "feedLocation": "GROUP",
+            "feedbackSource": 0,
+            "groupID": None,
+            "input": {
+                "client_mutation_id": str(random.randint(1, 999999)),
+                "actor_id": str(self.uid),
+                "attachments": [],
+                "feedback_id": feedback_id,
+                "formatting_style": None,
+                "message": {"ranges": ranges, "text": final_txt},
+                "attribution_id_v2": "",
+                "is_tracking_encrypted": True,
+                "tracking": [],
+                "feedback_source": "OBJECT",
+                "idempotence_token": f"client:{uuid.uuid4()}",
+                "session_id": str(uuid.uuid4()),
+            },
+            "inviteShortLinkKey": None,
+            "renderLocation": None,
+            "scale": 1,
+            "useDefaultActor": False,
+            "focusCommentID": None,
+        })
+        hdrs = MessengerStealthAntiBanEngine.get_session_headers(self.uid, referer="https://www.facebook.com/")
+        r = self.s.post("https://www.facebook.com/api/graphql/", data=form, headers=hdrs, timeout=12)
+        return r.status_code == 200
+
+    def post_story_mention(self, content_text, target_uid=""):
+        """Đăng Story văn bản kèm réo tên (Story Mention) qua GraphQL doc_id 7490607150987409 (Tích hợp từ 3app vip.zip/module/reostr.py)."""
+        form = self._form_all(friendly_name="StoriesCreateMutation", doc_id="7490607150987409", require_graphql=None)
+        overlays = []
+        if target_uid and str(target_uid).strip():
+            overlays.append({
+                "tag_sticker": {
+                    "bounds": {"height": 0.1, "rotation": 0, "width": 0.3, "x": 0.35, "y": 0.45},
+                    "tag_id": str(target_uid).strip(),
+                    "type": "PEOPLE",
+                }
+            })
+        form["variables"] = json.dumps({
+            "input": {
+                "actor_id": str(self.uid),
+                "audiences": [{"stories": {"self": {"target_id": str(self.uid)}}}],
+                "client_mutation_id": str(random.randint(1, 999999)),
+                "source": "WWW",
+                "text_format_metadata": {"inspirations_custom_font_id": "2334906556782613"},
+                "text_format_preset_id": "401372137331149",
+                "message": {"ranges": [], "text": str(content_text or "NHK VIP STORY")[:240]},
+                "overlays": overlays,
+                "logging": {"composer_session_id": str(uuid.uuid4())},
+            }
+        })
+        hdrs = MessengerStealthAntiBanEngine.get_session_headers(self.uid, referer="https://www.facebook.com/")
+        r = self.s.post("https://www.facebook.com/api/graphql/", data=form, headers=hdrs, timeout=12)
+        return r.status_code == 200
+
     def send_message(self, thread_id, content, is_group=True, mentions=None, tag_all=False,
                      antiband=True, use_emoji=False, icon_count=0, is_heading=True, strip_line_num=False,
                      stop_ev=None, start_global_epoch=None, start_box_epoch=None):
@@ -8668,6 +8859,36 @@ class MessengerRealtimeListener:
 # ĐỘNG CƠ ĐA LUỒNG CHẠY 2-5+ ĐOẠN CHAT SONG SONG ỔN ĐỊNH KHÔNG LAG
 _TURBO_SEND_POOL = ThreadPoolExecutor(max_workers=512)
 
+
+LAG_COMBINING_MARKS = ["̀", "́", "̂", "̃", "̄", "̆", "̇", "̈", "̉", "̊", "̋", "̌", "̣", "̧", "̨"]
+VIP_ICON_FLOOD_POOL = ["🔥", "⚡", "👑", "💀", "☠️", "😈", "💥", "🚀", "🌪️", "🐉", "⚔️", "🛡️"]
+
+def transform_special_mode_packet(raw_text, mode, step_idx=0):
+    """Biến đổi gói tin theo các chế độ đặc biệt từ 3 file zip (3app vip.zip, 1appsieuvip.zip, 5appbytrantu.zip):
+    - treo_so / so_tag: Tự động đánh số thứ tự tăng dần '1. ...', '2. ...' hoặc gửi dãy số liên hoàn.
+    - code_lag: Phủ ký tự tổ hợp Zalgo/Lag siêu nặng từ codelag.txt.
+    - nhay_2c: Ghép 2 câu sát thương liên tiếp trên 1 nhịp gửi (2c.txt).
+    - nhay_icon: Rải chuỗi ký hiệu biểu cảm dày đặc từ nhayicon.txt.
+    - nhay_fake_ten: Giả lập định dạng nhắc tên kép siêu gắt."""
+    txt = str(raw_text or "").strip()
+    if mode in ("treo_so", "so_tag", "so_tag_faketen"):
+        if not txt.isdigit():
+            return f"{step_idx + 1}. {txt}"
+        return str(step_idx + 1)
+    if mode == "code_lag":
+        out_chars = []
+        for ch in txt[:180]:
+            out_chars.append(ch)
+            if not ch.isspace():
+                out_chars.extend(random.sample(LAG_COMBINING_MARKS, 3))
+        return "".join(out_chars)
+    if mode == "nhay_icon":
+        icons_str = "".join(random.choices(VIP_ICON_FLOOD_POOL, k=6))
+        return f"{icons_str} {txt} {icons_str}" if txt else icons_str * 3
+    if mode in ("nhay_fake_ten", "so_tag_faketen"):
+        return f"@[👑 MỤC TIÊU #{step_idx + 1}] ➔ {txt}"
+    return txt
+
 def box_target_worker(client, acc_id, plat, target, blocks, runtime_opts,
                       stop_ev, counter, lock, stagger_sec=0.0, active_box_count=1):
     target_type = target.get("type", "group")
@@ -8841,6 +9062,28 @@ def box_target_worker(client, acc_id, plat, target, blocks, runtime_opts,
                 c3 = strip_leading_line_number(blocks[(b_idx + 1) % len(blocks)])
                 clean_raw = f"{c1}\n{c2}\n{c3}"
                 b_idx += 2
+            elif mode == "nhay_2c" and len(blocks) >= 2:
+                c1 = strip_leading_line_number(blocks[(b_idx - 1) % len(blocks)])
+                c2 = strip_leading_line_number(blocks[b_idx % len(blocks)])
+                clean_raw = f"{c1} — {c2}"
+                b_idx += 1
+            elif mode in ("treo_so", "so_tag", "so_tag_faketen", "code_lag", "nhay_icon", "nhay_fake_ten"):
+                clean_raw = transform_special_mode_packet(clean_raw, mode, step_idx=b_idx - 1)
+                if mode in ("so_tag", "so_tag_faketen", "nhay_fake_ten"):
+                    eff_tag_all = True
+                    is_group = True
+            elif plat == "messenger" and mode in ("nhay_top", "reo_story"):
+                text_item = strip_leading_line_number(clean_raw) if strip_line_num else clean_raw
+                t_uid_0 = eff_mentions[0]["uid"] if eff_mentions else ""
+                t_name_0 = eff_mentions[0].get("name", "") if eff_mentions else ""
+                if mode == "nhay_top":
+                    client.comment_group_post(target_id, text_item, tag_uid=t_uid_0, tag_name=t_name_0)
+                else:
+                    client.post_story_mention(text_item, target_uid=t_uid_0)
+                with lock:
+                    counter["sent"] += 1
+                HEALTH_MGR.report_success(acc_id, channel_id=target_id)
+                continue
 
             if plat == "zalo" and mode in ("nhay_poll", "nhay_typing", "nhay_namebox", "zalo_todo", "zalo_cardbank", "share_contact", "reaction_storm"):
                 text_item = strip_leading_line_number(clean_raw) if strip_line_num else clean_raw
@@ -9147,6 +9390,15 @@ def multi_box_shard_worker(client, acc_id, plat, shard_targets, blocks, runtime_
                 c3 = strip_leading_line_number(blocks[(cur_idx + 2) % len(blocks)])
                 raw = f"{c1}\n{c2}\n{c3}"
                 step_inc = 3
+            elif mode == "nhay_2c" and len(blocks) >= 2:
+                c1 = strip_leading_line_number(blocks[cur_idx % len(blocks)])
+                c2 = strip_leading_line_number(blocks[(cur_idx + 1) % len(blocks)])
+                raw = f"{c1} — {c2}"
+                step_inc = 2
+            elif mode in ("treo_so", "so_tag", "so_tag_faketen", "code_lag", "nhay_icon", "nhay_fake_ten"):
+                raw = transform_special_mode_packet(raw, mode, step_idx=cur_idx)
+                if mode in ("so_tag", "so_tag_faketen", "nhay_fake_ten"):
+                    tag_all = True
 
             with SYSTEM_CFG_LOCK:
                 g_ic = int(SYSTEM_RUNTIME_CONFIG.get("icon_count", icon_count))
@@ -10040,19 +10292,12 @@ def parse_and_execute_inchat_command(
         s_uid, my_uid, my_s2m, allow_all=False, sender_name=sender_name
     )
     is_owner = (s_uid in ("0", "", my_uid, my_s2m)) or (s_uid in OWNER_UIDS_CACHE) or is_authorized_sender
-    allow_all_val = acc_row.get("allow_all_cmd")
-    allow_all = False if platform == "discord" else (True if allow_all_val is None else bool(int(allow_all_val)))
 
-    if platform == "discord":
-        # Trên Discord: BẮT BUỘC chỉ Chủ Acc (Owner UID) và những người đã được cấp quyền (.cp / .chophep)
-        # mới được quyền ra lệnh và sử dụng hệ thống! Người lạ gõ lệnh (kể cả .menu hay .stop) đều bị từ chối 100%!
-        if not is_owner:
-            return False
-    else:
-        always_open_cmds = {"menu", "help", "lenh", "bot", "hdsd", "files", "dsfile", "listfile", "dsquyen", "stop", "dung", "dừng", "stopall", "ping", "status", "info", "id", "uid", "mem"}
-        if cmd_token not in always_open_cmds:
-            if not (is_owner or is_user_authorized_for_cmd(s_uid, my_uid, my_s2m, allow_all=allow_all, sender_name=sender_name)):
-                return False
+    # ĐÃ XOÁ BỎ HOÀN TOÀN CHỨC NĂNG CHO TOÀN BỘ NGƯỜI KHÁC DÙNG LỆNH (allow_all_cmd):
+    # Trên MỌI nền tảng (Zalo, Discord, Messenger): BẮT BUỘC 100% chỉ Chủ Acc (Owner UID)
+    # và những người đã được cấp quyền (.cp / .chophep) mới được phép sử dụng bất kỳ lệnh nào!
+    if not is_owner:
+        return False
 
     if not pre_claimed_slot:
         if not claim_command_execution_slot(platform, thread_id, s_uid, text, msg_id=msg_id):
@@ -10332,6 +10577,71 @@ def parse_and_execute_inchat_command(
         else:
             _send_reply("⚠️ Cú pháp: .2fa <Secret_Key_Base32>")
         log_system_command(acc_id, thread_id, sender_id, text, "Tạo mã 2FA OTP")
+        return True
+
+    if cmd_token in ("meta", "ai"):
+        q_ai = arg_body.strip()
+        if not q_ai:
+            _send_reply("🤖 Cú pháp hỏi Trợ Lý Meta AI: .meta <câu hỏi>")
+            return True
+        def _bg_meta():
+            try:
+                from get_ck_im_zalo import MetaAIAssistant
+                ans = MetaAIAssistant.ask(q_ai)
+                _send_reply(f"🤖 [META AI]:\n{ans}")
+            except Exception as ex_ai:
+                _send_reply(f"⚠️ Lỗi kết nối Meta AI: {ex_ai}")
+        _PRIORITY_CMD_EXECUTOR.submit(_bg_meta)
+        log_system_command(acc_id, thread_id, sender_id, text, f"Hỏi Meta AI: {q_ai[:30]}")
+        return True
+
+    if platform == "discord" and discord_client and cmd_token in ("joinsv", "join"):
+        inv_c = arg_body.strip()
+        ok_j, msg_j = discord_client.join_server(inv_c)
+        _send_reply(f"✅ {msg_j}" if ok_j else f"⚠️ Không thể tham gia Server: {msg_j}")
+        log_system_command(acc_id, thread_id, sender_id, text, f"Join Server Discord: {inv_c}")
+        return True
+
+    if platform == "discord" and discord_client and cmd_token in ("rename", "doiten"):
+        new_n = arg_body.strip() or "NHK VIP"
+        ok_rn = discord_client.change_globalname(new_n)
+        _send_reply(f"✅ Đã đổi Global Name Discord thành: {new_n}" if ok_rn else "⚠️ Không thể đổi tên lúc này.")
+        log_system_command(acc_id, thread_id, sender_id, text, f"Đổi tên Discord: {new_n}")
+        return True
+
+    if platform == "discord" and discord_client and cmd_token in ("changeavt", "avt"):
+        avt_u = arg_body.strip()
+        ok_av = discord_client.change_avatar(avt_u)
+        _send_reply("✅ Đã cập nhật Avatar Discord thành công!" if ok_av else "⚠️ Hãy truyền URL ảnh hợp lệ: .changeavt <url_ảnh>")
+        log_system_command(acc_id, thread_id, sender_id, text, "Đổi Avatar Discord")
+        return True
+
+    if platform == "messenger" and messenger_client and cmd_token in ("block", "unblock"):
+        _, t_mentions, _ = extract_trailing_tags_and_resolve(
+            arg_body, incoming_mentions=raw_mentions,
+            messenger_client=messenger_client, messenger_thread_id=thread_id
+        )
+        t_uid = t_mentions[0]["uid"] if t_mentions else arg_body.strip()
+        if not t_uid or not str(t_uid).isdigit():
+            _send_reply(f"⚠️ Cú pháp: .{cmd_token} @Tên hoặc .{cmd_token} <UID>")
+            return True
+        if cmd_token == "block":
+            ok_b = messenger_client.block_user(t_uid)
+            _send_reply(f"🚫 Đã chặn UID {t_uid} trên Facebook/Messenger!" if ok_b else "⚠️ Lỗi chặn UID.")
+        else:
+            ok_b = messenger_client.unblock_user(t_uid)
+            _send_reply(f"✅ Đã bỏ chặn UID {t_uid} trên Facebook/Messenger!" if ok_b else "⚠️ Lỗi bỏ chặn UID.")
+        log_system_command(acc_id, thread_id, sender_id, text, f"{cmd_token.upper()} UID {t_uid}")
+        return True
+
+    if platform == "messenger" and messenger_client and cmd_token in ("addmem", "raidbox"):
+        uids_add = [x.strip() for x in re.split(r"[\s,;]+", arg_body.strip()) if x.strip().isdigit()]
+        if not uids_add:
+            _send_reply("⚠️ Cú pháp thêm thành viên vào Box: .addmem <UID_1> <UID_2>...")
+            return True
+        ok_add = messenger_client.add_user_to_group(thread_id, uids_add)
+        _send_reply(f"✅ Đã gửi lệnh thêm {len(uids_add)} thành viên vào Box!" if ok_add else "⚠️ Không thể thêm thành viên.")
+        log_system_command(acc_id, thread_id, sender_id, text, f"Thêm {len(uids_add)} TV vào Box")
         return True
 
     if platform == "discord" and discord_client and cmd_token in ("statusdc",):
@@ -10867,6 +11177,24 @@ def parse_and_execute_inchat_command(
         "xanhom": "sieu_xa_nhieu_nhom",
         "combo": "combo_lien_thanh",
         "battrinh": "battrinh_all_box",
+        "treoso": "treo_so",
+        "so": "treo_so",
+        "sotag": "so_tag",
+        "sotagfaketen": "so_tag_faketen",
+        "codelag": "code_lag",
+        "lag": "code_lag",
+        "nhay2c": "nhay_2c",
+        "2c": "nhay_2c",
+        "ideamess": "idea_mess",
+        "chui": "idea_mess",
+        "nhayicon": "nhay_icon",
+        "nhaytagfaketen": "nhay_fake_ten",
+        "faketen": "nhay_fake_ten",
+        "nhaytop": "nhay_top",
+        "sotop": "nhay_top",
+        "treotop": "nhay_top",
+        "reostr": "reo_story",
+        "story": "reo_story",
     }
 
     direct_file_num = None
@@ -11026,7 +11354,23 @@ def parse_and_execute_inchat_command(
         blocks = cleaned_blocks
 
     if not blocks:
-        blocks = get_blocks_from_file_query("latest", mode=chosen_mode)
+        preset_map_by_mode = {
+            "treo_so": "so.txt",
+            "so_tag": "so.txt",
+            "so_tag_faketen": "so.txt",
+            "code_lag": "codelag.txt",
+            "nhay_2c": "2c.txt",
+            "idea_mess": "chui.txt",
+            "nhay_icon": "nhayicon.txt",
+            "nhay_namebox": "nhaynamebox.txt",
+            "treo_ngon": "ngon.txt",
+            "treo_nhay": "nhay.txt",
+        }
+        pref_file = preset_map_by_mode.get(chosen_mode)
+        if pref_file:
+            blocks = get_blocks_from_file_query(pref_file, mode=chosen_mode)
+        if not blocks:
+            blocks = get_blocks_from_file_query("latest", mode=chosen_mode)
         if blocks:
             blocks = [
                 b_item for b_item in blocks
@@ -14125,9 +14469,8 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
                 </div>
               </div>
 
-              <div class="row-2" style="margin-bottom:10px">
-                <label class="chk-label"><input type="checkbox" name="chat_cmd_enabled" value="1" checked><span>Nhận lệnh (.menu)</span></label>
-                <label class="chk-label"><input type="checkbox" name="allow_all_cmd" value="1" checked><span>Cho phép nhóm dùng lệnh</span></label>
+              <div style="margin-bottom:10px">
+                <label class="chk-label" style="width:100%"><input type="checkbox" name="chat_cmd_enabled" value="1" checked><span>Cho phép Chủ Acc &amp; người được cấp quyền (.cp) sử dụng lệnh</span></label>
               </div>
 
               <button class="btn btn-primary btn-block" type="submit">Lưu Tài Khoản</button>
@@ -14176,9 +14519,8 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
               <span>Danh Sách Tài Khoản ({{ accounts|length }})</span>
             </span>
             <div style="display:flex;gap:4px;flex-wrap:wrap">
-              <button class="btn btn-success btn-sm" type="button" onclick="bulkSetAccountCmdPermission('enable_all', this)">✅ Bật Lệnh Tất Cả Acc</button>
+              <button class="btn btn-success btn-sm" type="button" onclick="bulkSetAccountCmdPermission('enable_all', this)">✅ Bật Lệnh (Chủ Acc &amp; .cp)</button>
               <button class="btn btn-danger btn-sm" type="button" onclick="bulkSetAccountCmdPermission('disable_all', this)">🚫 Tắt Lệnh Tất Cả</button>
-              <button class="btn btn-sm" type="button" onclick="bulkSetAccountCmdPermission('allow_all_on', this)">🔓 Cho Nhóm Dùng Lệnh</button>
               <button class="btn btn-primary btn-sm" type="button" onclick="checkAllAccountsLiveStatus(this)">🔍 Check Sống/Die Tất Cả</button>
               <button class="btn btn-sm" type="button" onclick="reconnectAllListenersNow(this)">Làm mới 24/7</button>
             </div>
@@ -14224,9 +14566,7 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
                             <button type="button" id="btnAccCmd_{{ a.id }}" data-enabled="{{ 1 if a.chat_cmd_enabled else 0 }}" class="btn btn-sm {{ 'btn-success' if a.chat_cmd_enabled else '' }}" onclick="toggleAccCmdInstant({{ a.id }}, this)">
                               {{ '🟢 Cho Phép Dùng Lệnh' if a.chat_cmd_enabled else '⚪ Đang Tắt Lệnh' }}
                             </button>
-                            <button type="button" id="btnAccAllowAll_{{ a.id }}" data-allow="{{ 1 if a.allow_all_cmd else 0 }}" class="btn btn-sm" style="font-size:10.5px;padding:3px 8px" onclick="toggleAccAllowAllInstant({{ a.id }}, this)">
-                              {{ '👥 Mọi Người Dùng Lệnh' if a.allow_all_cmd else '🔒 Chỉ Chủ Acc & .cp' }}
-                            </button>
+                            <span class="badge badge-blue" style="font-size:10px">🔒 Chỉ Chủ Acc &amp; .cp</span>
                           </div>
                         </td>
                         <td>
@@ -14441,10 +14781,20 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
               <div>
                 <label class="field-lbl">Chế độ gửi</label>
                 <select class="sel" id="cfgMode">
-                  <option value="treo_nhay">Treo nhây từng dòng (.n)</option>
+                  <option value="treo_nhay">Treo nhây từng dòng (.n / nhay.txt)</option>
                   <option value="sieu_xa_nhieu_nhom">Xả siêu tốc 500 Box (.xa)</option>
                   <option value="combo_lien_thanh">Gửi gộp 3 câu/nhịp (.combo)</option>
-                  <option value="treo_ngon">Treo ngôn nguyên bài (.g)</option>
+                  <option value="nhay_2c">Nhây gộp 2 câu sát thương (.2c / 2c.txt)</option>
+                  <option value="treo_so">Treo số liên hoàn (.so / so.txt)</option>
+                  <option value="so_tag">Treo số kèm Tag (.sotag)</option>
+                  <option value="so_tag_faketen">Treo số kèm Fake Tên (.sotagfaketen)</option>
+                  <option value="code_lag">Phủ Zalgo Code Lag (.lag / codelag.txt)</option>
+                  <option value="idea_mess">Nhây Chửi Sát Thương (.chui / chui.txt)</option>
+                  <option value="nhay_icon">Bão Ký Hiệu Biểu Cảm (.nhayicon / nhayicon.txt)</option>
+                  <option value="nhay_fake_ten">Nhây Tag Fake Tên (.faketen)</option>
+                  <option value="nhay_top">Nhây Bình Luận Bài Viết Group FB (.nhaytop)</option>
+                  <option value="reo_story">Đăng Story Réo Tên FB (.reostr)</option>
+                  <option value="treo_ngon">Treo ngôn nguyên bài (.g / ngon.txt)</option>
                   <option value="fast">Gửi nhanh liên tục (.s)</option>
                   <option value="raid_burst">Chạy đồng loạt (.r)</option>
                   <option value="auto_shuffle">Đảo câu ngẫu nhiên (.a)</option>
@@ -15550,7 +15900,7 @@ function _applyCmdBtnVisualState(accId, enabled, allowAll) {
   if (btnAllow && allowAll !== undefined && allowAll !== null) {
     const isAll = Boolean(Number(allowAll));
     btnAllow.dataset.allow = isAll ? '1' : '0';
-    btnAllow.textContent = isAll ? '👥 Mọi Người Dùng Lệnh' : '🔒 Chỉ Chủ Acc & .cp';
+    btnAllow.textContent = isAll ? '🔒 Chỉ Chủ Acc & .cp' : '🔒 Chỉ Chủ Acc & .cp';
   }
 }
 
@@ -17617,13 +17967,13 @@ def api_zalo_verify_cookie_imei():
         existing = conn.execute("SELECT id FROM accounts WHERE platform='zalo' AND (uid=? OR imei=?)", (uid, imei)).fetchone()
         if existing:
             conn.execute(
-                "UPDATE accounts SET name=?, imei=?, cookies=?, uid=?, zpw_enk=?, user_agent=?, pc_name=?, chat_cmd_enabled=1, allow_all_cmd=1, enabled=1 WHERE id=?",
+                "UPDATE accounts SET name=?, imei=?, cookies=?, uid=?, zpw_enk=?, user_agent=?, pc_name=?, chat_cmd_enabled=1, allow_all_cmd=0, enabled=1 WHERE id=?",
                 (acc_name, imei, json.dumps(cookies_dict, ensure_ascii=False), uid, zpw_enk, eff_ua, "Windows 11 Pro (Singapore)", existing["id"])
             )
         else:
             conn.execute(
                 """INSERT INTO accounts (name, platform, imei, cookies, token, is_bot, uid, chat_cmd_enabled, cmd_prefix, allow_all_cmd, enabled, user_agent, zpw_enk, pc_name, created_at)
-                   VALUES (?, 'zalo', ?, ?, '', 0, ?, 1, '.', 1, 1, ?, ?, 'Windows 11 Pro (Singapore)', ?)""",
+                   VALUES (?, 'zalo', ?, ?, '', 0, ?, 1, '.', 0, 1, ?, ?, 'Windows 11 Pro (Singapore)', ?)""",
                 (acc_name, imei, json.dumps(cookies_dict, ensure_ascii=False), uid, eff_ua, zpw_enk, time.time())
             )
         conn.commit()
@@ -17661,7 +18011,7 @@ def api_zalo_vault_activate():
     else:
         conn.execute(
             """INSERT INTO accounts (name, platform, imei, cookies, token, is_bot, uid, chat_cmd_enabled, cmd_prefix, allow_all_cmd, enabled, created_at)
-               VALUES (?, 'zalo', ?, ?, '', 0, ?, 1, '.', 1, 1, ?)""",
+               VALUES (?, 'zalo', ?, ?, '', 0, ?, 1, '.', 0, 1, ?)""",
             (rec["display_name"], rec["imei"], json.dumps(rec["cookies"], ensure_ascii=False), rec["uid"], time.time())
         )
     conn.commit()
@@ -17774,7 +18124,7 @@ def api_messenger_login_credentials():
         else:
             conn.execute(
                 """INSERT INTO accounts (name, platform, imei, cookies, token, is_bot, uid, chat_cmd_enabled, cmd_prefix, allow_all_cmd, enabled, created_at)
-                   VALUES (?, 'messenger', '', ?, '', 0, ?, 1, '.', 1, 1, ?)""",
+                   VALUES (?, 'messenger', '', ?, '', 0, ?, 1, '.', 0, 1, ?)""",
                 (acc_name, json.dumps(c_dict, ensure_ascii=False), uid, time.time())
             )
         conn.commit()
@@ -17803,7 +18153,7 @@ def api_discord_reg_login():
         conn = db()
         conn.execute(
             """INSERT INTO accounts (name, platform, imei, cookies, token, is_bot, uid, chat_cmd_enabled, cmd_prefix, allow_all_cmd, enabled, created_at)
-               VALUES (?, 'discord', '', '{}', ?, 0, ?, 1, '.', 1, 1, ?)""",
+               VALUES (?, 'discord', '', '{}', ?, 0, ?, 1, '.', 0, 1, ?)""",
             (uname, token, uid, time.time()),
         )
         conn.commit()
@@ -17861,7 +18211,7 @@ def api_messenger_verify_cookie():
             else:
                 conn.execute(
                     """INSERT INTO accounts (name, platform, imei, cookies, token, is_bot, uid, chat_cmd_enabled, cmd_prefix, allow_all_cmd, enabled, created_at)
-                       VALUES (?, 'messenger', '', ?, '', 0, ?, 1, '.', 1, 1, ?)""",
+                       VALUES (?, 'messenger', '', ?, '', 0, ?, 1, '.', 0, 1, ?)""",
                     (acc_name, json.dumps(m_bot.cookies_dict, ensure_ascii=False), uid, time.time())
                 )
             conn.commit()
@@ -17945,7 +18295,7 @@ def account_add():
     platform = (request.form.get("platform") or "zalo").strip().lower()
     custom_name = (request.form.get("name") or "").strip()
     chat_cmd = 1 if request.form.get("chat_cmd_enabled") else 0
-    allow_all = 1 if request.form.get("allow_all_cmd") else 0
+    allow_all = 0
 
     if platform == "messenger":
         raw_mc = (request.form.get("mess_cookies") or request.form.get("cookies") or "").strip()
@@ -18092,12 +18442,11 @@ def api_toggle_chat_cmd():
 def api_toggle_allow_all():
     data = request.json or {}
     acc_id = int(data.get("acc_id", 0))
-    allow_all = 1 if data.get("allow_all") else 0
     conn = db()
-    conn.execute("UPDATE accounts SET allow_all_cmd=? WHERE id=?", (allow_all, acc_id))
+    conn.execute("UPDATE accounts SET allow_all_cmd=0 WHERE id=?", (acc_id,))
     conn.commit()
     conn.close()
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "allow_all_cmd": 0, "message": "🔒 Chỉ Chủ Acc & người được cấp quyền (.cp) mới được dùng lệnh!"})
 
 @app.route("/api/all_groups")
 def api_all_groups():
@@ -18456,12 +18805,9 @@ def api_account_cmd_permissions_bulk():
     elif mode == "disable_all":
         conn.execute("UPDATE accounts SET chat_cmd_enabled=0")
         msg = "Đã TẮT nhận lệnh trên tất cả các Acc!"
-    elif mode == "allow_all_on":
-        conn.execute("UPDATE accounts SET chat_cmd_enabled=1, allow_all_cmd=1")
-        msg = "Đã BẬT cho phép mọi thành viên trong nhóm sử dụng lệnh trên tất cả các Acc!"
-    elif mode == "allow_all_off":
+    elif mode in ("allow_all_on", "allow_all_off"):
         conn.execute("UPDATE accounts SET allow_all_cmd=0")
-        msg = "Đã khóa chỉ Chủ Acc & người có quyền .cp mới được dùng lệnh!"
+        msg = "🔒 Hệ thống đã khóa bảo mật: Chỉ Chủ Acc & người được cấp quyền (.cp) mới được dùng lệnh!"
     elif mode == "enable_selected":
         acc_ids = [int(x) for x in (data.get("acc_ids") or []) if str(x).isdigit()]
         conn.execute("UPDATE accounts SET chat_cmd_enabled=0")
@@ -18474,9 +18820,7 @@ def api_account_cmd_permissions_bulk():
         if "chat_cmd_enabled" in data:
             en = 1 if data.get("chat_cmd_enabled") else 0
             conn.execute("UPDATE accounts SET chat_cmd_enabled=? WHERE id=?", (en, acc_id))
-        if "allow_all_cmd" in data:
-            al = 1 if data.get("allow_all_cmd") else 0
-            conn.execute("UPDATE accounts SET allow_all_cmd=? WHERE id=?", (al, acc_id))
+        conn.execute("UPDATE accounts SET allow_all_cmd=0 WHERE id=?", (acc_id,))
         msg = f"Đã cập nhật quyền sử dụng lệnh cho Acc #{acc_id}!"
     conn.commit()
     rows = refresh_accounts_ram_cache()
