@@ -844,34 +844,57 @@ def interruptible_wait(stop_ev, wait_seconds, start_global_epoch=None, start_box
 GLOBAL_CMD_DEDUPE_CACHE = {}
 GLOBAL_CMD_DEDUPE_LOCK = threading.RLock()
 
-def claim_command_execution_slot(platform, thread_id, sender_id, raw_msg, msg_id=None):
+def _clean_zalo_id(val):
+    """Làm sạch ID Nhóm / UID Zalo: Chặn tuyệt đối các giá trị '0', '-1', 'null', 'None', 'undefined'."""
+    if val is None:
+        return ""
+    s = str(val).strip()
+    if not s or s.lower() in ("0", "-1", "null", "none", "undefined", "false", "nan", '""', "''"):
+        return ""
+    return s
+
+
+def claim_command_execution_slot(platform, thread_id, sender_id, raw_msg, msg_id=None, cli_msg_id=None):
     """Khóa điều phối lệnh Đa Tài Khoản 0.0001ms Thuần RAM (Zero-Lag Pure RAM Command Lock):
-    - Tuyệt đối KHÔNG gọi SQLite trên luồng nhận lệnh để 2..50 Acc Zalo/Discord phản hồi tức thì không bao giờ bị nghẽn!
-    - Khóa theo msg_id (45s) để 2 Acc trong cùng 1 nhóm không lặp lại cùng 1 tin nhắn, nhưng cho phép gõ lệnh liên hoàn (.m, .cp, .n, .t) nhạy 100%!"""
+    - Chuẩn hóa sender_id của Chủ Acc ('0', '', OWNER_UIDS_CACHE) về '__owner__' để tin nhắn từ WebSocket (uidFrom='0')
+      và HTTP Poller (uidFrom=my_uid) dùng chung 1 khóa duy nhất — chặn tuyệt đối lỗi gõ 1 lần .menu nhảy ra 2 lần!
+    - Khóa đồng thời theo cả msg_id, cli_msg_id (45s) VÀ khóa theo (platform, thread_id, norm_txt) trong 2.4s."""
     now = time.time()
     norm_txt = re.sub(r"\s+", " ", str(raw_msg or "").strip()).lower()[:120]
     plat_s = str(platform or "zalo").lower()
-    tid_s = str(thread_id or "").strip()
-    mid_s = str(msg_id or "").strip()
-    sender_s = str(sender_id or "").strip()
-    cmd_key = f"cmd:{plat_s}:{tid_s}:{sender_s}:{norm_txt}"
+    tid_s = _clean_zalo_id(thread_id) or "default"
+    mid_s = _clean_zalo_id(msg_id)
+    cmid_s = _clean_zalo_id(cli_msg_id)
+    raw_sender = str(sender_id or "").strip()
+    sender_norm = "__owner__" if (raw_sender in ("0", "") or raw_sender in OWNER_UIDS_CACHE) else raw_sender
+    cmd_key = f"cmd:{plat_s}:{tid_s}:{sender_norm}:{norm_txt}"
+    box_cmd_key = f"boxcmd:{plat_s}:{tid_s}:{norm_txt}"
 
     with GLOBAL_CMD_DEDUPE_LOCK:
-        if len(GLOBAL_CMD_DEDUPE_CACHE) > 2500:
+        if len(GLOBAL_CMD_DEDUPE_CACHE) > 3500:
             for k, ts_old in list(GLOBAL_CMD_DEDUPE_CACHE.items()):
-                ttl = 45.0 if k.startswith("mid:") else 0.75
+                ttl = 45.0 if k.startswith(("mid:", "cmid:")) else 2.5
                 if now - ts_old > ttl:
                     GLOBAL_CMD_DEDUPE_CACHE.pop(k, None)
-        if mid_s and mid_s not in ("0", ""):
-            m_key = f"mid:{plat_s}:{tid_s}:{mid_s}"
-            last_m = GLOBAL_CMD_DEDUPE_CACHE.get(m_key, 0.0)
-            if now - last_m < 45.0:
-                return False
-            GLOBAL_CMD_DEDUPE_CACHE[m_key] = now
-        last_ts = GLOBAL_CMD_DEDUPE_CACHE.get(cmd_key, 0.0)
-        if now - last_ts < 0.65:
+        if mid_s:
+            for mk in (f"mid:{plat_s}:{tid_s}:{mid_s}", f"mid:{plat_s}:any:{mid_s}"):
+                if now - GLOBAL_CMD_DEDUPE_CACHE.get(mk, 0.0) < 45.0:
+                    return False
+        if cmid_s:
+            for ck in (f"cmid:{plat_s}:{tid_s}:{cmid_s}", f"cmid:{plat_s}:any:{cmid_s}"):
+                if now - GLOBAL_CMD_DEDUPE_CACHE.get(ck, 0.0) < 45.0:
+                    return False
+        if now - GLOBAL_CMD_DEDUPE_CACHE.get(cmd_key, 0.0) < 2.4:
             return False
+
+        if mid_s:
+            GLOBAL_CMD_DEDUPE_CACHE[f"mid:{plat_s}:{tid_s}:{mid_s}"] = now
+            GLOBAL_CMD_DEDUPE_CACHE[f"mid:{plat_s}:any:{mid_s}"] = now
+        if cmid_s:
+            GLOBAL_CMD_DEDUPE_CACHE[f"cmid:{plat_s}:{tid_s}:{cmid_s}"] = now
+            GLOBAL_CMD_DEDUPE_CACHE[f"cmid:{plat_s}:any:{cmid_s}"] = now
         GLOBAL_CMD_DEDUPE_CACHE[cmd_key] = now
+        GLOBAL_CMD_DEDUPE_CACHE[box_cmd_key] = now
     return True
 
 SYSTEM_RUNTIME_CONFIG = {
@@ -1081,10 +1104,14 @@ def _ensure_authorized_users_loaded():
         except Exception:
             pass
 
-def is_user_authorized_for_cmd(sender_uid, client_uid=None, client_send2me_id=None, allow_all=False, sender_name=""):
-    """Kiểm tra quyền thực thi lệnh (.cp / Owner) trong 0.0001ms thuần RAM (Tuyệt đối không khóa SQLite khi treo đa Acc)!"""
+def is_true_account_owner(sender_uid, client_uid=None, client_send2me_id=None, platform="zalo"):
+    """Kiểm tra chính xác người gửi có phải là CHỦ TÀI KHOẢN (Owner) hay không:
+    - Tuyệt đối không cho phép sender_uid rỗng ('') mạo danh Owner.
+    - Giá trị '0' chỉ hợp lệ trên Zalo khi chính chủ tài khoản tự gõ lệnh từ thiết bị của mình."""
     s_uid = str(sender_uid or "").strip().lstrip("@")
-    if s_uid in ("0", ""):
+    if not s_uid:
+        return False
+    if str(platform or "zalo").lower() == "zalo" and s_uid == "0":
         return True
     if client_uid and s_uid == str(client_uid).strip():
         return True
@@ -1094,6 +1121,18 @@ def is_user_authorized_for_cmd(sender_uid, client_uid=None, client_send2me_id=No
         refresh_owner_uids()
     if s_uid in OWNER_UIDS_CACHE:
         return True
+    return False
+
+
+def is_user_authorized_for_cmd(sender_uid, client_uid=None, client_send2me_id=None, allow_all=False, sender_name="", platform="zalo"):
+    """Kiểm tra nghiêm ngặt quyền thực thi lệnh (.cp / Owner):
+    - CẤM TUYỆT ĐỐI 100% người lạ chưa được cấp quyền (.cp) sử dụng bất kỳ lệnh nào!
+    - Khi bản ghi .cp là UID số (r_uid.isdigit()), bắt buộc khớp chính xác UID 100% (chống giả mạo tên hiển thị!)."""
+    if is_true_account_owner(sender_uid, client_uid=client_uid, client_send2me_id=client_send2me_id, platform=platform):
+        return True
+    s_uid = str(sender_uid or "").strip().lstrip("@")
+    if not s_uid or s_uid in ("0", "-1", "null", "None"):
+        return False
 
     _ensure_authorized_users_loaded()
     s_name = str(sender_name or GLOBAL_USER_NAME_CACHE.get(s_uid) or "").strip().lstrip("@")
@@ -1107,17 +1146,18 @@ def is_user_authorized_for_cmd(sender_uid, client_uid=None, client_send2me_id=No
         for r_uid, info in AUTHORIZED_USERS_RAM_CACHE.items():
             if r_uid.lower() == s_uid_low:
                 return True
-            if s_name_low and (r_uid.lower() == s_name_low or info["name"].lower() == s_name_low):
-                return True
-            if s_name_norm and (info["norm_uid"] == s_name_norm or (info["norm_name"] and info["norm_name"] == s_name_norm)):
-                return True
-
-    # TUYỆT ĐỐI KHÔNG CHO PHÉP NGƯỜI LẠ DÙNG LỆNH — CHỈ OWNER HOẶC NGƯỜI ĐƯỢC CẤP QUYỀN (.cp) MỚI ĐƯỢC DÙNG!
+            # Chỉ cho phép so khớp theo tên khi chủ Acc cấp quyền bằng @Tên chữ (r_uid không phải số)
+            if not r_uid.isdigit() and len(r_uid) >= 2:
+                if s_name_low and (r_uid.lower() == s_name_low or info["name"].lower() == s_name_low):
+                    return True
+                if s_name_norm and (info["norm_uid"] == s_name_norm or (info["norm_name"] and info["norm_name"] == s_name_norm)):
+                    return True
     return False
+
 
 def add_authorized_user(uid, name="", acc_id=0):
     uid_str = str(uid or "").strip().lstrip("@")
-    if not uid_str or uid_str in ("0", "-1"):
+    if not uid_str or uid_str.lower() in ("0", "-1", "null", "none", "undefined"):
         return False
     _ensure_authorized_users_loaded()
     clean_name = str(name or "").strip().lstrip("@") or GLOBAL_USER_NAME_CACHE.get(uid_str) or f"User_{uid_str[-4:]}"
@@ -1130,6 +1170,11 @@ def add_authorized_user(uid, name="", acc_id=0):
             "norm_uid": remove_vn_accents(uid_str),
             "added_at": now_t,
         }
+    try:
+        with _STATUS_CACHE_LOCK:
+            _STATUS_SNAPSHOT_CACHE["ts"] = 0.0
+    except Exception:
+        pass
 
     def _async_save_cp():
         try:
@@ -1146,9 +1191,29 @@ def add_authorized_user(uid, name="", acc_id=0):
     threading.Thread(target=_async_save_cp, daemon=True).start()
     return True
 
+
 def remove_authorized_user(uid):
     uid_str = str(uid or "").strip().lstrip("@")
     _ensure_authorized_users_loaded()
+    if uid_str.lower() in ("__all__", "all", "tatca", "het"):
+        with AUTHORIZED_USERS_LOCK:
+            AUTHORIZED_USERS_RAM_CACHE.clear()
+        try:
+            with _STATUS_CACHE_LOCK:
+                _STATUS_SNAPSHOT_CACHE["ts"] = 0.0
+        except Exception:
+            pass
+        def _async_clear_all():
+            try:
+                conn = db()
+                conn.execute("DELETE FROM authorized_users")
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+        threading.Thread(target=_async_clear_all, daemon=True).start()
+        return True
+
     existed = False
     with AUTHORIZED_USERS_LOCK:
         if uid_str in AUTHORIZED_USERS_RAM_CACHE:
@@ -1159,6 +1224,11 @@ def remove_authorized_user(uid):
                 if k.lower() == uid_str.lower() or AUTHORIZED_USERS_RAM_CACHE[k]["name"].lower() == uid_str.lower():
                     AUTHORIZED_USERS_RAM_CACHE.pop(k, None)
                     existed = True
+    try:
+        with _STATUS_CACHE_LOCK:
+            _STATUS_SNAPSHOT_CACHE["ts"] = 0.0
+    except Exception:
+        pass
 
     def _async_del_cp():
         try:
@@ -3565,10 +3635,14 @@ class Zalo:
         )
         dec = self._dec(r.json().get("data", ""))
         grid = json.loads(dec).get("data", {}).get("gridVerMap", {})
-        all_gids = [str(g) for g in grid.keys()]
+        all_gids = [
+            _clean_zalo_id(g) for g in grid.keys()
+            if _clean_zalo_id(g) and _clean_zalo_id(g) != str(self.uid or "")
+        ]
         for gid in all_gids:
-            KNOWN_GROUPS_BY_ACC[self.uid].add(gid)
-            ALL_KNOWN_ZALO_GROUP_IDS.add(str(gid))
+            if self.uid:
+                KNOWN_GROUPS_BY_ACC[self.uid].add(gid)
+            ALL_KNOWN_ZALO_GROUP_IDS.add(gid)
 
         out = []
         for chunk in [all_gids[i:i + 50] for i in range(0, len(all_gids), 50)]:
@@ -3582,12 +3656,20 @@ class Zalo:
                 dec_info = self._dec(r_info.json().get("data", ""))
                 info_map = json.loads(dec_info).get("data", {}).get("gridInfoMap", {})
                 for gid in chunk:
-                    g_obj = info_map.get(gid) or {}
+                    g_obj = info_map.get(gid)
+                    if not isinstance(g_obj, dict):
+                        continue
+                    tot_m = g_obj.get("totalMember")
+                    if tot_m is not None and int(tot_m or 0) <= 0:
+                        continue
+                    raw_gname = str(g_obj.get("name") or "").strip()
+                    if raw_gname.lower() in ("null", "none", "undefined"):
+                        raw_gname = ""
                     out.append({
                         "id": gid,
-                        "name": g_obj.get("name") or f"Nhóm Zalo {gid[-6:]}",
+                        "name": raw_gname or f"Nhóm Zalo {gid[-6:]}",
                         "type": "group",
-                        "members": g_obj.get("totalMember", "?")
+                        "members": tot_m if tot_m is not None else "?"
                     })
             except Exception:
                 for gid in chunk:
@@ -3603,34 +3685,74 @@ class Zalo:
             params={"zpw_ver": 645, "zpw_type": 30}, timeout=(1.5, 3.2),
         )
         dec = self._dec(r.json().get("data", ""))
-        gmap = json.loads(dec).get("data", {}).get("gridVerMap", {})
-        for gid in gmap:
-            KNOWN_GROUPS_BY_ACC[self.uid].add(str(gid))
-            ALL_KNOWN_ZALO_GROUP_IDS.add(str(gid))
-        return gmap
+        raw_gmap = json.loads(dec).get("data", {}).get("gridVerMap", {}) or {}
+        clean_gmap = {}
+        for gid, ver in raw_gmap.items():
+            cg = _clean_zalo_id(gid)
+            if cg and cg != str(self.uid or ""):
+                clean_gmap[cg] = ver
+                if self.uid:
+                    KNOWN_GROUPS_BY_ACC[self.uid].add(cg)
+                ALL_KNOWN_ZALO_GROUP_IDS.add(cg)
+        return clean_gmap
 
     def get_last_msgs(self):
-        """Lấy toàn bộ tin nhắn mới nhất của mọi Nhóm (groupMsgs) và Chat riêng (msgs) trong 1 request duy nhất
-        trên kênh ưu tiên self.prio_s (0ms, không bị nghẽn khi đang treo nhiều box)!"""
-        try:
-            active_s = getattr(self, "prio_s", None) or self.s
-            enc = self._enc({"threadIdLocalMsgId": json.dumps({}), "imei": self.imei})
-            r = active_s.get(
-                "https://tt-convers-wpa.chat.zalo.me/api/preloadconvers/get-last-msgs",
-                params={"zpw_ver": "645", "zpw_type": "30", "params": enc},
-                timeout=(1.2, 2.5),
-            )
-            rj = r.json() if r.content else {}
-            if rj.get("error_code") == 0 and rj.get("data"):
-                dec = json.loads(self._dec(rj["data"]))
-                d = dec.get("data") if isinstance(dec, dict) and isinstance(dec.get("data"), dict) else dec
-                if isinstance(d, dict):
-                    return {
-                        "msgs": d.get("msgs") or [],
-                        "groupMsgs": d.get("groupMsgs") or [],
-                    }
-        except Exception:
-            pass
+        """Lấy toàn bộ tin nhắn mới nhất của mọi Nhóm (groupMsgs) và Chat riêng (msgs)
+        trên kênh ưu tiên self.prio_s (tự động chuẩn hóa cả dạng List và Dict để không sót bất kỳ nhóm nào)!"""
+        active_s = getattr(self, "prio_s", None) or self.s
+        enc = self._enc({"threadIdLocalMsgId": json.dumps({}), "imei": self.imei})
+        for use_post in (False, True):
+            try:
+                if not use_post:
+                    r = active_s.get(
+                        "https://tt-convers-wpa.chat.zalo.me/api/preloadconvers/get-last-msgs",
+                        params={"zpw_ver": "645", "zpw_type": "30", "params": enc},
+                        timeout=(1.2, 2.5),
+                    )
+                else:
+                    r = active_s.post(
+                        "https://tt-convers-wpa.chat.zalo.me/api/preloadconvers/get-last-msgs",
+                        params={"zpw_ver": "645", "zpw_type": "30"},
+                        data={"params": enc},
+                        timeout=(1.2, 2.5),
+                    )
+                rj = r.json() if r.content else {}
+                if rj.get("error_code") == 0 and rj.get("data"):
+                    dec = json.loads(self._dec(rj["data"]))
+                    d = dec.get("data") if isinstance(dec, dict) and isinstance(dec.get("data"), dict) else dec
+                    if isinstance(d, dict):
+                        raw_u = d.get("msgs") or []
+                        raw_g = d.get("groupMsgs") or []
+                        u_list = []
+                        if isinstance(raw_u, list):
+                            u_list = [x for x in raw_u if isinstance(x, dict)]
+                        elif isinstance(raw_u, dict):
+                            for k_u, v_u in raw_u.items():
+                                if isinstance(v_u, dict):
+                                    u_list.append(v_u)
+                                elif isinstance(v_u, list):
+                                    u_list.extend(x for x in v_u if isinstance(x, dict))
+                        g_list = []
+                        if isinstance(raw_g, list):
+                            g_list = [x for x in raw_g if isinstance(x, dict)]
+                        elif isinstance(raw_g, dict):
+                            for k_g, v_g in raw_g.items():
+                                cg_k = _clean_zalo_id(k_g)
+                                if isinstance(v_g, dict):
+                                    item_g = dict(v_g)
+                                    if cg_k:
+                                        item_g["grid"] = cg_k
+                                    g_list.append(item_g)
+                                elif isinstance(v_g, list):
+                                    for x in v_g:
+                                        if isinstance(x, dict):
+                                            item_g = dict(x)
+                                            if cg_k:
+                                                item_g["grid"] = cg_k
+                                            g_list.append(item_g)
+                        return {"msgs": u_list, "groupMsgs": g_list}
+            except Exception:
+                continue
         return {"msgs": [], "groupMsgs": []}
 
     def friends(self, use_cache=True):
@@ -4423,12 +4545,18 @@ class Zalo:
                  color_offset=0, antiband=True, use_emoji=False, icon_count=0,
                  auto_retry_thread_type=False, strip_line_num=False, parse_auto_tags=True,
                  hide_tag_all=True, hide_tag_name=True, font_style="big_bold", priority_bypass=False):
+        thread_id = _clean_zalo_id(thread_id)
+        if not thread_id or thread_id == "Web_Console":
+            return None
         eff_mentions = list(mentions) if mentions else []
         eff_tag_all = bool(tag_all)
         working_text = raw_text
 
-        if eff_mentions or eff_tag_all:
+        known_gids_now = (KNOWN_GROUPS_BY_ACC.get(self.uid, set()) | ALL_KNOWN_ZALO_GROUP_IDS)
+        if thread_id in known_gids_now or eff_mentions or eff_tag_all:
             is_group = True
+        elif thread_id == str(self.uid or ""):
+            is_group = False
 
         if parse_auto_tags and is_group and "@" in str(raw_text or ""):
             stripped_txt, auto_m, auto_all = extract_trailing_tags_and_resolve(
@@ -4514,8 +4642,15 @@ class Zalo:
             inner_err = getattr(r, "_inner_err_code", 0)
 
             if auto_retry_thread_type and (err_code != 0 or inner_err != 0):
-                r2 = self._send_raw_payload(final_msg, thread_id, not is_group, [], styles, first_color=first_color, priority_bypass=priority_bypass)
-                return r2
+                # QUAN TRỌNG: Nếu đang gửi vào Nhóm (is_group=True) và có đính kèm mention (m_arr) bị lỗi,
+                # chỉ thử gửi lại vào ĐÚNG NHÓM ĐÓ (is_group=True) không kèm mention (m_arr=[])!
+                # Tuyệt đối KHÔNG gửi /api/message/sms (is_group=False) vào ID Nhóm vì Zalo sẽ tạo ra 'Box null'!
+                if is_group and m_arr:
+                    r2 = self._send_raw_payload(final_msg, thread_id, True, [], styles, first_color=first_color, priority_bypass=priority_bypass)
+                    return r2
+                elif not is_group and thread_id in (KNOWN_GROUPS_BY_ACC.get(self.uid, set()) | ALL_KNOWN_ZALO_GROUP_IDS):
+                    r2 = self._send_raw_payload(final_msg, thread_id, True, [], styles, first_color=first_color, priority_bypass=priority_bypass)
+                    return r2
 
             if err_code in AntiDieAllEngine.ZALO_RATELIMIT_CODES or inner_err in AntiDieAllEngine.ZALO_RATELIMIT_CODES:
                 code_hit = err_code or inner_err
@@ -5703,10 +5838,10 @@ class ZaloQRLoginManager:
             clean_c["z_uuid"] = imei
         clean_c.setdefault("_zlang", "vn")
 
-        live_groups_count = 0
+        live_groups_count = int((user_info_dict or {}).get("_groups_count") or 0) if isinstance(user_info_dict, dict) else 0
         try:
             z_client_live = Zalo.get_pooled_client(
-                imei, clean_c, force_new=True,
+                imei, clean_c, force_new=False,
                 user_agent=ua_bound, zpw_enk_hint=zpw_enk, uid_hint=uid
             )
             if ws_list:
@@ -5716,9 +5851,9 @@ class ZaloQRLoginManager:
             if z_client_live.display_name and not z_client_live.display_name.startswith("Zalo_"):
                 d_name = z_client_live.display_name
             clean_c.update(z_client_live.cookies_dict)
-            if zpw_enk and clean_c.get("zpw_sek") and uid:
-                g_check = z_client_live.groups(use_cache=False)
-                live_groups_count = len(g_check) if isinstance(g_check, list) else 0
+            if not live_groups_count and zpw_enk and clean_c.get("zpw_sek") and uid:
+                gmap_now = z_client_live.get_grid_ver_map()
+                live_groups_count = len(gmap_now) if isinstance(gmap_now, dict) else 0
         except Exception:
             pass
 
@@ -5968,8 +6103,10 @@ class ZaloQRLoginManager:
         pc_name = st.get("pc_name", "ASUS ROG Zephyrus G16 (Windows 11 Pro VN)")
         comp_name = st.get("computer_name") or "Web"
 
-        continue_url = "https://zalo.me/pc"
-        login_referer = "https://id.zalo.me/account?continue=https%3A%2F%2Fzalo.me%2Fpc"
+        pc_continue_url = "https://zalo.me/pc"
+        pc_referer = "https://id.zalo.me/account?continue=https%3A%2F%2Fzalo.me%2Fpc"
+        continue_url = "https://chat.zalo.me/"
+        login_referer = "https://id.zalo.me/account?continue=https%3A%2F%2Fchat.zalo.me%2F"
         v_str = "2.3.10"
         qr_b64_raw = ""
         qr_code_id = ""
@@ -6034,8 +6171,8 @@ class ZaloQRLoginManager:
                 try:
                     r_li = s.post(
                         "https://id.zalo.me/account/logininfo",
-                        data={"continue": continue_url, "v": v_str},
-                        headers=_make_ajax_headers(login_referer),
+                        data={"continue": pc_continue_url, "v": v_str},
+                        headers=_make_ajax_headers(pc_referer),
                         timeout=8,
                     )
                     cls._harvest_cookies(r_li, s, cookie_jar_dict)
@@ -6045,8 +6182,8 @@ class ZaloQRLoginManager:
                 try:
                     r_vc = s.post(
                         "https://id.zalo.me/account/verify-client",
-                        data={"type": "device", "continue": continue_url, "v": v_str},
-                        headers=_make_ajax_headers(login_referer),
+                        data={"type": "device", "continue": pc_continue_url, "v": v_str},
+                        headers=_make_ajax_headers(pc_referer),
                         timeout=8,
                     )
                     cls._harvest_cookies(r_vc, s, cookie_jar_dict)
@@ -6056,8 +6193,8 @@ class ZaloQRLoginManager:
                 try:
                     r_qr = s.post(
                         "https://id.zalo.me/account/authen/qr/generate",
-                        data={"continue": continue_url, "v": v_str},
-                        headers=_make_ajax_headers(login_referer),
+                        data={"continue": pc_continue_url, "v": v_str},
+                        headers=_make_ajax_headers(pc_referer),
                         timeout=10,
                     )
                     cls._harvest_cookies(r_qr, s, cookie_jar_dict)
@@ -10288,14 +10425,16 @@ def parse_and_execute_inchat_command(
     }
     cmd_token = stealth_alias_map.get(cmd_token, cmd_token)
 
-    is_authorized_sender = is_user_authorized_for_cmd(
-        s_uid, my_uid, my_s2m, allow_all=False, sender_name=sender_name
+    is_true_owner = is_true_account_owner(
+        s_uid, client_uid=my_uid, client_send2me_id=my_s2m, platform=platform
     )
-    is_owner = (s_uid in ("0", "", my_uid, my_s2m)) or (s_uid in OWNER_UIDS_CACHE) or is_authorized_sender
+    is_authorized_sender = is_user_authorized_for_cmd(
+        s_uid, my_uid, my_s2m, allow_all=False, sender_name=sender_name, platform=platform
+    )
+    is_owner = is_true_owner or is_authorized_sender
 
-    # ĐÃ XOÁ BỎ HOÀN TOÀN CHỨC NĂNG CHO TOÀN BỘ NGƯỜI KHÁC DÙNG LỆNH (allow_all_cmd):
-    # Trên MỌI nền tảng (Zalo, Discord, Messenger): BẮT BUỘC 100% chỉ Chủ Acc (Owner UID)
-    # và những người đã được cấp quyền (.cp / .chophep) mới được phép sử dụng bất kỳ lệnh nào!
+    # BẮT BUỘC 100%: Chỉ Chủ Acc (is_true_owner) và người được Chủ Acc cấp quyền (.cp) mới được phép dùng lệnh!
+    # Cấm tuyệt đối 100% mọi người lạ khác trong nhóm sử dụng lệnh!
     if not is_owner:
         return False
 
@@ -10915,8 +11054,9 @@ def parse_and_execute_inchat_command(
         return True
 
     if cmd_token in ("chophep", "capquyen", "adduser", "add", "admin"):
-        if not is_owner:
-            return False
+        if not is_true_owner:
+            _send_reply("🔒 Chỉ Chủ Tài Khoản chính chủ mới có quyền cấp quyền (.cp) cho người khác!", broadcast_all_accs=False)
+            return True
         _, target_mentions, _ = extract_trailing_tags_and_resolve(
             arg_body, incoming_mentions=raw_mentions,
             zalo_client=zalo_client if platform == "zalo" else None,
@@ -10964,14 +11104,12 @@ def parse_and_execute_inchat_command(
         return True
 
     if cmd_token in ("xoaquyen", "thuhoi", "deluser", "del", "cam"):
-        if not is_owner:
-            return False
+        if not is_true_owner:
+            _send_reply("🔒 Chỉ Chủ Tài Khoản chính chủ mới có quyền thu hồi quyền (.xq)!", broadcast_all_accs=False)
+            return True
         if arg_body.strip().lower() in ("all", "tatca", "het"):
-            conn = db()
-            conn.execute("DELETE FROM authorized_users")
-            conn.commit()
-            conn.close()
-            reply_txt = "Đã thu hồi quyền của tất cả người dùng phụ"
+            remove_authorized_user("__all__")
+            reply_txt = "✅ Đã thu hồi sạch 100% quyền (.cp) của tất cả người dùng phụ (Chỉ Chủ Acc được dùng lệnh)!"
         else:
             _, target_mentions, _ = extract_trailing_tags_and_resolve(
                 arg_body, incoming_mentions=raw_mentions,
@@ -11702,21 +11840,30 @@ class ZaloRealtimeListener:
     def _extract_msg_dicts(self, obj, parent_is_group=False, parent_grid=None):
         found = []
         if isinstance(obj, dict):
-            cur_grid = str(obj.get("grid") or obj.get("groupId") or obj.get("group_id") or parent_grid or "").strip()
-            is_grp_branch = parent_is_group or bool(cur_grid and cur_grid != "0") or ("groupMsgs" in obj) or ("grid" in obj)
+            cur_grid = (
+                _clean_zalo_id(obj.get("grid"))
+                or _clean_zalo_id(obj.get("groupId"))
+                or _clean_zalo_id(obj.get("group_id"))
+                or _clean_zalo_id(parent_grid)
+            )
+            is_grp_branch = parent_is_group or bool(cur_grid)
             has_content = ("content" in obj) or ("msg" in obj) or ("message" in obj) or ("text" in obj) or ("title" in obj)
             if has_content and any(k in obj for k in ("uidFrom", "idTo", "msgId", "cliMsgId", "toid", "fromUid", "grid")):
                 item = dict(obj)
                 if is_grp_branch:
                     item["_is_group_hint"] = True
-                if cur_grid and cur_grid != "0":
+                if cur_grid:
                     item["grid"] = cur_grid
                     item["_grid_hint"] = cur_grid
                 found.append(item)
+                # Không đệ quy vào bên trong quote/content của tin nhắn đã khớp để tránh bóc nhầm tin nhắn trích dẫn (quote) gây lỗi box null!
+                return found
             for k, v in obj.items():
+                if k in ("quote", "propertyExt", "params"):
+                    continue
                 sub_grp = is_grp_branch or (k in ("groupMsgs", "group_msgs", "grid"))
                 sub_grid = cur_grid
-                if not sub_grid and str(k).isdigit() and len(str(k)) >= 8 and is_grp_branch:
+                if not sub_grid and str(k).isdigit() and len(str(k)) >= 8 and sub_grp:
                     sub_grid = str(k)
                 if isinstance(v, (dict, list)):
                     found.extend(self._extract_msg_dicts(v, parent_is_group=sub_grp, parent_grid=sub_grid))
@@ -11754,21 +11901,57 @@ class ZaloRealtimeListener:
 
     @staticmethod
     def _make_msg_dedupe_key(msg_obj, content=""):
-        mid = str(msg_obj.get("msgId") or msg_obj.get("globalMsgId") or msg_obj.get("id") or "").strip()
-        cmid = str(msg_obj.get("cliMsgId") or "").strip()
-        ts_v = str(msg_obj.get("ts") or msg_obj.get("time") or "").strip()
-        if mid or cmid:
-            return f"id:{mid}:{cmid}"
-        if ts_v and ts_v != "0":
+        mid = _clean_zalo_id(msg_obj.get("msgId") or msg_obj.get("globalMsgId") or msg_obj.get("id"))
+        cmid = _clean_zalo_id(msg_obj.get("cliMsgId"))
+        ts_v = _clean_zalo_id(msg_obj.get("ts") or msg_obj.get("time"))
+        if mid:
+            return f"mid:{mid}"
+        if cmid:
+            return f"cmid:{cmid}"
+        if ts_v:
             return f"ts:{ts_v}:{content[:30]}"
         return f"win:{int(time.time())}:{content[:30]}"
+
+    def _check_and_mark_seen(self, msg_obj, content="", mark=True):
+        """Kiểm tra & đánh dấu chống trùng lặp nguyên tử theo cả msgId VÀ cliMsgId:
+        - Ngăn chặn 100% trường hợp WebSocket có cả (msgId, cliMsgId) còn preloadconvers/get-last-msgs chỉ có (msgId)
+          làm lệnh .menu bị nhảy ra 2 lần!"""
+        lock = getattr(self, "_dedupe_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._dedupe_lock = lock
+        mid = _clean_zalo_id(msg_obj.get("msgId") or msg_obj.get("globalMsgId") or msg_obj.get("id"))
+        cmid = _clean_zalo_id(msg_obj.get("cliMsgId"))
+        ts_v = _clean_zalo_id(msg_obj.get("ts") or msg_obj.get("time"))
+        keys = []
+        if mid:
+            keys.append(f"mid:{mid}")
+        if cmid:
+            keys.append(f"cmid:{cmid}")
+        if not keys:
+            if ts_v:
+                keys.append(f"ts:{ts_v}:{content[:30]}")
+            else:
+                keys.append(f"win:{int(time.time())}:{content[:30]}")
+        with lock:
+            for k in keys:
+                if k in self.seen_msg_ids:
+                    if mark:
+                        for k2 in keys:
+                            if k2 not in self.seen_msg_ids:
+                                self.seen_msg_ids.append(k2)
+                    return True
+            if mark:
+                for k in keys:
+                    self.seen_msg_ids.append(k)
+            return False
 
     def _process_msg_item(self, client, acc_row, msg_obj, default_is_group=False, fallback_thread_id=None):
         if not isinstance(msg_obj, dict):
             return
 
-        msg_id = str(msg_obj.get("msgId") or msg_obj.get("globalMsgId") or msg_obj.get("id") or "")
-        cli_msg_id = str(msg_obj.get("cliMsgId") or "")
+        msg_id = _clean_zalo_id(msg_obj.get("msgId") or msg_obj.get("globalMsgId") or msg_obj.get("id"))
+        cli_msg_id = _clean_zalo_id(msg_obj.get("cliMsgId"))
         raw_content = msg_obj.get("content")
         if isinstance(raw_content, dict):
             raw_content = (
@@ -11802,69 +11985,99 @@ class ZaloRealtimeListener:
         if not content:
             return
 
-        dedupe_key = self._make_msg_dedupe_key(msg_obj, content)
-        if dedupe_key in self.seen_msg_ids:
-            return
-        self.seen_msg_ids.append(dedupe_key)
+        # Kiểm tra độ tươi của tin nhắn (chỉ xử lý tin nhắn mới trong vòng 60s để không bao giờ chạy lại lệnh cũ trong lịch sử nhóm)
+        try:
+            msg_ts = int(msg_obj.get("ts") or msg_obj.get("time") or 0)
+            if 0 < msg_ts < 10000000000:
+                msg_ts *= 1000
+            if msg_ts > 0 and abs(int(time.time() * 1000) - msg_ts) > 60000:
+                self._check_and_mark_seen(msg_obj, content, mark=True)
+                return
+        except Exception:
+            pass
 
-        grid_id = str(msg_obj.get("grid") or msg_obj.get("groupId") or msg_obj.get("_grid_hint") or fallback_thread_id or "").strip()
-        uid_from = str(msg_obj.get("uidFrom") or msg_obj.get("fromUid") or "").strip()
+        if self._check_and_mark_seen(msg_obj, content, mark=True):
+            return
+
+        my_uid = _clean_zalo_id(client.uid or acc_row.get("uid"))
+        my_s2m = _clean_zalo_id(getattr(client, "send2me_id", ""))
+        fb_tid = _clean_zalo_id(fallback_thread_id)
+        grid_id = (
+            _clean_zalo_id(msg_obj.get("grid"))
+            or _clean_zalo_id(msg_obj.get("groupId"))
+            or _clean_zalo_id(msg_obj.get("_grid_hint"))
+            or fb_tid
+        )
+        raw_uid_from = str(msg_obj.get("uidFrom") or msg_obj.get("fromUid") or "").strip()
+        uid_from = _clean_zalo_id(raw_uid_from)
         d_name = str(msg_obj.get("dName") or "").strip()
-        if uid_from and d_name and uid_from != "0":
+        if uid_from and d_name and d_name.lower() not in ("null", "none"):
             GLOBAL_USER_NAME_CACHE[uid_from] = d_name
 
-        id_to = str(msg_obj.get("idTo") or msg_obj.get("toid") or "").strip()
+        id_to = _clean_zalo_id(msg_obj.get("idTo") or msg_obj.get("toid"))
         cmd_num = int(msg_obj.get("cmd") or 0)
         raw_mentions = self._extract_raw_mentions_from_msg_obj(msg_obj)
 
-        known_gids = KNOWN_GROUPS_BY_ACC.get(client.uid, set()) | ALL_KNOWN_ZALO_GROUP_IDS
+        known_gids = (KNOWN_GROUPS_BY_ACC.get(client.uid, set()) | ALL_KNOWN_ZALO_GROUP_IDS) - {"0", "", my_uid, my_s2m, "null", "None"}
         is_group = bool(
             default_is_group
-            or (grid_id and grid_id != "0")
+            or bool(grid_id and grid_id not in (my_uid, my_s2m))
             or msg_obj.get("_is_group_hint")
             or msg_obj.get("isGroup")
             or (cmd_num in (521, 522))
-            or (id_to in known_gids)
-            or (uid_from in known_gids)
+            or (id_to and id_to in known_gids)
+            or (uid_from and uid_from in known_gids)
             or bool(raw_mentions)
         )
 
-        my_uid = str(client.uid or acc_row.get("uid") or "").strip()
+        thread_id = ""
         if is_group:
-            if grid_id and grid_id != "0":
+            if fb_tid and fb_tid not in (my_uid, my_s2m):
+                thread_id = fb_tid
+            elif grid_id and grid_id not in (my_uid, my_s2m):
                 thread_id = grid_id
-            elif id_to in known_gids:
+            elif id_to and id_to in known_gids:
                 thread_id = id_to
-            elif uid_from in known_gids:
+            elif uid_from and uid_from in known_gids:
                 thread_id = uid_from
+            elif id_to and id_to not in (my_uid, my_s2m):
+                thread_id = id_to
             else:
-                thread_id = id_to if (id_to and id_to not in ("0", my_uid)) else (fallback_thread_id or uid_from)
-            ALL_KNOWN_ZALO_GROUP_IDS.add(thread_id)
-            if client.uid:
-                KNOWN_GROUPS_BY_ACC[client.uid].add(thread_id)
+                # Tuyệt đối KHÔNG lấy uid_from (ID cá nhân người gửi) làm ID Nhóm vì sẽ khiến Zalo tạo ra 'Box null'!
+                return
+            if thread_id and thread_id not in (my_uid, my_s2m):
+                ALL_KNOWN_ZALO_GROUP_IDS.add(thread_id)
+                if client.uid:
+                    KNOWN_GROUPS_BY_ACC[client.uid].add(thread_id)
         else:
-            if uid_from in ("0", my_uid, ""):
-                thread_id = id_to if id_to not in ("0", "") else my_uid
+            if raw_uid_from in ("0", "", my_uid, my_s2m):
+                if id_to and id_to not in (my_uid, my_s2m):
+                    thread_id = id_to
+                    if thread_id in known_gids:
+                        is_group = True
+                else:
+                    return
             else:
                 thread_id = uid_from
 
-        if not thread_id or thread_id == "0":
+        if not thread_id or thread_id in ("0", "null", "None", "undefined"):
             return
 
         reply_target = None
         quote_obj = msg_obj.get("quote")
         if isinstance(quote_obj, dict):
-            q_uid = str(quote_obj.get("ownerId") or quote_obj.get("uidFrom") or "").strip()
+            q_uid = _clean_zalo_id(quote_obj.get("ownerId") or quote_obj.get("uidFrom"))
             q_name = str(quote_obj.get("fromD") or quote_obj.get("dName") or "").strip()
-            if q_uid and q_uid != "0":
+            if q_uid:
                 reply_target = {"uid": q_uid, "name": q_name or GLOBAL_USER_NAME_CACHE.get(q_uid, f"User_{q_uid[-4:]}")}
 
+        sender_for_auth = "0" if raw_uid_from in ("0", "") else (uid_from or my_uid)
         was_cmd = parse_and_execute_inchat_command(
             zalo_client=client,
             acc_row=acc_row,
             thread_id=thread_id,
             is_group=is_group,
-            sender_id=uid_from,
+            sender_id=sender_for_auth,
             raw_msg=content,
             raw_mentions=raw_mentions,
             platform="zalo",
@@ -11874,7 +12087,7 @@ class ZaloRealtimeListener:
         )
         if not was_cmd and str(thread_id) in AUTO_INTERCEPT_BOXES:
             ic_cfg = AUTO_INTERCEPT_BOXES.get(str(thread_id))
-            if ic_cfg and ic_cfg.get("enabled") and uid_from and uid_from not in ("0", my_uid) and uid_from not in OWNER_UIDS_CACHE:
+            if ic_cfg and ic_cfg.get("enabled") and uid_from and uid_from not in ("0", my_uid, my_s2m) and uid_from not in OWNER_UIDS_CACHE:
                 b_list = ic_cfg.get("blocks") or ["Phản đòn siêu tốc 0s!"]
                 idx_c = ic_cfg.get("idx", 0)
                 ic_cfg["idx"] = idx_c + 1
@@ -11882,7 +12095,7 @@ class ZaloRealtimeListener:
                 target_m = [{"uid": uid_from, "id": uid_from, "name": d_name or GLOBAL_USER_NAME_CACHE.get(uid_from) or f"User_{uid_from[-4:]}"}]
                 threading.Thread(
                     target=lambda: client.send_adv(
-                        reply_line, thread_id, color_mode="rainbow", is_group=True,
+                        reply_line, thread_id, color_mode="rainbow", is_group=is_group,
                         mentions=target_m, tag_all=False, is_heading=True, antiband=True,
                         use_emoji=False, icon_count=0, hide_tag_name=False
                     ),
@@ -11900,8 +12113,6 @@ class ZaloRealtimeListener:
                 hdr = cls._recv_exact(sock, 2)
                 if not hdr:
                     return None, None
-                # Ngay khi đã đọc 2 byte đầu của Frame, tăng timeout lên 18s để đọc trọn vẹn các gói lớn (như Discord READY)
-                # mà không bao giờ bị ngắt giữa chừng gây hỏng luồng WebSocket!
                 sock.settimeout(18.0)
                 fin = (hdr[0] & 0x80) != 0
                 opcode = hdr[0] & 0x0F
@@ -11957,15 +12168,16 @@ class ZaloRealtimeListener:
     def _poll_single_group(self, client, acc_now, gid):
         if self.stop_ev.is_set():
             return
+        gid_clean = _clean_zalo_id(gid)
+        if not gid_clean or gid_clean == str(client.uid or ""):
+            return
         try:
-            msgs = client.get_recent_group_messages(gid)
-            if gid not in self.seeded_groups:
-                self.seeded_groups.add(gid)
-                if not msgs:
-                    return
-                # Ghi nhận các tin nhắn cũ vào seen_msg_ids, NHƯNG nếu tin nhắn cuối cùng vừa mới được gõ
-                # trong vòng 60 giây gần đây và là lệnh (.menu, .help, .nhay, .stop...) thì thực thi ngay!
-                now_ms = int(time.time() * 1000)
+            msgs = client.get_recent_group_messages(gid_clean)
+            if not msgs:
+                return
+            now_ms = int(time.time() * 1000)
+            if gid_clean not in self.seeded_groups:
+                self.seeded_groups.add(gid_clean)
                 for idx_m, m in enumerate(msgs):
                     if not isinstance(m, dict):
                         continue
@@ -11975,37 +12187,53 @@ class ZaloRealtimeListener:
                     ct = strip_invisible_chars(str(rc))
                     is_last_msg = (idx_m == len(msgs) - 1)
                     msg_ts = int(m.get("ts") or 0)
-                    if msg_ts > 0 and msg_ts < 10000000000:
+                    if 0 < msg_ts < 10000000000:
                         msg_ts *= 1000
                     is_fresh_cmd = is_last_msg and is_direct_user_command_text(ct) and (
-                        msg_ts == 0 or abs(now_ms - msg_ts) <= 60000
+                        0 < msg_ts and abs(now_ms - msg_ts) <= 25000
                     )
                     if is_fresh_cmd:
-                        m["grid"] = str(gid)
-                        self._process_msg_item(client, acc_now, m, default_is_group=True, fallback_thread_id=str(gid))
+                        m_copy = dict(m)
+                        m_copy["grid"] = gid_clean
+                        self._process_msg_item(client, acc_now, m_copy, default_is_group=True, fallback_thread_id=gid_clean)
                     else:
-                        self.seen_msg_ids.append(self._make_msg_dedupe_key(m, ct))
+                        self._check_and_mark_seen(m, ct, mark=True)
             else:
-                for m in msgs:
-                    if isinstance(m, dict):
-                        m["grid"] = str(gid)
-                        self._process_msg_item(client, acc_now, m, default_is_group=True, fallback_thread_id=str(gid))
+                # Chỉ kiểm tra 6 tin nhắn mới nhất của nhóm để phản hồi tức thì mà không tốn CPU
+                for m in msgs[-6:]:
+                    if not isinstance(m, dict):
+                        continue
+                    rc = m.get("content") or m.get("message") or m.get("msg") or ""
+                    if isinstance(rc, dict):
+                        rc = rc.get("title") or rc.get("text") or rc.get("msg") or ""
+                    ct = strip_invisible_chars(str(rc))
+                    if not ct or self._check_and_mark_seen(m, ct, mark=False):
+                        continue
+                    m_copy = dict(m)
+                    m_copy["grid"] = gid_clean
+                    self._process_msg_item(client, acc_now, m_copy, default_is_group=True, fallback_thread_id=gid_clean)
         except Exception:
             pass
 
     def _poll_active_groups_inline(self, client, acc_now):
-        """Bộ đồng bộ Siêu Nhạy NHK cho Đa Tài Khoản Zalo (< 0.12s Phản Hồi, Không Nghẽn Khi Chạy 2..50 Acc):
-        1. Cô lập 100% danh sách nhóm theo từng tài khoản (KNOWN_GROUPS_BY_ACC[client.uid]), tuyệt đối không quét chéo nhóm của Acc khác!
-        2. Gọi get_last_msgs() (preloadconvers/get-last-msgs) bắt tức thì mọi lệnh .menu, .cp, .n, .g, .t ở cả Chat Riêng và Mọi Nhóm.
-        3. Khởi tạo nhanh bảng phiên bản nhóm (last_grid_vers) từ get_grid_ver_map() trong 1 request duy nhất và chỉ gọi get_recent_group_messages
-           cho đúng những nhóm vừa nhảy phiên bản mới (changed_gids)!"""
+        """Bộ đồng bộ Đa Tầng Siêu Nhạy cho MỌI Box Zalo:
+        1. Quét nhanh preloadconvers/get-last-msgs để bắt lệnh tức thì.
+        2. Định kỳ cập nhật danh sách nhóm thực tế từ get_grid_ver_map() (getlg/v4).
+        3. Xoay vòng quét trực tiếp get_recent_group_messages(gid) trên TẤT CẢ các nhóm của tài khoản (10 nhóm/nhịp song song)
+           để dù gõ lệnh ở bất kỳ Box nào ('box kia') cũng đều ăn lệnh 100% trong < 0.35s và gửi đúng vào Box đó!"""
+        now_t = time.time()
+        now_ms = int(now_t * 1000)
+        my_uid = _clean_zalo_id(client.uid or acc_now.get("uid"))
+
         try:
             last_conv = client.get_last_msgs()
             u_msgs = last_conv.get("msgs") or []
             g_msgs = last_conv.get("groupMsgs") or []
+            preload_tries = getattr(self, "_preload_seed_tries", 0)
             if "__preload_seeded__" not in self.seeded_groups:
-                self.seeded_groups.add("__preload_seeded__")
-                now_ms = int(time.time() * 1000)
+                if u_msgs or g_msgs or preload_tries >= 2:
+                    self.seeded_groups.add("__preload_seeded__")
+                self._preload_seed_tries = preload_tries + 1
                 for m in u_msgs:
                     if isinstance(m, dict):
                         rc = m.get("content") or m.get("message") or m.get("msg") or ""
@@ -12015,10 +12243,10 @@ class ZaloRealtimeListener:
                         msg_ts = int(m.get("ts") or 0)
                         if 0 < msg_ts < 10000000000:
                             msg_ts *= 1000
-                        if is_direct_user_command_text(ct) and (msg_ts == 0 or abs(now_ms - msg_ts) <= 60000):
-                            _PRIORITY_CMD_EXECUTOR.submit(self._process_msg_item, client, acc_now, m, False, None)
+                        if is_direct_user_command_text(ct) and (0 < msg_ts and abs(now_ms - msg_ts) <= 25000):
+                            _PRIORITY_CMD_EXECUTOR.submit(self._process_msg_item, client, acc_now, dict(m), False, None)
                         else:
-                            self.seen_msg_ids.append(self._make_msg_dedupe_key(m, ct))
+                            self._check_and_mark_seen(m, ct, mark=True)
                 for m in g_msgs:
                     if isinstance(m, dict):
                         rc = m.get("content") or m.get("message") or m.get("msg") or ""
@@ -12028,14 +12256,21 @@ class ZaloRealtimeListener:
                         msg_ts = int(m.get("ts") or 0)
                         if 0 < msg_ts < 10000000000:
                             msg_ts *= 1000
-                        gid_m = str(m.get("idTo") or m.get("grid") or "").strip()
-                        if gid_m:
+                        gid_m = (
+                            _clean_zalo_id(m.get("grid"))
+                            or _clean_zalo_id(m.get("groupId"))
+                            or _clean_zalo_id(m.get("idTo"))
+                            or _clean_zalo_id(m.get("toid"))
+                        )
+                        if gid_m and gid_m != my_uid:
                             KNOWN_GROUPS_BY_ACC[client.uid].add(gid_m)
-                        if is_direct_user_command_text(ct) and (msg_ts == 0 or abs(now_ms - msg_ts) <= 60000):
-                            m["grid"] = gid_m
-                            _PRIORITY_CMD_EXECUTOR.submit(self._process_msg_item, client, acc_now, m, True, gid_m)
+                            ALL_KNOWN_ZALO_GROUP_IDS.add(gid_m)
+                        if gid_m and gid_m != my_uid and is_direct_user_command_text(ct) and (0 < msg_ts and abs(now_ms - msg_ts) <= 25000):
+                            m_copy = dict(m)
+                            m_copy["grid"] = gid_m
+                            _PRIORITY_CMD_EXECUTOR.submit(self._process_msg_item, client, acc_now, m_copy, True, gid_m)
                         else:
-                            self.seen_msg_ids.append(self._make_msg_dedupe_key(m, ct))
+                            self._check_and_mark_seen(m, ct, mark=True)
             else:
                 for m in u_msgs:
                     if isinstance(m, dict):
@@ -12043,28 +12278,36 @@ class ZaloRealtimeListener:
                         if isinstance(rc_u, dict):
                             rc_u = rc_u.get("title") or rc_u.get("text") or rc_u.get("msg") or ""
                         ct_u = strip_invisible_chars(str(rc_u))
-                        if not ct_u or self._make_msg_dedupe_key(m, ct_u) in self.seen_msg_ids:
+                        if not ct_u or self._check_and_mark_seen(m, ct_u, mark=False):
                             continue
-                        _PRIORITY_CMD_EXECUTOR.submit(self._process_msg_item, client, acc_now, m, False, None)
+                        _PRIORITY_CMD_EXECUTOR.submit(self._process_msg_item, client, acc_now, dict(m), False, None)
                 for m in g_msgs:
                     if isinstance(m, dict):
-                        gid_m = str(m.get("idTo") or m.get("grid") or "").strip()
-                        if gid_m:
-                            KNOWN_GROUPS_BY_ACC[client.uid].add(gid_m)
+                        gid_m = (
+                            _clean_zalo_id(m.get("grid"))
+                            or _clean_zalo_id(m.get("groupId"))
+                            or _clean_zalo_id(m.get("idTo"))
+                            or _clean_zalo_id(m.get("toid"))
+                        )
+                        if not gid_m or gid_m == my_uid:
+                            continue
+                        KNOWN_GROUPS_BY_ACC[client.uid].add(gid_m)
+                        ALL_KNOWN_ZALO_GROUP_IDS.add(gid_m)
                         rc_g = m.get("content") or m.get("message") or m.get("msg") or ""
                         if isinstance(rc_g, dict):
                             rc_g = rc_g.get("title") or rc_g.get("text") or rc_g.get("msg") or ""
                         ct_g = strip_invisible_chars(str(rc_g))
-                        if not ct_g or self._make_msg_dedupe_key(m, ct_g) in self.seen_msg_ids:
+                        if not ct_g or self._check_and_mark_seen(m, ct_g, mark=False):
                             continue
-                        m["grid"] = gid_m
-                        def _fast_group_dispatch(msg_item=m, grp_id=gid_m, raw_c=ct_g):
+                        m_copy = dict(m)
+                        m_copy["grid"] = gid_m
+                        def _fast_group_dispatch(msg_item=m_copy, grp_id=gid_m, raw_c=ct_g):
                             if "@" in raw_c and grp_id and is_direct_user_command_text(raw_c) and not msg_item.get("mentions") and not msg_item.get("mentionInfo"):
                                 try:
                                     full_g = client.get_recent_group_messages(grp_id)
                                     m_match = next((x for x in reversed(full_g) if str(x.get("msgId")) == str(msg_item.get("msgId"))), None)
                                     if m_match:
-                                        msg_item = m_match
+                                        msg_item = dict(m_match)
                                         msg_item["grid"] = grp_id
                                 except Exception:
                                     pass
@@ -12073,33 +12316,43 @@ class ZaloRealtimeListener:
         except Exception:
             pass
 
-        changed_gids = []
-        now_t = time.time()
-        if now_t - getattr(self, "_last_gmap_check_ts", 0.0) >= 0.32:
+        # Cập nhật danh sách ID nhóm của tài khoản mỗi 8 giây (hoặc ngay lần đầu tiên)
+        acc_gids = KNOWN_GROUPS_BY_ACC.get(client.uid, set())
+        if not acc_gids or (now_t - getattr(self, "_last_gmap_check_ts", 0.0) >= 8.0):
             self._last_gmap_check_ts = now_t
             try:
                 gmap = client.get_grid_ver_map() or {}
-                is_first_gmap = ("__gmap_seeded__" not in self.seeded_groups)
-                if is_first_gmap:
-                    self.seeded_groups.add("__gmap_seeded__")
-                for gid_k, ver_v in gmap.items():
-                    gid_s = str(gid_k)
-                    KNOWN_GROUPS_BY_ACC[client.uid].add(gid_s)
-                    prev_v = self.last_grid_vers.get(gid_s)
-                    if is_first_gmap:
-                        self.last_grid_vers[gid_s] = ver_v
-                        self.seeded_groups.add(gid_s)
-                    else:
-                        if prev_v is not None and str(prev_v) != str(ver_v):
-                            changed_gids.append(gid_s)
-                            HOT_ACTIVE_ZALO_GROUPS.add(gid_s)
-                        self.last_grid_vers[gid_s] = ver_v
+                for gid_k in gmap.keys():
+                    gid_s = _clean_zalo_id(gid_k)
+                    if gid_s and gid_s != my_uid:
+                        KNOWN_GROUPS_BY_ACC[client.uid].add(gid_s)
+                        ALL_KNOWN_ZALO_GROUP_IDS.add(gid_s)
             except Exception:
                 pass
 
-        if changed_gids:
-            for gid in changed_gids[:6]:
-                _PRIORITY_CMD_EXECUTOR.submit(self._poll_single_group, client, acc_now, gid)
+        # Xoay vòng quét trực tiếp get_recent_group_messages(gid) cho TẤT CẢ các nhóm của tài khoản (mỗi 0.24s quét 8 nhóm song song)
+        # đảm bảo gõ lệnh ở bất kỳ Box nào cũng ăn lệnh ngay lập tức!
+        if now_t - getattr(self, "_last_rot_group_poll_ts", 0.0) >= 0.24:
+            self._last_rot_group_poll_ts = now_t
+            all_my_gids = sorted(
+                g for g in KNOWN_GROUPS_BY_ACC.get(client.uid, set())
+                if _clean_zalo_id(g) and g != my_uid
+            )
+            if all_my_gids:
+                batch_gids = []
+                for h_gid in list(HOT_ACTIVE_ZALO_GROUPS):
+                    if h_gid in all_my_gids and len(batch_gids) < 3:
+                        batch_gids.append(h_gid)
+                batch_size = min(8, len(all_my_gids))
+                for _ in range(len(all_my_gids)):
+                    if len(batch_gids) >= batch_size:
+                        break
+                    cand_g = all_my_gids[self.poll_cursor % len(all_my_gids)]
+                    self.poll_cursor += 1
+                    if cand_g not in batch_gids:
+                        batch_gids.append(cand_g)
+                for gid_target in batch_gids:
+                    _SHARED_ZALO_POLLER_POOL.submit(self._poll_single_group, client, acc_now, gid_target)
 
     def _run_http_poller_loop(self):
         while not self.stop_ev.is_set():
@@ -12142,7 +12395,7 @@ class ZaloRealtimeListener:
             except Exception as e:
                 if "Phiên đăng nhập" in str(e) or "zpw_enk" in str(e):
                     self.ws_status = "Cần cập nhật lại Cookie Zalo"
-            self.stop_ev.wait(0.08)
+            self.stop_ev.wait(0.12)
 
     def _run_ws_session(self, client, acc_row, ws_url):
         parsed = urlparse(ws_url)
@@ -12273,18 +12526,51 @@ class ZaloRealtimeListener:
             except Exception:
                 pass
 
+    def _handle_shared_ws_frame(self, client, acc_now, opcode, data):
+        """Nhận trực tiếp gói tin từ kết nối WebSocket duy nhất của ZaloPCSessionKeeper (Không bao giờ mở WebSocket thứ 2 gây xung đột cmd_id=3000!)."""
+        try:
+            if opcode in (0x1, 0x2) and data and len(data) >= 4:
+                cmd_id = 0
+                json_part = data
+                if data[0] != ord("{"):
+                    cmd_id = struct.unpack("<H", data[1:3])[0]
+                    json_part = data[4:]
+                txt_frame = json_part.decode("utf-8", errors="ignore").strip()
+                if not txt_frame.startswith("{"):
+                    return
+                outer = json.loads(txt_frame)
+                if outer.get("key"):
+                    self.ws_cipher_key = outer["key"]
+                elif isinstance(outer.get("data"), dict) and outer["data"].get("key"):
+                    self.ws_cipher_key = outer["data"]["key"]
+                enc_type = int(outer.get("encrypt", 0))
+                raw_d = outer.get("data")
+                if not raw_d:
+                    return
+                inner = self._decode_ws_payload(client, raw_d, enc_type)
+                if inner is not None:
+                    if isinstance(inner, dict):
+                        k_dec = inner.get("key") or (
+                            inner.get("data", {}).get("key") if isinstance(inner.get("data"), dict) else None
+                        )
+                        if k_dec and isinstance(k_dec, str):
+                            self.ws_cipher_key = k_dec
+                    self.last_event_ts = time.time()
+                    is_grp_cmd = (cmd_id in (521, 522))
+                    msg_items = self._extract_msg_dicts(inner, parent_is_group=is_grp_cmd)
+                    for m in msg_items:
+                        m["cmd"] = cmd_id
+                        _PRIORITY_CMD_EXECUTOR.submit(self._process_msg_item, client, acc_now, m, is_grp_cmd, None)
+        except Exception:
+            pass
+
     def _run_loop(self):
-        ws_idx = 0
         while not self.stop_ev.is_set():
             acc_row = self._get_acc_row()
             if not acc_row or (acc_row.get("platform") or "zalo") != "zalo":
                 break
             if not acc_row.get("chat_cmd_enabled", 1):
                 self.ws_status = "Đã tắt nhận lệnh"
-                self.stop_ev.wait(4.0)
-                continue
-
-            if time.time() < self.ws_conflict_until:
                 self.stop_ev.wait(4.0)
                 continue
 
@@ -12304,15 +12590,25 @@ class ZaloRealtimeListener:
                     except Exception:
                         pass
 
-                if client.ws_urls:
-                    ws_url = client.ws_urls[ws_idx % len(client.ws_urls)]
-                    ws_idx += 1
-                    if "zpw_ver=" not in ws_url:
-                        sep = "&" if "?" in ws_url else "?"
-                        ws_url = f"{ws_url}{sep}zpw_ver=645&zpw_type=30&t={int(time.time() * 1000)}"
-                    self._run_ws_session(client, acc_row, ws_url)
-
-                self.stop_ev.wait(3.0)
+                # Gắn trực tiếp vào kết nối WebSocket duy nhất của ZaloPCSessionKeeper (Tuyệt đối không mở WebSocket thứ 2!)
+                from zalo_login import ZaloPCSessionKeeper
+                ZaloPCSessionKeeper.register_and_keep_alive(
+                    uid=client.uid or client.imei,
+                    imei=client.imei,
+                    cookies_dict=client.cookies_dict,
+                    zpw_enk=client.secret_key or "",
+                    user_agent=client.user_agent or "",
+                    pc_name=acc_row.get("pc_name") or "Windows 11 Pro (Singapore)",
+                    display_name=acc_row.get("name") or client.display_name or "",
+                    ws_urls=client.ws_urls,
+                    db_path=DB_PATH,
+                )
+                ZaloPCSessionKeeper.register_ws_frame_callback(
+                    client.imei,
+                    lambda op, dt, c=client: self._handle_shared_ws_frame(c, self._get_acc_row() or acc_row, op, dt)
+                )
+                self.ws_status = "Đang sống trong Acc (Single WS + Poller 24/7)"
+                self.stop_ev.wait(8.0)
             except Exception:
                 self.ws_status = "Zalo Poller Đang Bảo Vệ..."
                 self.stop_ev.wait(5.0)
@@ -13270,6 +13566,146 @@ html, body {
 }
 .tab-count.zero-val, .tab-count.zero-badge { display: none !important; }
 
+
+/* ==================== CRISP MODERN STUDIO BUTTONS (ZERO SCALE / ZERO DISTORTION) ==================== */
+#tgPageBootLoader {
+  display: none !important;
+  opacity: 0 !important;
+  visibility: hidden !important;
+  pointer-events: none !important;
+}
+.btn, .tg-btn-login, .tg-nav-pill-btn, .sub-tab, .acc-pill, .tg-icon-btn, .nav-tab, .tg-capsule-telemetry, .brand-logo-wrap {
+  transform: none !important;
+  transition: background-color 0.14s ease, border-color 0.14s ease, color 0.14s ease, box-shadow 0.14s ease, opacity 0.14s ease !important;
+  box-sizing: border-box !important;
+  cursor: pointer !important;
+  user-select: none !important;
+  -webkit-user-select: none !important;
+}
+.btn::before, .btn::after, .tg-btn-login::before, .tg-btn-login::after, .tg-nav-pill-btn::before, .tg-nav-pill-btn::after {
+  display: none !important;
+  content: none !important;
+}
+.btn:hover, .tg-btn-login:hover, .tg-nav-pill-btn:hover, .sub-tab:hover, .acc-pill:hover, .tg-icon-btn:hover, .brand-logo-wrap:hover {
+  transform: none !important;
+  filter: brightness(1.08);
+}
+.btn:active, .tg-btn-login:active, .tg-nav-pill-btn:active, .sub-tab:active, .acc-pill:active, .tg-icon-btn:active, .tg-capsule-telemetry:active, .nav-tab:active {
+  transform: none !important;
+  filter: brightness(0.92);
+}
+.nav-tab.active svg {
+  transform: none !important;
+}
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 34px;
+  padding: 6px 13px;
+  border-radius: 9px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: #24262d;
+  color: #f4f4f5;
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.2;
+  white-space: nowrap;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+}
+.btn:hover {
+  border-color: rgba(56, 189, 248, 0.55);
+  background: #2c2f37;
+}
+.btn-sm {
+  min-height: 29px;
+  padding: 4px 10px;
+  font-size: 11.5px;
+  border-radius: 8px;
+}
+.btn-block {
+  width: 100%;
+  min-height: 38px;
+  padding: 9px 14px;
+  font-size: 13px;
+  border-radius: 10px;
+}
+.btn-primary {
+  background: #0284c7;
+  border: 1px solid #38bdf8;
+  color: #ffffff;
+}
+.btn-primary:hover {
+  background: #0369a1;
+  border-color: #7dd3fc;
+}
+.btn-success {
+  background: #059669;
+  border: 1px solid #34d399;
+  color: #ffffff;
+}
+.btn-success:hover {
+  background: #047857;
+  border-color: #6ee7b7;
+}
+.btn-danger {
+  background: rgba(225, 29, 72, 0.20);
+  border: 1px solid rgba(251, 113, 133, 0.50);
+  color: #fda4af;
+}
+.btn-danger:hover {
+  background: rgba(225, 29, 72, 0.32);
+  border-color: #fb7185;
+}
+.btn.pet-loading {
+  opacity: 0.72 !important;
+  pointer-events: auto !important;
+  animation: none !important;
+}
+.tg-top-studio-nav {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 6px;
+  margin-bottom: 12px;
+  padding: 4px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+@media (max-width: 720px) {
+  .tg-top-studio-nav {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+.tg-top-nav-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 34px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--txt-muted);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tg-top-nav-btn:hover {
+  background: var(--surface-sub);
+  color: var(--txt);
+}
+.tg-top-nav-btn.active {
+  background: #0284c7;
+  border-color: #38bdf8;
+  color: #ffffff;
+}
+
 </style>
 </head>
 <body>
@@ -14076,6 +14512,146 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
 }
 .tab-count.zero-val, .tab-count.zero-badge { display: none !important; }
 
+
+/* ==================== CRISP MODERN STUDIO BUTTONS (ZERO SCALE / ZERO DISTORTION) ==================== */
+#tgPageBootLoader {
+  display: none !important;
+  opacity: 0 !important;
+  visibility: hidden !important;
+  pointer-events: none !important;
+}
+.btn, .tg-btn-login, .tg-nav-pill-btn, .sub-tab, .acc-pill, .tg-icon-btn, .nav-tab, .tg-capsule-telemetry, .brand-logo-wrap {
+  transform: none !important;
+  transition: background-color 0.14s ease, border-color 0.14s ease, color 0.14s ease, box-shadow 0.14s ease, opacity 0.14s ease !important;
+  box-sizing: border-box !important;
+  cursor: pointer !important;
+  user-select: none !important;
+  -webkit-user-select: none !important;
+}
+.btn::before, .btn::after, .tg-btn-login::before, .tg-btn-login::after, .tg-nav-pill-btn::before, .tg-nav-pill-btn::after {
+  display: none !important;
+  content: none !important;
+}
+.btn:hover, .tg-btn-login:hover, .tg-nav-pill-btn:hover, .sub-tab:hover, .acc-pill:hover, .tg-icon-btn:hover, .brand-logo-wrap:hover {
+  transform: none !important;
+  filter: brightness(1.08);
+}
+.btn:active, .tg-btn-login:active, .tg-nav-pill-btn:active, .sub-tab:active, .acc-pill:active, .tg-icon-btn:active, .tg-capsule-telemetry:active, .nav-tab:active {
+  transform: none !important;
+  filter: brightness(0.92);
+}
+.nav-tab.active svg {
+  transform: none !important;
+}
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 34px;
+  padding: 6px 13px;
+  border-radius: 9px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: #24262d;
+  color: #f4f4f5;
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.2;
+  white-space: nowrap;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+}
+.btn:hover {
+  border-color: rgba(56, 189, 248, 0.55);
+  background: #2c2f37;
+}
+.btn-sm {
+  min-height: 29px;
+  padding: 4px 10px;
+  font-size: 11.5px;
+  border-radius: 8px;
+}
+.btn-block {
+  width: 100%;
+  min-height: 38px;
+  padding: 9px 14px;
+  font-size: 13px;
+  border-radius: 10px;
+}
+.btn-primary {
+  background: #0284c7;
+  border: 1px solid #38bdf8;
+  color: #ffffff;
+}
+.btn-primary:hover {
+  background: #0369a1;
+  border-color: #7dd3fc;
+}
+.btn-success {
+  background: #059669;
+  border: 1px solid #34d399;
+  color: #ffffff;
+}
+.btn-success:hover {
+  background: #047857;
+  border-color: #6ee7b7;
+}
+.btn-danger {
+  background: rgba(225, 29, 72, 0.20);
+  border: 1px solid rgba(251, 113, 133, 0.50);
+  color: #fda4af;
+}
+.btn-danger:hover {
+  background: rgba(225, 29, 72, 0.32);
+  border-color: #fb7185;
+}
+.btn.pet-loading {
+  opacity: 0.72 !important;
+  pointer-events: auto !important;
+  animation: none !important;
+}
+.tg-top-studio-nav {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 6px;
+  margin-bottom: 12px;
+  padding: 4px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+@media (max-width: 720px) {
+  .tg-top-studio-nav {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+.tg-top-nav-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 34px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--txt-muted);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tg-top-nav-btn:hover {
+  background: var(--surface-sub);
+  color: var(--txt);
+}
+.tg-top-nav-btn.active {
+  background: #0284c7;
+  border-color: #38bdf8;
+  color: #ffffff;
+}
+
 </style>
 </head>
 <body data-theme="tg_dark">
@@ -14242,6 +14818,15 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
       <span class="kpi-label">Tin đã gửi</span>
       <span class="kpi-val" id="kpiTotalSent">0</span>
     </div>
+  </div>
+
+  <!-- Thanh Điều Hướng Studio Phía Trên (Bấm Ăn Ngay Lập Tức Không Trễ) -->
+  <div class="tg-top-studio-nav" id="tgTopStudioNav">
+    <button type="button" class="tg-top-nav-btn active" data-top-tab="tab-accounts" onclick="switchMainTab('tab-accounts')">1. Tài Khoản &amp; Quyền .CP</button>
+    <button type="button" class="tg-top-nav-btn" data-top-tab="tab-targets" onclick="switchMainTab('tab-targets')">2. Phòng Chat (500 Box)</button>
+    <button type="button" class="tg-top-nav-btn" data-top-tab="tab-campaign" onclick="switchMainTab('tab-campaign')">3. Chiến Dịch Siêu Tốc</button>
+    <button type="button" class="tg-top-nav-btn" data-top-tab="tab-files" onclick="switchMainTab('tab-files')">4. Kho Kịch Bản (.TXT)</button>
+    <button type="button" class="tg-top-nav-btn" data-top-tab="tab-shield" onclick="switchMainTab('tab-shield')">5. Hệ Thống &amp; Proxy</button>
   </div>
 
   <!-- TAB 1: QUẢN LÝ TÀI KHOẢN -->
@@ -14582,6 +15167,31 @@ body[data-theme="tg_light"] .tg-pet-companion-bar {
                 </table>
               </div>
             {% endif %}
+          </div>
+        </div>
+
+        <!-- BẢNG QUẢN LÝ PHÂN QUYỀN LỆNH (.CP) & KHÓA CHẶN 100% NGƯỜI LẠ TRỰC TIẾP TẠI TAB 1 -->
+        <div class="panel">
+          <div class="panel-hd">
+            <span class="panel-title">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+              <span>Kiểm Soát Quyền Dùng Lệnh (Chỉ Chủ Acc &amp; .cp — Cấm 100% Người Lạ)</span>
+            </span>
+            <span class="badge badge-green" id="cpCountBadgeTab1">Chế độ: Khóa Cứng Bảo Mật</span>
+          </div>
+          <div class="panel-body">
+            <div style="font-size:12px;color:var(--txt-muted);margin-bottom:8px">
+              Hệ thống đã <b>xóa bỏ hoàn toàn</b> chức năng cho người lạ dùng lệnh. Bắt buộc 100% chỉ <b>Chủ Tài Khoản</b> và những UID nằm trong danh sách cấp phép (<code>.cp</code>) dưới đây mới có thể gõ lệnh trên Zalo, Discord và Messenger:
+            </div>
+            <div style="display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap">
+              <input class="inp" id="cpGrantUidInputTab1" placeholder="Nhập UID hoặc @Tên cần cấp phép (.cp)..." style="flex:1;min-width:160px">
+              <input class="inp" id="cpGrantNameInputTab1" placeholder="Tên gợi nhớ..." style="flex:1;min-width:120px">
+              <button type="button" class="btn btn-success btn-sm" onclick="grantCpPermissionFromWebTab1()">+ Cấp Quyền (.cp)</button>
+              <button type="button" class="btn btn-danger btn-sm" onclick="revokeCpPermissionFromWeb('__all__')">Thu Hồi Sạch Quyền Phụ (.xq all)</button>
+            </div>
+            <div class="scroll-area" id="cpUsersListContainerTab1" style="max-height:140px">
+              <div style="padding:10px;text-align:center;color:var(--txt-muted)">Chỉ Chủ Tài Khoản đang có quyền điều khiển.</div>
+            </div>
           </div>
         </div>
       </div>
@@ -15222,14 +15832,7 @@ function checkZaloRealGeoStatus(forceScan = false) { return checkZaloGeoStatus(f
 function autoScanAndBindVnSgProxy(btnEl) { return scanAndLockRealVnSgRoute(btnEl); }
 function spawnPetBurstParticles(x, y, c) {}
 
-// Theo dõi tọa độ chuột / ngón tay thời gian thực cho hiệu ứng nút bấm Specular Rim Luxury
-document.addEventListener('pointermove', (ev) => {
-  const btn = ev.target.closest('.btn, .tg-btn-login, .tg-nav-pill-btn');
-  if (!btn) return;
-  const rect = btn.getBoundingClientRect();
-  btn.style.setProperty('--mx', (ev.clientX - rect.left) + 'px');
-  btn.style.setProperty('--my', (ev.clientY - rect.top) + 'px');
-}, {passive: true});
+// Specular Rim disabled for crisp zero-distortion buttons
 
 // Đảm bảo 100% biểu tượng đồ họa SVG & Khối 3D NHK luôn xuất hiện rõ nét
 async function ensureNhkPetsAnd3DRendered() {}
@@ -15278,54 +15881,36 @@ function setDockBadgeCount(badgeId, countVal) {
   el.classList.toggle('zero-badge', n <= 0);
 }
 
-// Khởi tạo hiệu ứng Ripple + Paw Particles cho toàn bộ nút bấm & tải thông số Vật lý từ Python Backend
+// Khởi chạy trang tức thì — Không tạo Ripple làm phình nút hoặc nuốt sự kiện click!
 (function initTelegramBootAndPhysics() {
+  const loader = document.getElementById('tgPageBootLoader');
+  if (loader) loader.classList.add('hidden');
   window.addEventListener('DOMContentLoaded', () => {
-    setTimeout(() => {
-      const loader = document.getElementById('tgPageBootLoader');
-      if (loader) loader.classList.add('hidden');
-    }, 240);
+    const l2 = document.getElementById('tgPageBootLoader');
+    if (l2) l2.classList.add('hidden');
     checkZaloGeoStatus(false);
   });
-
-  document.addEventListener('pointerdown', (ev) => {
-    const btn = ev.target.closest('.btn, .tg-nav-pill-btn, .sub-tab, .acc-pill');
-    if (!btn) return;
-    const rect = btn.getBoundingClientRect();
-    const ripple = document.createElement('span');
-    ripple.className = 'tg-btn-ripple';
-    const size = Math.max(rect.width, rect.height);
-    ripple.style.width = ripple.style.height = size + 'px';
-    ripple.style.left = (ev.clientX - rect.left - size / 2) + 'px';
-    ripple.style.top = (ev.clientY - rect.top - size / 2) + 'px';
-    btn.appendChild(ripple);
-    setTimeout(() => ripple.remove(), 580);
-
-    
-  }, {passive: true});
-
-  fetch('/api/ui/physics').then(r => r.json()).then(d => {
-    if (d && Array.isArray(d.spring_samples) && d.spring_samples.length > 4) {
-      TG_SPRING_SAMPLES = d.spring_samples;
-    }
-  }).catch(() => {});
 })();
 
 async function withPetButtonLoading(btnEl, loadingText, asyncFn) {
   if (!btnEl) return await asyncFn();
-  if (btnEl.dataset.loading === '1') return;
+  const nowTs = Date.now();
+  const prevLockTs = parseInt(btnEl.dataset.lockTs || '0', 10);
+  if (btnEl.dataset.loading === '1' && (nowTs - prevLockTs < 6000)) return;
   btnEl.dataset.loading = '1';
-  const origHtml = btnEl.innerHTML;
+  btnEl.dataset.lockTs = String(nowTs);
   btnEl.classList.add('pet-loading');
-  btnEl.innerHTML = `<span class="btn-pet-spinner">${MINI_PET_LOADER_SVG}<span>${escapeHtmlSafe(loadingText || 'Đang xử lý...')}</span><span class="paw-dot"></span><span class="paw-dot"></span><span class="paw-dot"></span></span>`;
-  setPetTurboMode(true);
+  if (loadingText) setPetCompanionMood(loadingText);
+  const unlockTimer = setTimeout(() => {
+    btnEl.classList.remove('pet-loading');
+    btnEl.dataset.loading = '0';
+  }, 6000);
   try {
     return await asyncFn();
   } finally {
+    clearTimeout(unlockTimer);
     btnEl.classList.remove('pet-loading');
-    btnEl.innerHTML = origHtml;
     btnEl.dataset.loading = '0';
-    setTimeout(() => setPetTurboMode(false), 450);
   }
 }
 
@@ -15447,113 +16032,34 @@ function toggleTelegramDayNight() {
   } catch (e) {}
 })();
 
-// Thanh Tab Dưới Cùng Kéo Trượt Vật Lý Đàn Hồi
-(function initTelegramDraggableBottomDock() {
-  const bar = document.getElementById('tgBottomBar');
+// Điều hướng Tab tức thì không độ trễ (Đồng bộ cả Thanh Tab Trên & Thanh Tab Dưới)
+(function initInstantBottomDock() {
   const pill = document.getElementById('tgNavPill');
-  if (!bar || !pill) return;
-  const tabs = Array.from(bar.querySelectorAll('.nav-tab'));
-  const tabCount = tabs.length;
-
-  let isPointerDown = false;
-  let isDragging = false;
-  let startX = 0;
-  let lastX = 0;
-  let lastMoveTs = 0;
-  let currentFloatIdx = 0;
-  let activePointerId = null;
-
-  function setPillPosition(floatIdx, stretchX = 1.0, squishY = 1.0) {
-    const clamped = Math.max(0, Math.min(tabCount - 1, floatIdx));
-    const pct = clamped * 100;
-    pill.style.transform = `translate3d(${pct.toFixed(2)}%, 0, 0) scaleX(${stretchX.toFixed(3)}) scaleY(${squishY.toFixed(3)})`;
-  }
-
   window.animateTelegramPillToIndex = function(targetIdx) {
-    currentFloatIdx = targetIdx;
-    bar.classList.remove('dragging');
-    setPillPosition(targetIdx, 1.0, 1.0);
+    if (!pill) return;
+    const clamped = Math.max(0, Math.min(4, Number(targetIdx) || 0));
+    pill.style.transform = `translate3d(${(clamped * 100).toFixed(2)}%, 0, 0)`;
   };
-
-  bar.addEventListener('pointerdown', (e) => {
-    if (e.button !== undefined && e.button !== 0) return;
-    isPointerDown = true;
-    isDragging = false;
-    startX = e.clientX;
-    lastX = e.clientX;
-    lastMoveTs = performance.now();
-    activePointerId = e.pointerId;
-  });
-
-  window.addEventListener('pointermove', (e) => {
-    if (!isPointerDown || (activePointerId !== null && e.pointerId !== activePointerId)) return;
-    const dx = Math.abs(e.clientX - startX);
-    if (!isDragging && dx > 6) {
-      isDragging = true;
-      bar.classList.add('dragging');
-    }
-    if (!isDragging) return;
-
-    const rect = bar.getBoundingClientRect();
-    const innerWidth = Math.max(1, rect.width - 8);
-    const slotWidth = innerWidth / tabCount;
-    const relX = e.clientX - rect.left - 4 - (slotWidth / 2);
-    const rawIdx = relX / slotWidth;
-    currentFloatIdx = Math.max(0, Math.min(tabCount - 1, rawIdx));
-
-    const now = performance.now();
-    const dt = Math.max(8, now - lastMoveTs);
-    const vx = Math.abs(e.clientX - lastX) / dt;
-    lastX = e.clientX;
-    lastMoveTs = now;
-
-    const stretch = Math.min(1.15, 1.0 + vx * 0.085);
-    const squish = Math.max(0.92, 1.0 - vx * 0.035);
-    setPillPosition(currentFloatIdx, stretch, squish);
-
-    const hoverIdx = Math.round(currentFloatIdx);
-    tabs.forEach((t, i) => t.classList.toggle('active', i === hoverIdx));
-  }, {passive: true});
-
-  function finishDrag() {
-    if (!isPointerDown) return;
-    isPointerDown = false;
-    activePointerId = null;
-    if (isDragging) {
-      isDragging = false;
-      bar.classList.remove('dragging');
-      const finalIdx = Math.max(0, Math.min(tabCount - 1, Math.round(currentFloatIdx)));
-      const targetBtn = tabs[finalIdx];
-      if (targetBtn) {
-        switchMainTab(targetBtn.getAttribute('data-tab'), targetBtn);
-      } else {
-        setPillPosition(CURRENT_TAB_INDEX, 1.0, 1.0);
-      }
-    }
-  }
-
-  window.addEventListener('pointerup', finishDrag);
-  window.addEventListener('pointercancel', finishDrag);
 })();
 
 function switchMainTab(tabId, btnEl) {
   const panes = document.querySelectorAll('.tab-pane');
   const btns = Array.from(document.querySelectorAll('#tgBottomBar .nav-tab'));
+  const topBtns = Array.from(document.querySelectorAll('#tgTopStudioNav .tg-top-nav-btn'));
   const targetBtn = btnEl || btns.find(b => b.getAttribute('data-tab') === tabId);
   const nextIdx = targetBtn ? parseInt(targetBtn.getAttribute('data-idx') || '0', 10) : 0;
-  const fromLeft = nextIdx < CURRENT_TAB_INDEX;
   CURRENT_TAB_INDEX = nextIdx;
 
   panes.forEach(p => p.classList.remove('active', 'slide-from-left'));
   const targetSec = document.getElementById(tabId);
   if (targetSec) {
-    if (fromLeft) targetSec.classList.add('slide-from-left');
     targetSec.classList.add('active');
   }
 
-  btns.forEach(b => b.classList.remove('active'));
+  btns.forEach(b => b.classList.toggle('active', b.getAttribute('data-tab') === tabId));
+  topBtns.forEach(b => b.classList.toggle('active', b.getAttribute('data-top-tab') === tabId));
+
   if (targetBtn) {
-    targetBtn.classList.add('active');
     const hdrTitle = document.getElementById('headerBrandTitle');
     const customTitle = (document.getElementById('customWebTitleInput') ? document.getElementById('customWebTitleInput').value : '').trim();
     if (hdrTitle && !customTitle) {
@@ -15580,16 +16086,24 @@ function handleGlobalTelegramSearch(val) {
 
 function dispatchGlobalSearchCommand(val) {
   const q = String(val || '').trim();
-  if (!q) return;
-  if (q.startsWith('.') || q.startsWith('/')) {
+  if (!q) {
+    showToast('Hãy nhập lệnh (VD: .menu, .ping, .n 1, .t) hoặc từ khóa tìm phòng!');
+    return;
+  }
+  const firstWord = q.replace(/^[.\/!]+/, '').split(/\s+/)[0].toLowerCase();
+  const knownCmds = ['menu','help','m','h','ping','p','status','soi','dsbox','n','nhay','g','ngon','s','spam','t','stop','ta','stopall','cp','chophep','xq','xoaquyen','dsq','d','delay','icon','mau','prx','chan','bam','gall','nall','xa','combo','2c','so','lag'];
+  if (q.startsWith('.') || q.startsWith('/') || q.startsWith('!') || knownCmds.includes(firstWord)) {
     const cmdInp = document.getElementById('webQuickCmdInput');
     if (cmdInp) {
-      cmdInp.value = q;
+      cmdInp.value = (q.startsWith('.') || q.startsWith('/') || q.startsWith('!')) ? q : ('.' + q);
       dispatchWebQuickCommand();
-      document.getElementById('globalTelegramSearchInput').value = '';
+      const gInp = document.getElementById('globalTelegramSearchInput');
+      if (gInp) gInp.value = '';
     }
   } else {
     switchMainTab('tab-targets');
+    handleGlobalTelegramSearch(q);
+    showToast(`Đang lọc phòng chat theo từ khóa: "${q}"`);
   }
 }
 
@@ -17127,10 +17641,12 @@ async function stopSingleTask(tid) {
 }
 
 let _isPollingStatus = false;
-const _domCache = {tasks: '', health: '', logs: '', campLogs: '', banner: '', cpList: ''};
+window._forceDomRefreshNow = false;
+const _domCache = {tasks: '', health: '', logs: '', campLogs: '', banner: '', cpList: '', cpListTab1: ''};
 
 function updateDomIfChanged(el, cacheKey, newHtml) {
   if (!el || _domCache[cacheKey] === newHtml) return;
+  if (!window._forceDomRefreshNow && el.matches && el.matches(':hover')) return;
   _domCache[cacheKey] = newHtml;
   el.innerHTML = newHtml;
 }
@@ -17256,22 +17772,24 @@ function renderSystemStatusData(d, measuredRtt = null) {
   const cpUsers = d.authorized_users || [];
   const cpBadge = document.getElementById('cpCountBadge');
   if (cpBadge) cpBadge.textContent = `${cpUsers.length} người có quyền .cp`;
-  const cpBox = document.getElementById('cpUsersListContainer');
-  if (cpBox) {
-    const cpHtml = cpUsers.length
-      ? cpUsers.map(u => `
-          <div class="list-item" style="padding:6px 12px">
-            <div class="item-info">
-              <span class="badge badge-green">.CP</span>
-              <strong style="margin-left:6px">${escapeHtmlSafe(u.name)}</strong>
-              <code style="margin-left:6px;font-size:11px;color:var(--txt-muted)">UID: ${escapeHtmlSafe(u.uid)}</code>
-            </div>
-            <button type="button" class="btn btn-danger btn-sm" onclick="revokeCpPermissionFromWeb('${escapeHtmlSafe(u.uid)}')">Xóa</button>
+  const cpBadge1 = document.getElementById('cpCountBadgeTab1');
+  if (cpBadge1) cpBadge1.textContent = `Chủ Acc + ${cpUsers.length} người có quyền .cp`;
+  const cpHtml = cpUsers.length
+    ? cpUsers.map(u => `
+        <div class="list-item" style="padding:6px 12px">
+          <div class="item-info">
+            <span class="badge badge-green">.CP</span>
+            <strong style="margin-left:6px">${escapeHtmlSafe(u.name)}</strong>
+            <code style="margin-left:6px;font-size:11px;color:var(--txt-muted)">UID: ${escapeHtmlSafe(u.uid)}</code>
           </div>
-        `).join('')
-      : '<div style="padding:10px;text-align:center;color:var(--txt-muted)">Chỉ Chủ Tài Khoản đang có quyền điều khiển.</div>';
-    updateDomIfChanged(cpBox, 'cpList', cpHtml);
-  }
+          <button type="button" class="btn btn-danger btn-sm" onclick="revokeCpPermissionFromWeb('${escapeHtmlSafe(u.uid)}')">Xóa quyền</button>
+        </div>
+      `).join('')
+    : '<div style="padding:10px;text-align:center;color:var(--txt-muted)">🔒 Chỉ Chủ Tài Khoản đang có quyền điều khiển (Cấm 100% người lạ).</div>';
+  const cpBox = document.getElementById('cpUsersListContainer');
+  if (cpBox) updateDomIfChanged(cpBox, 'cpList', cpHtml);
+  const cpBox1 = document.getElementById('cpUsersListContainerTab1');
+  if (cpBox1) updateDomIfChanged(cpBox1, 'cpListTab1', cpHtml);
 
   const logs = d.cmd_logs || [];
   const bannerEl = document.getElementById('latestCmdBannerText');
@@ -17457,12 +17975,40 @@ async function grantCpPermissionFromWeb() {
     if (d.ok) {
       document.getElementById('cpGrantUidInput').value = '';
       document.getElementById('cpGrantNameInput').value = '';
+      window._forceDomRefreshNow = true;
       showToast(d.message || 'Đã cấp quyền .cp!');
-      pollSystemStatus(true);
+      await pollSystemStatus(true);
+      window._forceDomRefreshNow = false;
     } else {
       showToast(d.error || 'Lỗi cấp quyền');
     }
-  } catch (e) {}
+  } catch (e) { showToast('Lỗi kết nối khi cấp quyền!'); }
+}
+
+async function grantCpPermissionFromWebTab1() {
+  const uEl = document.getElementById('cpGrantUidInputTab1');
+  const nEl = document.getElementById('cpGrantNameInputTab1');
+  const uid = (uEl ? uEl.value : '').trim();
+  const name = (nEl ? nEl.value : '').trim();
+  if (!uid) { showToast('Hãy nhập UID hoặc @Tên cần cấp quyền (.cp)!'); return; }
+  try {
+    const r = await fetch('/api/permissions/add', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({uid, name})
+    });
+    const d = await r.json();
+    if (d.ok) {
+      if (uEl) uEl.value = '';
+      if (nEl) nEl.value = '';
+      window._forceDomRefreshNow = true;
+      showToast(d.message || 'Đã cấp quyền .cp!');
+      await pollSystemStatus(true);
+      window._forceDomRefreshNow = false;
+    } else {
+      showToast(d.error || 'Lỗi cấp quyền');
+    }
+  } catch (e) { showToast('Lỗi kết nối khi cấp quyền!'); }
 }
 
 async function revokeCpPermissionFromWeb(uid) {
@@ -17474,10 +18020,12 @@ async function revokeCpPermissionFromWeb(uid) {
     });
     const d = await r.json();
     if (d.ok) {
+      window._forceDomRefreshNow = true;
       showToast(d.message || 'Đã thu hồi quyền .cp!');
-      pollSystemStatus(true);
+      await pollSystemStatus(true);
+      window._forceDomRefreshNow = false;
     }
-  } catch (e) {}
+  } catch (e) { showToast('Lỗi kết nối khi xóa quyền!'); }
 }
 
 pollSystemStatus(true);
@@ -19240,17 +19788,13 @@ def api_permissions_add():
 def api_permissions_remove():
     data = request.json or {}
     uid = str(data.get("uid") or "").strip()
-    if uid == "__all__":
-        conn = db()
-        conn.execute("DELETE FROM authorized_users")
-        conn.commit()
+    if uid in ("__all__", "all", "tatca"):
+        remove_authorized_user("__all__")
         log_system_command(0, "Web_Permissions", "Admin_Web", ".xq all", "Thu hồi toàn bộ quyền điều khiển phụ (.cp)", sender_name="Admin Web")
-        with _STATUS_CACHE_LOCK:
-            _STATUS_SNAPSHOT_CACHE["ts"] = 0.0
-        return jsonify({"ok": True, "authorized_users": [], "message": "Đã thu hồi toàn bộ danh sách quyền (.cp)!"})
+        return jsonify({"ok": True, "authorized_users": [], "message": "Đã thu hồi sạch 100% danh sách quyền (.cp) — Chỉ Chủ Acc được dùng lệnh!"})
     remove_authorized_user(uid)
     log_system_command(0, "Web_Permissions", "Admin_Web", f".xq {uid}", f"Đã xóa quyền (.cp) của {uid}", sender_name="Admin Web")
-    return jsonify({"ok": True, "authorized_users": list_authorized_users(), "message": f"Đã xóa quyền của {uid}!"})
+    return jsonify({"ok": True, "authorized_users": list_authorized_users(), "message": f"Đã xóa quyền (.cp) của {uid}!"})
 
 # TỰ ĐỘNG KHỞI CHẠY BOT TELEGRAM PHAN ANH KHÔI (RIKE) CÙNG WEB SERVER
 _TELEGRAM_BOT_RUNNER = None
