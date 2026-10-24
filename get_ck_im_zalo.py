@@ -327,7 +327,7 @@ def sync_and_keepalive_tokens_to_db(raw_text):
 
     imei, ck_dict, enk, ua = extract_imei_and_metadata_flexible("", s)
     if imei and ck_dict:
-        chk = check_zalo_cookie_imei_live(imei=imei, cookies_input=ck_dict, zpw_enk=enk, user_agent=ua)
+        chk = check_zalo_cookie_imei_live(imei=imei, cookies_input=ck_dict, zpw_enk=enk, user_agent=ua, db_path=DB_PATH)
         if chk["alive"]:
             sync_zalo_account_to_web_db(
                 uid=chk["uid"] or imei,
@@ -998,7 +998,7 @@ class DirectTelegramBotRunner:
                     reply_to=msg_id,
                 )
                 return True
-            chk = check_zalo_cookie_imei_live(imei=imei, cookies_input=ck_dict, zpw_enk=enk, user_agent=ua)
+            chk = check_zalo_cookie_imei_live(imei=imei, cookies_input=ck_dict, zpw_enk=enk, user_agent=ua, db_path=DB_PATH)
             if chk["alive"]:
                 sync_zalo_account_to_web_db(
                     uid=chk["uid"] or imei,
@@ -1123,7 +1123,7 @@ class DirectTelegramBotRunner:
                 return
             imei, ck_dict, enk, ua = extract_imei_and_metadata_flexible("", raw_txt)
             if imei and ck_dict:
-                chk = check_zalo_cookie_imei_live(imei=imei, cookies_input=ck_dict, zpw_enk=enk, user_agent=ua)
+                chk = check_zalo_cookie_imei_live(imei=imei, cookies_input=ck_dict, zpw_enk=enk, user_agent=ua, db_path=DB_PATH)
                 if chk["alive"]:
                     sync_zalo_account_to_web_db(
                         uid=chk["uid"] or imei,
@@ -1284,7 +1284,7 @@ class DirectTelegramBotRunner:
             if raw_body_full:
                 imei, ck_dict, enk, ua = extract_imei_and_metadata_flexible("", raw_body_full)
                 if imei and ck_dict:
-                    chk = check_zalo_cookie_imei_live(imei=imei, cookies_input=ck_dict, zpw_enk=enk, user_agent=ua)
+                    chk = check_zalo_cookie_imei_live(imei=imei, cookies_input=ck_dict, zpw_enk=enk, user_agent=ua, db_path=DB_PATH)
                     if chk["alive"]:
                         sync_zalo_account_to_web_db(
                             uid=chk["uid"] or imei,
